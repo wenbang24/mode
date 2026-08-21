@@ -1,0 +1,5 @@
+__marimo__/
+__pycache__/
+*/__pycache__/
+*.pdf
+*.md
