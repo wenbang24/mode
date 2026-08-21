@@ -23,8 +23,8 @@ def title(mo):
     # Official Qwen AdaSteer bundle notebook
 
     This marimo notebook uses the official AdaSteer `Probe` and Qwen steering
-    model to derive RD and HD from all 9,000 WildGuard rows. It keeps only the
-    coefficient-law fitting and bundle assembly local.
+    model to reproduce the paper's Qwen procedure over a fixed 7,200/1,800
+    split of the 9,000 WildGuard prompts.
     """)
     return
 
@@ -83,7 +83,7 @@ def controls(DEFAULT_DATASET_PATH, DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
         value="https://ai.hackclub.com/proxy/v1", label="Judge API base", full_width=True
     )
     judge_model_control = mo.ui.text(
-        value="openai/gpt-5.6-sol", label="Judge model", full_width=True
+        value="openai/gpt-4o", label="Paper judge model", full_width=True
     )
     overwrite_control = mo.ui.checkbox(value=False, label="Replace an existing bundle")
     preflight_button = mo.ui.run_button(label="1. Preflight")
@@ -195,18 +195,27 @@ def judge_context(
     api_key,
     judge_model_control,
 ):
-    def judge_response(prompt, response):
+    def paper_context():
         if not api_key:
             raise RuntimeError("HACKCLUB_API_KEY is required")
-        context = SimpleNamespace(
+        return SimpleNamespace(
             api_key=api_key,
             api_base=api_base_control.value.rstrip("/"),
             judge_model=judge_model_control.value.strip(),
             seed=42,
         )
-        return AdaSteer._judge(context, prompt, response)
 
-    return (judge_response,)
+    def judge_refusal(prompt, response):
+        return AdaSteer._paper_judge(
+            paper_context(), prompt, response, "refusal"
+        )["result"]
+
+    def judge_compliance(prompt, response):
+        return AdaSteer._paper_judge(
+            paper_context(), prompt, response, "compliance"
+        )["result"]
+
+    return judge_compliance, judge_refusal
 
 
 @app.cell
@@ -215,7 +224,9 @@ def build(
     build_button,
     dataset_path,
     hf_token,
-    judge_response,
+    judge_compliance,
+    judge_model_control,
+    judge_refusal,
     mo,
     model_id,
     official_root,
@@ -228,10 +239,12 @@ def build(
             official_root=official_root,
             dataset_path=dataset_path,
             output_root=output_root,
-            judge=judge_response,
+            judge_refusal=judge_refusal,
+            judge_compliance=judge_compliance,
             model_id=model_id,
             revision=revision,
             token=hf_token,
+            judge_model=judge_model_control.value.strip(),
             overwrite=overwrite_control.value,
         )
         build_view = mo.callout(f"Saved and verified: `{built_bundle}`", kind="success")
@@ -255,6 +268,18 @@ def bundle_status(mo, target_bundle, verify_bundle):
                             "path": str(target_bundle.resolve()),
                             "model": bundle_metadata["model_id"],
                             "rows": bundle_metadata["dataset_rows"],
+                            "train / validation": "7,200 / 1,800",
+                            "Qwen groups": bundle_metadata["qwen_group_counts"],
+                            "RD / HD calibration": (
+                                f"{len(bundle_metadata['calibration_records']['rd'])} / "
+                                f"{len(bundle_metadata['calibration_records']['hd'])}"
+                            ),
+                            "harmful refusal": bundle_metadata["paper_metrics"][
+                                "final_harmful_refusal_rate"
+                            ],
+                            "benign compliance": bundle_metadata["paper_metrics"][
+                                "final_benign_full_compliance_rate"
+                            ],
                             "official_commit": bundle_metadata["official_commit"],
                         }
                     ]
@@ -263,7 +288,15 @@ def bundle_status(mo, target_bundle, verify_bundle):
         )
     else:
         bundle_metadata = None
-        status_view = mo.callout(f"No bundle exists yet at `{target_bundle}`.")
+        work = target_bundle.parent / f".{target_bundle.name}.work"
+        evaluations = work / "evaluations.jsonl"
+        positions = work / "positions.jsonl"
+        status_view = mo.callout(
+            f"No completed bundle at `{target_bundle}`. Resume state: "
+            f"{len(evaluations.read_text().splitlines()) if evaluations.exists() else 0} "
+            f"judged generations and "
+            f"{len(positions.read_text().splitlines()) if positions.exists() else 0} positions."
+        )
     status_view
     return
 
@@ -334,8 +367,8 @@ def notes(mo):
     ## What this workflow owns
 
     - The official repository owns activation capture and Qwen activation injection.
-    - This project only adapts the WildGuard rows to RD/HD groups and fits the two
-      bounded linear coefficient laws missing from the released training code.
+    - Qwen's GPT-4o-judged behavior—not stored WildGuard response labels—forms
+      the RD/HD groups and calibrates the two bounded affine laws.
     - The generated bundle is separate from the checkout, so upstream vectors and
       source files are never overwritten.
     """)
