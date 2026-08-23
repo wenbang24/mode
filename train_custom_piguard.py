@@ -53,6 +53,23 @@ def _():
     RUNTIME_ROOT = WORKSPACE / ".piguard"
     UPSTREAM_DIR = RUNTIME_ROOT / "PIGuard"
     ARTIFACT_ROOT = WORKSPACE / "artifacts" / "piguard_custom"
+    CACHE_VERSION = 1
+    STEP_VERSIONS = {
+        "prepare": 1,
+        "stage1": 1,
+        "scan": 1,
+        "generate": 1,
+        "stage2": 1,
+        "evaluate": 1,
+    }
+    STEP_LABELS = {
+        "prepare": "1 · Prepare pinned source + data",
+        "stage1": "2 · Train stage one",
+        "scan": "3 · Scan biased tokens",
+        "generate": "4 · Generate + refine benign prompts",
+        "stage2": "5 · Retrain from untouched base",
+        "evaluate": "6 · Evaluate final checkpoint",
+    }
     UPSTREAM_REPO = "https://github.com/leolee99/PIGuard.git"
     UPSTREAM_COMMIT = "1b5751e88bf7475acbedfc8eda795ce060307c84"
     SEED = 42
@@ -605,54 +622,341 @@ def _():
             count = None
         return requested, count
 
-    def run_fingerprint(config):
-        payload = {
+    def _fingerprint(value):
+        return hashlib.sha256(
+            json.dumps(value, sort_keys=True).encode()
+        ).hexdigest()[:12]
+
+    def pipeline_artifacts(config, root=ARTIFACT_ROOT):
+        config = {
+            "model_id": config["model_id"].strip(),
+            "revision": config.get("revision", "").strip(),
+            "training_mode": config["training_mode"],
+            "trust_remote_code": bool(config["trust_remote_code"]),
+            "smoke": bool(config["smoke"]),
+            "batch_size": int(config["batch_size"]),
+            "max_length": int(config["max_length"]),
+            "ai_base_url": config["ai_base_url"].strip().rstrip("/"),
+            "ai_model": config["ai_model"].strip(),
+        }
+        common = {"cache_version": CACHE_VERSION}
+        prepare = {
+            **common,
+            "step_version": STEP_VERSIONS["prepare"],
             "upstream_commit": UPSTREAM_COMMIT,
             "dataset_sha256": DATASET_SHA256,
-            **config,
+            "seed": SEED,
+            "smoke": config["smoke"],
         }
-        digest = hashlib.sha256(
-            json.dumps(payload, sort_keys=True).encode()
-        ).hexdigest()[:12]
-        model_slug = (
-            config["model_id"].split("/")[-1].lower().replace(".", "-")
-        )
-        return f"{model_slug}-{digest}"
+        prepare_key = _fingerprint(prepare)
+        training = {
+            "model_id": config["model_id"],
+            "revision": config["revision"],
+            "training_mode": config["training_mode"],
+            "trust_remote_code": config["trust_remote_code"],
+            "smoke": config["smoke"],
+            "batch_size": config["batch_size"],
+            "max_length": config["max_length"],
+            "epochs": 1 if config["smoke"] else 3,
+            "save_step": 1 if config["smoke"] else 200,
+            "warmup": 0 if config["smoke"] else 100,
+            "seed": SEED,
+        }
+        stage1 = {
+            **common,
+            "step_version": STEP_VERSIONS["stage1"],
+            "prepare": prepare_key,
+            "stage": "stage1",
+            **training,
+        }
+        stage1_key = _fingerprint(stage1)
+        scan = {
+            **common,
+            "step_version": STEP_VERSIONS["scan"],
+            "stage1": stage1_key,
+            "vocabulary_limit": 512 if config["smoke"] else None,
+            "saved_tokens": 300,
+        }
+        scan_key = _fingerprint(scan)
+        generate = {
+            **common,
+            "step_version": STEP_VERSIONS["generate"],
+            "prepare": prepare_key,
+            "scan": scan_key,
+            "ai_base_url": config["ai_base_url"],
+            "ai_model": config["ai_model"],
+            "target": 4 if config["smoke"] else 1000,
+            "request_budget": 400,
+        }
+        generate_key = _fingerprint(generate)
+        stage2 = {
+            **common,
+            "step_version": STEP_VERSIONS["stage2"],
+            "prepare": prepare_key,
+            "generate": generate_key,
+            "stage": "stage2",
+            **training,
+        }
+        stage2_key = _fingerprint(stage2)
+        evaluate = {
+            **common,
+            "step_version": STEP_VERSIONS["evaluate"],
+            "prepare": prepare_key,
+            "stage2": stage2_key,
+            "batch_size": config["batch_size"],
+            "max_length": config["max_length"],
+            "threshold": 0.5,
+        }
+        inputs = {
+            "prepare": prepare,
+            "stage1": stage1,
+            "scan": scan,
+            "generate": generate,
+            "stage2": stage2,
+            "evaluate": evaluate,
+        }
+        keys = {step: _fingerprint(value) for step, value in inputs.items()}
+        root = Path(root)
+        return {
+            "root": root,
+            "config": config,
+            "steps": {
+                step: {
+                    "step": step,
+                    "key": keys[step],
+                    "inputs": value,
+                    "path": root / "cache" / step / keys[step],
+                }
+                for step, value in inputs.items()
+            },
+        }
 
-    def prepare_run(config):
-        if not config["model_id"].strip():
+    _REQUIRED_OUTPUTS = {
+        "prepare": (
+            "data/train.json",
+            "data/valid.json",
+            "data/test.json",
+            "manifests/data_manifest.json",
+            "patched-source.diff",
+        ),
+        "stage1": ("checkpoints/best_model.pth",),
+        "scan": ("biased_tokens.json",),
+        "generate": ("generated/benign_prompts.jsonl",),
+        "stage2": ("checkpoints/best_model.pth",),
+        "evaluate": ("metrics.json", "test_predictions.jsonl"),
+    }
+
+    def _required_outputs(artifact):
+        outputs = _REQUIRED_OUTPUTS[artifact["step"]]
+        if artifact["step"] == "prepare" and artifact["inputs"]["smoke"]:
+            outputs += (
+                "data/smoke_train.json",
+                "data/smoke_valid.json",
+                "data/smoke_test.json",
+            )
+        return outputs
+
+    def _cache_manifest(artifact):
+        path = artifact["path"] / "manifest.json"
+        if not path.exists():
+            return None
+        try:
+            manifest = read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            manifest.get("schema_version") != CACHE_VERSION
+            or manifest.get("step") != artifact["step"]
+            or manifest.get("key") != artifact["key"]
+            or manifest.get("inputs") != artifact["inputs"]
+            or not all(
+                (artifact["path"] / relative).exists()
+                for relative in _required_outputs(artifact)
+            )
+        ):
+            return None
+        return manifest
+
+    def _complete_artifact(artifact, result, config=None):
+        # ponytail: one writer per cache key; add file locks if concurrent sessions need the same key.
+        manifest = {
+            "schema_version": CACHE_VERSION,
+            "step": artifact["step"],
+            "key": artifact["key"],
+            "inputs": artifact["inputs"],
+            "result": result,
+            "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        if config is not None:
+            manifest["config"] = config
+        write_json(artifact["path"] / "manifest.json", manifest)
+        return {
+            "status": "completed",
+            "step": artifact["step"],
+            "key": artifact["key"],
+            "artifact_dir": str(artifact["path"]),
+            **result,
+        }
+
+    def _training_matches(saved, current):
+        return (
+            saved.get("model_id") == current["model_id"]
+            and (saved.get("revision") or "") == current["revision"]
+            and saved.get("training_mode") == current["training_mode"]
+            and bool(saved.get("trust_remote_code"))
+            == current["trust_remote_code"]
+            and bool(saved.get("smoke")) == current["smoke"]
+            and saved.get("batch_size") == current["batch_size"]
+            and saved.get("max_length") == current["max_length"]
+        )
+
+    def _legacy_generation_matches(run_dir, config):
+        manifest_path = run_dir / "manifests" / "ai_generation.json"
+        output_path = run_dir / "generated" / "benign_prompts.jsonl"
+        if not manifest_path.exists() or not output_path.exists():
+            return False
+        try:
+            manifest = read_json(manifest_path)
+            rows = read_jsonl(output_path)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        target = 4 if config["smoke"] else 1000
+        return (
+            manifest.get("model") == config["ai_model"]
+            and str(manifest.get("base_url", "")).rstrip("/")
+            == config["ai_base_url"]
+            and manifest.get("accepted") == target
+            and len(rows) == target
+        )
+
+    def _legacy_artifact(pipeline, step):
+        root = pipeline["root"]
+        config = pipeline["config"]
+        if not root.exists():
+            return None
+        for run_dir in sorted(root.iterdir()):
+            config_path = run_dir / "run_config.json"
+            if run_dir.name == "cache" or not config_path.exists():
+                continue
+            try:
+                saved = read_json(config_path)
+                data_manifest = read_json(
+                    run_dir / "manifests" / "data_manifest.json"
+                )
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            base_matches = (
+                saved.get("upstream_commit") == UPSTREAM_COMMIT
+                and saved.get("dataset_sha256") == DATASET_SHA256
+                and data_manifest.get("seed") == SEED
+                and bool(saved.get("smoke")) == config["smoke"]
+            )
+            if not base_matches:
+                continue
+            training_matches = _training_matches(saved, config)
+            generation_matches = training_matches and _legacy_generation_matches(
+                run_dir, config
+            )
+            paths = {
+                "prepare": run_dir,
+                "stage1": run_dir / "stage1",
+                "scan": run_dir,
+                "generate": run_dir,
+                "stage2": run_dir / "stage2",
+                "evaluate": run_dir / "stage2" / "evaluation",
+            }
+            complete = {
+                "prepare": all(
+                    (paths["prepare"] / relative).exists()
+                    for relative in _required_outputs(
+                        pipeline["steps"]["prepare"]
+                    )
+                ),
+                "stage1": training_matches
+                and (paths["stage1"] / "stage_manifest.json").exists()
+                and (paths["stage1"] / "checkpoints/best_model.pth").exists(),
+                "scan": training_matches
+                and (paths["scan"] / "biased_tokens.json").exists(),
+                "generate": generation_matches,
+                "stage2": generation_matches
+                and (paths["stage2"] / "stage_manifest.json").exists()
+                and (paths["stage2"] / "checkpoints/best_model.pth").exists(),
+                "evaluate": generation_matches
+                and (paths["evaluate"] / "metrics.json").exists()
+                and (paths["evaluate"] / "test_predictions.jsonl").exists(),
+            }
+            if complete[step]:
+                return {
+                    **pipeline["steps"][step],
+                    "path": paths[step],
+                    "legacy": True,
+                    "legacy_run": run_dir,
+                }
+        return None
+
+    def _resolved_artifact(pipeline, step):
+        artifact = pipeline["steps"][step]
+        if _cache_manifest(artifact) is not None:
+            return artifact
+        return _legacy_artifact(pipeline, step)
+
+    def _cached_result(artifact):
+        result = {
+            "status": "cached",
+            "step": artifact["step"],
+            "key": artifact["key"],
+            "artifact_dir": str(artifact["path"]),
+            "legacy": bool(artifact.get("legacy")),
+        }
+        manifest = None if artifact.get("legacy") else _cache_manifest(artifact)
+        if manifest is not None and isinstance(manifest.get("result"), dict):
+            result.update(manifest["result"])
+        return result
+
+    def _require_artifact(pipeline, step):
+        artifact = _resolved_artifact(pipeline, step)
+        if artifact is None:
+            raise RuntimeError(f"Complete {STEP_LABELS[step]} first.")
+        return artifact
+
+    def _effective_training_config(config):
+        if not config["model_id"]:
             raise ValueError(
                 "Choose a preset or enter a Hugging Face model ID."
             )
-        run_dir = ARTIFACT_ROOT / run_fingerprint(config)
-        run_dir.mkdir(parents=True, exist_ok=True)
         resolved_mode, parameter_count = resolve_training_mode(config)
-        effective = {
-            **config,
+        return {
+            key: config[key]
+            for key in (
+                "model_id",
+                "revision",
+                "training_mode",
+                "trust_remote_code",
+                "smoke",
+                "batch_size",
+                "max_length",
+            )
+        } | {
             "resolved_training_mode": resolved_mode,
             "parameter_count": parameter_count,
-            "run_fingerprint": run_dir.name,
             "upstream_commit": UPSTREAM_COMMIT,
             "dataset_sha256": DATASET_SHA256,
         }
-        source_diff = patch_upstream()
-        data_manifest = prepare_data(run_dir, smoke=config["smoke"])
-        write_json(run_dir / "run_config.json", effective)
-        atomic_text(run_dir / "patched-source.diff", source_diff)
-        write_json(RUNTIME_ROOT / "latest_run.json", {"run_dir": str(run_dir)})
-        return {
-            "status": "prepared",
-            "run_dir": str(run_dir),
-            "training_mode": resolved_mode,
-            "parameter_count": parameter_count,
-            "splits": data_manifest["split_sizes"],
-        }
 
-    def prepared_config(run_dir):
-        path = Path(run_dir) / "run_config.json"
-        if not path.exists():
-            raise RuntimeError("Click Prepare before running this step.")
-        return read_json(path)
+    def prepare_run(pipeline):
+        cached = _resolved_artifact(pipeline, "prepare")
+        if cached is not None:
+            return _cached_result(cached)
+        artifact = pipeline["steps"]["prepare"]
+        artifact["path"].mkdir(parents=True, exist_ok=True)
+        source_diff = patch_upstream()
+        data_manifest = prepare_data(
+            artifact["path"], smoke=pipeline["config"]["smoke"]
+        )
+        atomic_text(artifact["path"] / "patched-source.diff", source_diff)
+        return _complete_artifact(
+            artifact, {"splits": data_manifest["split_sizes"]}
+        )
 
     def _require_training_platform(mode):
         if mode != "qlora":
@@ -664,29 +968,41 @@ def _():
                 "QLoRA/4-bit needs Linux, a CUDA GPU, and bitsandbytes. Use a GPU host or select Full manually."
             )
 
-    def run_official_stage(run_dir, stage):
-        run_dir = Path(run_dir)
-        config = prepared_config(run_dir)
+    def run_official_stage(pipeline, stage):
+        if stage not in {"stage1", "stage2"}:
+            raise ValueError(stage)
+        cached = _resolved_artifact(pipeline, stage)
+        if cached is not None:
+            return _cached_result(cached)
+        prepared = _require_artifact(pipeline, "prepare")
+        generated = (
+            _require_artifact(pipeline, "generate")
+            if stage == "stage2"
+            else None
+        )
+        artifact = pipeline["steps"][stage]
+        config = _effective_training_config(pipeline["config"])
         mode = config["resolved_training_mode"]
         _require_training_platform(mode)
         patch_upstream()
-        if stage not in {"stage1", "stage2"}:
-            raise ValueError(stage)
+        output_dir = artifact["path"]
+        output_dir.mkdir(parents=True, exist_ok=True)
         if stage == "stage2":
-            build_stage2_data(run_dir, smoke=config["smoke"])
+            build_stage2_data(
+                prepared["path"],
+                generated["path"],
+                output_dir,
+                smoke=config["smoke"],
+            )
         prefix = "smoke_" if config["smoke"] else ""
-        train_name = (
-            f"{prefix}train.json"
+        train_path = (
+            prepared["path"] / "data" / f"{prefix}train.json"
             if stage == "stage1"
-            else f"{prefix}stage2_train.json"
+            else output_dir / "data" / f"{prefix}stage2_train.json"
         )
-        valid_name = f"{prefix}valid.json"
-        train_path = run_dir / "data" / train_name
-        valid_path = run_dir / "data" / valid_name
-        output_dir = run_dir / stage
+        valid_path = prepared["path"] / "data" / f"{prefix}valid.json"
         checkpoint_dir = output_dir / "checkpoints"
         logs_dir = output_dir / "logs"
-        output_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
         environment = os.environ.copy()
@@ -763,21 +1079,32 @@ def _():
         record = {
             "stage": stage,
             "started_at": started,
-            "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "fresh_base_model": True,
             "checkpoint": str(checkpoint),
             "bundle": str(checkpoint_dir / "best_bundle"),
             "official_train_py": str(UPSTREAM_DIR / "train.py"),
             "log": str(log_path),
         }
-        write_json(output_dir / "stage_manifest.json", record)
-        return record
+        return _complete_artifact(artifact, record, config=config)
 
-    def load_piguard_model(run_dir, stage="stage1"):
+    def _artifact_training_config(artifact):
+        if artifact.get("legacy"):
+            config = read_json(artifact["legacy_run"] / "run_config.json")
+        else:
+            manifest = _cache_manifest(artifact)
+            config = None if manifest is None else manifest.get("config")
+        if not isinstance(config, dict) or not config.get(
+            "resolved_training_mode"
+        ):
+            raise RuntimeError(
+                f"Stored {artifact['step']} artifact has no training configuration."
+            )
+        return config
+
+    def load_piguard_model(artifact):
         import torch
 
-        run_dir = Path(run_dir)
-        config = prepared_config(run_dir)
+        config = _artifact_training_config(artifact)
         _require_training_platform(config["resolved_training_mode"])
         patch_upstream()
         if str(UPSTREAM_DIR) not in sys.path:
@@ -810,10 +1137,10 @@ def _():
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-        checkpoint = run_dir / stage / "checkpoints" / "best_model.pth"
+        checkpoint = artifact["path"] / "checkpoints" / "best_model.pth"
         if not checkpoint.exists():
             raise RuntimeError(
-                f"Run {stage} training before loading its checkpoint."
+                f"Run {artifact['step']} training before loading its checkpoint."
             )
         model.load_state_dict(
             torch.load(checkpoint, map_location=device), strict=True
@@ -821,11 +1148,15 @@ def _():
         model.eval()
         return model, device, config
 
-    def scan_biased_tokens(run_dir):
+    def scan_biased_tokens(pipeline):
+        cached = _resolved_artifact(pipeline, "scan")
+        if cached is not None:
+            return _cached_result(cached)
         import torch
 
-        run_dir = Path(run_dir)
-        model, device, config = load_piguard_model(run_dir, "stage1")
+        stage1 = _require_artifact(pipeline, "stage1")
+        artifact = pipeline["steps"]["scan"]
+        model, device, config = load_piguard_model(stage1)
         tokenizer = model.tokenizer
         vocabulary = sorted(
             tokenizer.get_vocab().items(), key=lambda item: item[1]
@@ -889,15 +1220,16 @@ def _():
             "smoke_limited": config["smoke"],
             "top_biased_tokens": scores[:300],
         }
-        write_json(run_dir / "biased_tokens.json", output)
+        write_json(artifact["path"] / "biased_tokens.json", output)
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return {
+        result = {
             key: value
             for key, value in output.items()
             if key != "top_biased_tokens"
         } | {"saved": len(output["top_biased_tokens"])}
+        return _complete_artifact(artifact, result)
 
     class AIAPIError(RuntimeError):
         def __init__(self, message, status=None, retry_after=None):
@@ -1048,27 +1380,19 @@ def _():
             accepted.append((prompt, required))
         return accepted
 
-    def generate_benign_prompts(run_dir, transport=None, target=None):
-        run_dir = Path(run_dir)
-        config = prepared_config(run_dir)
-        api_key = os.environ.get("AI_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "Set AI_API_KEY in the environment; the notebook never stores it."
-            )
+    def generate_benign_prompts(pipeline, transport=None):
+        cached = _resolved_artifact(pipeline, "generate")
+        if cached is not None:
+            return _cached_result(cached)
+        prepared = _require_artifact(pipeline, "prepare")
+        scanned = _require_artifact(pipeline, "scan")
+        artifact = pipeline["steps"]["generate"]
+        config = pipeline["config"]
         ai_base_url = _normalize_ai_base_url(config["ai_base_url"])
         ai_model = config["ai_model"].strip()
         if not ai_model:
             raise ValueError("Enter an AI model ID.")
-        if transport is None:
-
-            def configured_transport(path, key, payload=None):
-                return _ai_transport(ai_base_url, path, key, payload)
-
-            transport = configured_transport
-        biased_path = run_dir / "biased_tokens.json"
-        if not biased_path.exists():
-            raise RuntimeError("Scan biased tokens first.")
+        biased_path = scanned["path"] / "biased_tokens.json"
         tokens = [
             row["decoded"]
             for row in read_json(biased_path)["top_biased_tokens"]
@@ -1076,22 +1400,17 @@ def _():
         tokens = list(
             dict.fromkeys(token for token in tokens if token.strip())
         )
-        if len(tokens) < 6:
-            raise RuntimeError(
-                "The token scan returned too few usable tokens."
-            )
-
-        target = target or (4 if config["smoke"] else 1000)
-        output_path = run_dir / "generated" / "benign_prompts.jsonl"
+        target = artifact["inputs"]["target"]
+        output_path = artifact["path"] / "generated" / "benign_prompts.jsonl"
         existing = read_jsonl(output_path)
         if len(existing) > target:
             raise RuntimeError(
                 f"Resume file already has {len(existing)} rows, above target {target}."
             )
         wildguard = (
-            read_json(run_dir / "data" / "train.json")
-            + read_json(run_dir / "data" / "valid.json")
-            + read_json(run_dir / "data" / "test.json")
+            read_json(prepared["path"] / "data" / "train.json")
+            + read_json(prepared["path"] / "data" / "valid.json")
+            + read_json(prepared["path"] / "data" / "test.json")
         )
         source_seen = {
             " ".join(row["prompt"].casefold().split()) for row in wildguard
@@ -1106,6 +1425,33 @@ def _():
                 "Resume JSONL contains duplicate prompts or a WildGuard prompt."
             )
         seen = source_seen.union(resume_prompts)
+        if len(existing) == target:
+            return _complete_artifact(
+                artifact,
+                {
+                    "target": target,
+                    "accepted": target,
+                    "requests_this_session": 0,
+                    "request_budget": 400,
+                    "base_url": ai_base_url,
+                    "model": ai_model,
+                },
+            )
+        if len(tokens) < 6:
+            raise RuntimeError(
+                "The token scan returned too few usable tokens."
+            )
+        api_key = os.environ.get("AI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "Set AI_API_KEY in the environment; the notebook never stores it."
+            )
+        if transport is None:
+
+            def configured_transport(path, key, payload=None):
+                return _ai_transport(ai_base_url, path, key, payload)
+
+            transport = configured_transport
         budget = {"used": 0, "limit": 400}
         validate_ai_model(ai_model, api_key, budget, transport=transport)
 
@@ -1188,7 +1534,7 @@ def _():
                 raise RuntimeError(
                     "Too many rejected generations; partial progress is saved."
                 )
-        manifest = {
+        result = {
             "target": target,
             "accepted": accepted_count,
             "requests_this_session": budget["used"],
@@ -1196,22 +1542,22 @@ def _():
             "base_url": ai_base_url,
             "model": ai_model,
         }
-        write_json(run_dir / "manifests" / "ai_generation.json", manifest)
-        return manifest
+        return _complete_artifact(artifact, result)
 
-    def build_stage2_data(run_dir, smoke=False):
-        run_dir = Path(run_dir)
-        generated = read_jsonl(run_dir / "generated" / "benign_prompts.jsonl")
+    def build_stage2_data(prepare_dir, generation_dir, output_dir, smoke=False):
+        generated = read_jsonl(
+            generation_dir / "generated" / "benign_prompts.jsonl"
+        )
         expected = 4 if smoke else 1000
         if len(generated) != expected:
             raise RuntimeError(
                 f"Need exactly {expected} generated benign prompts; found {len(generated)}."
             )
-        train = read_json(run_dir / "data" / "train.json")
+        train = read_json(prepare_dir / "data" / "train.json")
         added = [{"prompt": row["prompt"], "label": 0} for row in generated]
-        write_json(run_dir / "data" / "stage2_train.json", train + added)
+        write_json(output_dir / "data" / "stage2_train.json", train + added)
         write_json(
-            run_dir / "manifests" / "stage2_data.json",
+            output_dir / "stage2_data.json",
             {
                 "base_train_rows": len(train),
                 "generated_benign_rows": len(added),
@@ -1220,20 +1566,25 @@ def _():
             },
         )
         if smoke:
-            smoke_train = read_json(run_dir / "data" / "smoke_train.json")
+            smoke_train = read_json(prepare_dir / "data" / "smoke_train.json")
             write_json(
-                run_dir / "data" / "smoke_stage2_train.json",
+                output_dir / "data" / "smoke_stage2_train.json",
                 smoke_train + added,
             )
         return len(train) + len(added)
 
-    def evaluate_stage(run_dir, stage="stage2"):
+    def evaluate_stage(pipeline):
+        cached = _resolved_artifact(pipeline, "evaluate")
+        if cached is not None:
+            return _cached_result(cached)
         import torch
 
-        run_dir = Path(run_dir)
-        model, device, config = load_piguard_model(run_dir, stage)
+        prepared = _require_artifact(pipeline, "prepare")
+        stage2 = _require_artifact(pipeline, "stage2")
+        artifact = pipeline["steps"]["evaluate"]
+        model, device, config = load_piguard_model(stage2)
         test_name = "smoke_test.json" if config["smoke"] else "test.json"
-        rows = read_json(run_dir / "data" / test_name)
+        rows = read_json(prepared["path"] / "data" / test_name)
         predictions = []
         batch_size = config["batch_size"]
         with torch.no_grad():
@@ -1271,7 +1622,7 @@ def _():
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
         metrics = {
-            "stage": stage,
+            "stage": "stage2",
             "rows": len(rows),
             "accuracy": float((labels == predicted).mean()),
             "benign_accuracy": tn / (tn + fp) if tn + fp else 0.0,
@@ -1285,7 +1636,7 @@ def _():
             "pooling": model.pooling,
             "training_mode": config["resolved_training_mode"],
         }
-        output_dir = run_dir / stage / "evaluation"
+        output_dir = artifact["path"]
         atomic_text(
             output_dir / "test_predictions.jsonl",
             "".join(
@@ -1297,20 +1648,19 @@ def _():
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return metrics
+        return _complete_artifact(artifact, metrics)
 
-    def classify_prompt(run_dir, prompt):
+    def classify_prompt(pipeline, prompt):
         import torch
 
         if not prompt.strip():
             raise ValueError("Enter a prompt.")
-        run_dir = Path(run_dir)
-        stage = (
-            "stage2"
-            if (run_dir / "stage2" / "checkpoints" / "best_model.pth").exists()
-            else "stage1"
-        )
-        model, device, _ = load_piguard_model(run_dir, stage)
+        artifact = _resolved_artifact(pipeline, "stage2")
+        if artifact is None:
+            artifact = _resolved_artifact(pipeline, "stage1")
+        if artifact is None:
+            raise RuntimeError("Complete stage-one or stage-two training first.")
+        model, _, _ = load_piguard_model(artifact)
         with torch.no_grad():
             probability = torch.softmax(
                 model.classify(prompt).float(), dim=-1
@@ -1319,28 +1669,34 @@ def _():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return {
-            "stage": stage,
+            "stage": artifact["step"],
             "label": "harmful" if probability >= 0.5 else "benign",
             "harmful_probability": probability,
         }
 
-    def artifact_status(run_dir):
-        run_dir = Path(run_dir)
-        checks = {
-            "prepared": run_dir / "run_config.json",
-            "stage_one_checkpoint": run_dir
-            / "stage1"
-            / "checkpoints"
-            / "best_model.pth",
-            "biased_tokens": run_dir / "biased_tokens.json",
-            "generated_benign": run_dir / "generated" / "benign_prompts.jsonl",
-            "final_checkpoint": run_dir
-            / "stage2"
-            / "checkpoints"
-            / "best_model.pth",
-            "metrics": run_dir / "stage2" / "evaluation" / "metrics.json",
-        }
-        return {name: path.exists() for name, path in checks.items()}
+    def artifact_status(pipeline):
+        status = {}
+        for step, artifact in pipeline["steps"].items():
+            resolved = _resolved_artifact(pipeline, step)
+            if resolved is not None:
+                state = "cached"
+                path = resolved["path"]
+                legacy = bool(resolved.get("legacy"))
+            else:
+                path = artifact["path"]
+                state = (
+                    "partial"
+                    if path.exists() and any(path.iterdir())
+                    else "missing"
+                )
+                legacy = False
+            status[step] = {
+                "state": state,
+                "key": artifact["key"],
+                "path": path,
+                "legacy": legacy,
+            }
+        return status
 
     def self_check():
         assert (
@@ -1408,6 +1764,156 @@ def _():
                 "one",
                 "two",
             ]
+
+        base_config = {
+            "model_id": "example/model",
+            "revision": "main",
+            "training_mode": "full",
+            "trust_remote_code": False,
+            "smoke": True,
+            "batch_size": 2,
+            "max_length": 512,
+            "ai_base_url": "https://example.test/v1",
+            "ai_model": "example/generator",
+        }
+
+        def keys(config):
+            return {
+                step: artifact["key"]
+                for step, artifact in pipeline_artifacts(config)[
+                    "steps"
+                ].items()
+            }
+
+        original = keys(base_config)
+        assert keys(dict(base_config)) == original
+        ai_changed = keys(
+            base_config
+            | {
+                "ai_base_url": "https://other.example/v1/",
+                "ai_model": "example/other-generator",
+            }
+        )
+        assert all(
+            original[step] == ai_changed[step]
+            for step in ("prepare", "stage1", "scan")
+        )
+        assert all(
+            original[step] != ai_changed[step]
+            for step in ("generate", "stage2", "evaluate")
+        )
+        for setting, value in (("batch_size", 3), ("max_length", 256)):
+            changed = keys(base_config | {setting: value})
+            assert changed["prepare"] == original["prepare"]
+            assert all(
+                changed[step] != original[step]
+                for step in (
+                    "stage1",
+                    "scan",
+                    "generate",
+                    "stage2",
+                    "evaluate",
+                )
+            )
+        smoke_changed = keys(base_config | {"smoke": False})
+        assert all(
+            original[step] != smoke_changed[step] for step in original
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            pipeline = pipeline_artifacts(base_config, root=temporary)
+            prepared = pipeline["steps"]["prepare"]
+            for relative in _required_outputs(prepared):
+                path = prepared["path"] / relative
+                if path.suffix == ".json":
+                    write_json(path, {})
+                else:
+                    atomic_text(path, "test\n")
+            _complete_artifact(prepared, {"splits": {}})
+            assert prepare_run(pipeline)["status"] == "cached"
+
+            generated = pipeline["steps"]["generate"]
+            append_jsonl(
+                generated["path"] / "generated" / "benign_prompts.jsonl",
+                {"prompt": "partial", "label": 0},
+            )
+            assert artifact_status(pipeline)["generate"]["state"] == "partial"
+
+            scanned = pipeline["steps"]["scan"]
+            write_json(scanned["path"] / "biased_tokens.json", {})
+            write_json(
+                scanned["path"] / "manifest.json",
+                {
+                    "schema_version": CACHE_VERSION,
+                    "step": "scan",
+                    "key": "wrong",
+                    "inputs": scanned["inputs"],
+                },
+            )
+            assert _cache_manifest(scanned) is None
+            _complete_artifact(scanned, {"saved": 0})
+            assert _cache_manifest(scanned) is not None
+            assert scan_biased_tokens(pipeline)["status"] == "cached"
+
+            for number in range(1, 4):
+                append_jsonl(
+                    generated["path"]
+                    / "generated"
+                    / "benign_prompts.jsonl",
+                    {"prompt": f"cached {number}", "label": 0},
+                )
+            _complete_artifact(generated, {"target": 4, "accepted": 4})
+            assert generate_benign_prompts(pipeline)["status"] == "cached"
+
+            stage2 = pipeline["steps"]["stage2"]
+            atomic_text(
+                stage2["path"] / "checkpoints" / "best_model.pth", "test\n"
+            )
+            _complete_artifact(stage2, {"stage": "stage2"}, config={})
+            assert run_official_stage(pipeline, "stage2")["status"] == "cached"
+
+            evaluated = pipeline["steps"]["evaluate"]
+            write_json(evaluated["path"] / "metrics.json", {})
+            atomic_text(evaluated["path"] / "test_predictions.jsonl", "")
+            _complete_artifact(evaluated, {"rows": 0})
+            assert evaluate_stage(pipeline)["status"] == "cached"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy = root / "legacy-run"
+            saved = {
+                key: base_config[key]
+                for key in (
+                    "model_id",
+                    "revision",
+                    "training_mode",
+                    "trust_remote_code",
+                    "smoke",
+                    "batch_size",
+                    "max_length",
+                )
+            } | {
+                "resolved_training_mode": "full",
+                "upstream_commit": UPSTREAM_COMMIT,
+                "dataset_sha256": DATASET_SHA256,
+            }
+            write_json(legacy / "run_config.json", saved)
+            write_json(
+                legacy / "manifests" / "data_manifest.json", {"seed": SEED}
+            )
+            for name in ("train", "valid", "test"):
+                write_json(legacy / "data" / f"{name}.json", [])
+                write_json(legacy / "data" / f"smoke_{name}.json", [])
+            atomic_text(legacy / "patched-source.diff", "test\n")
+            atomic_text(
+                legacy / "stage1" / "checkpoints" / "best_model.pth",
+                "test\n",
+            )
+            write_json(legacy / "stage1" / "stage_manifest.json", {})
+            legacy_pipeline = pipeline_artifacts(base_config, root=root)
+            assert _legacy_artifact(legacy_pipeline, "prepare") is not None
+            assert _legacy_artifact(legacy_pipeline, "stage1") is not None
+            assert not (root / "cache").exists()
         return {
             "ai_url_validation": "ok",
             "split_math": "ok",
@@ -1415,11 +1921,15 @@ def _():
             "deduplication": "ok",
             "429_retry_and_budget": "ok",
             "jsonl_resume": "ok",
+            "step_cache_keys": "ok",
+            "cache_completion_and_partial_resume": "ok",
+            "legacy_cache_discovery": "ok",
         }
 
     return (
         ARTIFACT_ROOT,
         PRESETS,
+        STEP_LABELS,
         UPSTREAM_COMMIT,
         UPSTREAM_REPO,
         artifact_status,
@@ -1428,8 +1938,8 @@ def _():
         generate_benign_prompts,
         json,
         mo,
+        pipeline_artifacts,
         prepare_run,
-        run_fingerprint,
         run_official_stage,
         scan_biased_tokens,
         self_check,
@@ -1519,7 +2029,6 @@ def controls(mo):
 
 @app.cell(hide_code=True)
 def configuration(
-    ARTIFACT_ROOT,
     PRESETS,
     ai_base_url,
     ai_model_id,
@@ -1528,7 +2037,7 @@ def configuration(
     custom_model_id,
     max_length,
     model_revision,
-    run_fingerprint,
+    pipeline_artifacts,
     smoke_mode,
     training_mode,
     trust_remote_code,
@@ -1549,8 +2058,8 @@ def configuration(
         "ai_base_url": ai_base_url.value.strip().rstrip("/"),
         "ai_model": ai_model_id.value.strip(),
     }
-    current_run_dir = ARTIFACT_ROOT / run_fingerprint(run_config)
-    return current_run_dir, run_config
+    pipeline = pipeline_artifacts(run_config)
+    return (pipeline,)
 
 
 @app.cell
@@ -1559,7 +2068,6 @@ def control_panel(
     ai_model_id,
     backbone_preset,
     batch_size,
-    current_run_dir,
     custom_model_id,
     evaluate_button,
     generate_button,
@@ -1567,6 +2075,7 @@ def control_panel(
     mo,
     model_revision,
     prepare_button,
+    pipeline,
     scan_button,
     smoke_mode,
     stage1_button,
@@ -1593,7 +2102,7 @@ def control_panel(
             mo.md("## Pipeline"),
             mo.hstack([prepare_button, stage1_button, scan_button]),
             mo.hstack([generate_button, stage2_button, evaluate_button]),
-            mo.md(f"**Artifact directory:** `{current_run_dir}`"),
+            mo.md(f"**Cache directory:** `{pipeline['root'] / 'cache'}`"),
         ]
     )
     return
@@ -1601,7 +2110,6 @@ def control_panel(
 
 @app.cell
 def actions(
-    current_run_dir,
     evaluate_button,
     evaluate_stage,
     generate_benign_prompts,
@@ -1610,7 +2118,7 @@ def actions(
     mo,
     prepare_button,
     prepare_run,
-    run_config,
+    pipeline,
     run_official_stage,
     scan_biased_tokens,
     scan_button,
@@ -1620,17 +2128,17 @@ def actions(
     _result = {"status": "ready"}
     try:
         if prepare_button.value:
-            _result = prepare_run(run_config)
+            _result = prepare_run(pipeline)
         elif stage1_button.value:
-            _result = run_official_stage(current_run_dir, "stage1")
+            _result = run_official_stage(pipeline, "stage1")
         elif scan_button.value:
-            _result = scan_biased_tokens(current_run_dir)
+            _result = scan_biased_tokens(pipeline)
         elif generate_button.value:
-            _result = generate_benign_prompts(current_run_dir)
+            _result = generate_benign_prompts(pipeline)
         elif stage2_button.value:
-            _result = run_official_stage(current_run_dir, "stage2")
+            _result = run_official_stage(pipeline, "stage2")
         elif evaluate_button.value:
-            _result = evaluate_stage(current_run_dir, "stage2")
+            _result = evaluate_stage(pipeline)
     except Exception as _exc:
         _result = {
             "status": "error",
@@ -1647,14 +2155,17 @@ def actions(
 
 
 @app.cell
-def status(action_result, artifact_status, current_run_dir, mo):
+def status(STEP_LABELS, action_result, artifact_status, mo, pipeline):
     _refresh = action_result
-    _status = artifact_status(current_run_dir)
+    _status = artifact_status(pipeline)
+    _icons = {"cached": "✅", "partial": "🟨", "missing": "⬜"}
     _rows = "\n".join(
-        f"- {'✅' if exists else '⬜'} {name.replace('_', ' ')}"
-        for name, exists in _status.items()
+        f"- {_icons[item['state']]} {STEP_LABELS[step]} — "
+        f"**{item['state']}** · `{item['key']}`"
+        + (" · legacy" if item["legacy"] else "")
+        for step, item in _status.items()
     )
-    _diff_path = current_run_dir / "patched-source.diff"
+    _diff_path = _status["prepare"]["path"] / "patched-source.diff"
     _diff_preview = (
         _diff_path.read_text(encoding="utf-8")
         if _diff_path.exists()
@@ -1679,17 +2190,17 @@ def inference_controls(mo):
 @app.cell
 def inference(
     classify_prompt,
-    current_run_dir,
     inference_button,
     inference_prompt,
     json,
     mo,
+    pipeline,
 ):
     _inference_result = {"status": "waiting"}
     if inference_button.value:
         try:
             _inference_result = classify_prompt(
-                current_run_dir, inference_prompt.value
+                pipeline, inference_prompt.value
             )
         except Exception as _infer_exc:
             _inference_result = {
