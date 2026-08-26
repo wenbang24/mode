@@ -26,6 +26,7 @@ def imports_and_config():
     import tempfile
     import time
     import zipfile
+    import urllib.request
     from collections import Counter
     from pathlib import Path
 
@@ -48,6 +49,18 @@ def imports_and_config():
     PIGUARD_DATA_ROOT = WORKSPACE / ".piguard" / "PIGuard" / "datasets"
     CACHE_ROOT = ARTIFACT_ROOT / ".eval_cache"
     PIGUARD_COMMIT = "1b5751e88bf7475acbedfc8eda795ce060307c84"
+    PIGUARD_RAW_ROOT = (
+        "https://raw.githubusercontent.com/leolee99/PIGuard/"
+        f"{PIGUARD_COMMIT}/datasets"
+    )
+    PIGUARD_FILES = {
+        "NotInject_one.json": "69b535596d95102424e9c5946944feb4f2d596687eb8213f2ecad75478e5ffdd",
+        "NotInject_two.json": "6043d94e75b48d8e7682d25dc79eaf45359e1e561ce520e3b8fd5625a91060c6",
+        "NotInject_three.json": "ef01eff0d761d2e34571b3fdbcec08c30cd93efe8d0e1a2eb5c2baeb1873b070",
+        "wildguard.json": "d884fc834a5a8081a423c49effb7aeb7977e991c1e3e7fb58e0285630d550bad",
+        "BIPIA_text.json": "75750e7b4e8b34e8f9d88d89b357aeaaf02bd07f9e493ccd37eda74a0cd7c7f8",
+        "BIPIA_code.json": "892545c5aaec0645b1ded65dc7816b3d70e9ef4eadcba2301a7a3db93676b6e0",
+    }
     AEGIS_DATASET_ID = "nvidia/Aegis-AI-Content-Safety-Dataset-2.0"
     AEGIS_REVISION = "cd1abe041ba6f595fea47a67f650bcc0a809ea81"
     AEGIS_FILENAME = "aegis_v2_test.parquet"
@@ -73,6 +86,8 @@ def imports_and_config():
         MAX_LENGTH,
         PAPER_RESULTS,
         PIGUARD_DATA_ROOT,
+        PIGUARD_FILES,
+        PIGUARD_RAW_ROOT,
         Path,
         THRESHOLD,
         TRAIN_ROWS_PATH,
@@ -87,6 +102,7 @@ def imports_and_config():
         tempfile,
         time,
         torch,
+        urllib,
         zipfile,
     )
 
@@ -103,6 +119,7 @@ def title(mo):
 
     - **PIGuard public tests:** NotInject, WildGuard-benign, and BIPIA. PINT is intentionally omitted.
     - **Aegis 2.0:** prompt text and `prompt_label` only; blank and redacted prompts are excluded and counted.
+    - **Data access:** both public datasets download automatically from pinned revisions; PIGuard files are SHA-256 verified.
     - **Decision rule:** class 1 at probability ≥ 0.5, matching the training notebook.
     """)
     return
@@ -239,13 +256,43 @@ def data_helpers(
     ARCHIVE_PATH,
     Counter,
     PIGUARD_DATA_ROOT,
+    PIGUARD_FILES,
+    PIGUARD_RAW_ROOT,
+    Path,
     TRAIN_ROWS_PATH,
+    hashlib,
     hf_hub_download,
     normalize_prompt,
     pq,
     read_json,
+    sha256_file,
+    tempfile,
+    urllib,
 ):
+    def ensure_piguard_files():
+        PIGUARD_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        for filename, expected_sha in PIGUARD_FILES.items():
+            path = PIGUARD_DATA_ROOT / filename
+            if path.is_file() and sha256_file(path) == expected_sha:
+                continue
+            with urllib.request.urlopen(
+                f"{PIGUARD_RAW_ROOT}/{filename}", timeout=60
+            ) as response:
+                payload = response.read()
+            actual_sha = hashlib.sha256(payload).hexdigest()
+            if actual_sha != expected_sha:
+                raise RuntimeError(
+                    f"SHA-256 mismatch for {filename}: {actual_sha}"
+                )
+            with tempfile.NamedTemporaryFile(
+                dir=PIGUARD_DATA_ROOT, delete=False
+            ) as handle:
+                handle.write(payload)
+                temporary_path = Path(handle.name)
+            temporary_path.replace(path)
+
     def load_piguard_rows():
+        ensure_piguard_files()
         rows = []
         notinject_files = (
             ("NotInject_one.json", "NotInject one-word"),
