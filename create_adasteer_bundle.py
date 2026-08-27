@@ -23,8 +23,8 @@ def title(mo):
     # Official Qwen AdaSteer bundle notebook
 
     This marimo notebook uses the official AdaSteer `Probe` and Qwen steering
-    model to reproduce the paper's Qwen procedure over a fixed 7,200/1,800
-    split of the 9,000 WildGuard prompts.
+    model to reproduce the paper's Qwen procedure over a deterministic
+    8,000/2,000 split of either common 10,000-case prompt-safety artifact.
     """)
     return
 
@@ -67,29 +67,45 @@ def imports():
 @app.cell
 def controls(DEFAULT_DATASET_PATH, DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
     official_root_control = mo.ui.text(
-        value="/content/AdaSteer", label="Official AdaSteer checkout", full_width=True
+        value="/content/AdaSteer",
+        label="Official AdaSteer checkout",
+        full_width=True,
     )
     model_id_control = mo.ui.text(
-        value=DEFAULT_MODEL_ID, label="Qwen-2.5-7B model ID or path", full_width=True
+        value=DEFAULT_MODEL_ID,
+        label="Qwen-2.5-7B model ID or path",
+        full_width=True,
     )
-    revision_control = mo.ui.text(value="", label="Model revision", full_width=True)
+    revision_control = mo.ui.text(
+        value="", label="Model revision", full_width=True
+    )
     dataset_control = mo.ui.text(
-        value=str(DEFAULT_DATASET_PATH), label="9,000-row WildGuard Parquet", full_width=True
+        value=str(DEFAULT_DATASET_PATH),
+        label="10,000-row prompt-safety Parquet",
+        full_width=True,
     )
     output_control = mo.ui.text(
-        value=str(DEFAULT_OUTPUT_ROOT), label="Bundle output root", full_width=True
+        value=str(DEFAULT_OUTPUT_ROOT),
+        label="Bundle output root",
+        full_width=True,
     )
     api_base_control = mo.ui.text(
-        value="https://ai.hackclub.com/proxy/v1", label="Judge API base", full_width=True
+        value="https://ai.hackclub.com/proxy/v1",
+        label="Judge API base",
+        full_width=True,
     )
     judge_model_control = mo.ui.text(
         value="openai/gpt-4o", label="Paper judge model", full_width=True
     )
-    overwrite_control = mo.ui.checkbox(value=False, label="Replace an existing bundle")
+    overwrite_control = mo.ui.checkbox(
+        value=False, label="Replace an existing bundle"
+    )
     preflight_button = mo.ui.run_button(label="1. Preflight")
     build_button = mo.ui.run_button(label="2. Build bundle")
     demo_prompt_control = mo.ui.text_area(
-        value="Explain how rainbows form.", label="Demonstration prompt", full_width=True
+        value="Explain how rainbows form.",
+        label="Demonstration prompt",
+        full_width=True,
     )
     demo_button = mo.ui.run_button(label="3. Run demonstration")
 
@@ -144,7 +160,9 @@ def configuration(
     output_root = Path(output_control.value).expanduser()
     model_id = model_id_control.value.strip()
     revision = revision_control.value.strip() or None
-    target_bundle = output_root / model_slug(model_id)
+    target_bundle = (
+        output_root / model_slug(dataset_path.stem) / model_slug(model_id)
+    )
     return (
         dataset_path,
         model_id,
@@ -268,19 +286,23 @@ def bundle_status(mo, target_bundle, verify_bundle):
                             "path": str(target_bundle.resolve()),
                             "model": bundle_metadata["model_id"],
                             "rows": bundle_metadata["dataset_rows"],
-                            "train / validation": "7,200 / 1,800",
-                            "Qwen groups": bundle_metadata["qwen_group_counts"],
+                            "train / validation": "8,000 / 2,000",
+                            "Qwen groups": bundle_metadata[
+                                "qwen_group_counts"
+                            ],
                             "RD / HD calibration": (
                                 f"{len(bundle_metadata['calibration_records']['rd'])} / "
                                 f"{len(bundle_metadata['calibration_records']['hd'])}"
                             ),
-                            "harmful refusal": bundle_metadata["paper_metrics"][
-                                "final_harmful_refusal_rate"
+                            "harmful refusal": bundle_metadata[
+                                "paper_metrics"
+                            ]["final_harmful_refusal_rate"],
+                            "benign compliance": bundle_metadata[
+                                "paper_metrics"
+                            ]["final_benign_full_compliance_rate"],
+                            "official_commit": bundle_metadata[
+                                "official_commit"
                             ],
-                            "benign compliance": bundle_metadata["paper_metrics"][
-                                "final_benign_full_compliance_rate"
-                            ],
-                            "official_commit": bundle_metadata["official_commit"],
                         }
                     ]
                 ),
@@ -367,7 +389,7 @@ def notes(mo):
     ## What this workflow owns
 
     - The official repository owns activation capture and Qwen activation injection.
-    - Qwen's GPT-4o-judged behavior—not stored WildGuard response labels—forms
+    - Qwen's GPT-4o-judged behavior—not stored source response labels—forms
       the RD/HD groups and calibrates the two bounded affine laws.
     - The generated bundle is separate from the checkout, so upstream vectors and
       source files are never overwritten.

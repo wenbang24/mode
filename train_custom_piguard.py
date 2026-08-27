@@ -46,10 +46,11 @@ def _():
     import urllib.request
 
     import numpy as np
-    import pyarrow.parquet as pq
+
+    from scripts.training_cases import read_cases
 
     WORKSPACE = Path(__file__).resolve().parent
-    DATASET_PATH = WORKSPACE / "wildguardtrain_9000_seed42.parquet"
+    DEFAULT_DATASET_PATH = WORKSPACE / "wildguardtrain_10000_seed42.parquet"
     RUNTIME_ROOT = WORKSPACE / ".piguard"
     UPSTREAM_DIR = RUNTIME_ROOT / "PIGuard"
     ARTIFACT_ROOT = WORKSPACE / "artifacts" / "piguard_custom"
@@ -291,10 +292,6 @@ def _():
                 digest.update(chunk)
         return digest.hexdigest()
 
-    DATASET_SHA256 = (
-        file_sha256(DATASET_PATH) if DATASET_PATH.exists() else "missing"
-    )
-
     def atomic_text(path, text):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -468,26 +465,10 @@ def _():
             result[index] += 1
         return result
 
-    def prepare_data(run_dir, smoke=False):
-        if not DATASET_PATH.exists():
-            raise FileNotFoundError(DATASET_PATH)
-        table = pq.read_table(
-            DATASET_PATH,
-            columns=["prompt", "prompt_harm_label", "source_index"],
-        )
-        source = table.to_pylist()
-        if len(source) != 9000:
-            raise ValueError(
-                f"Expected 9,000 WildGuard rows, found {len(source):,}."
-            )
+    def prepare_data(run_dir, dataset_path, dataset_sha256, smoke=False):
+        source = read_cases(dataset_path)
         prompts = [row["prompt"] for row in source]
-        if len(set(prompts)) != 9000:
-            raise ValueError(
-                "WildGuard selection must contain 9,000 unique prompts."
-            )
         counts = Counter(row["prompt_harm_label"] for row in source)
-        if counts != Counter({"harmful": 5148, "unharmful": 3852}):
-            raise ValueError(f"Unexpected label counts: {dict(counts)}")
 
         split_rows = {"train": [], "valid": [], "test": []}
         manifest_rows = []
@@ -518,10 +499,12 @@ def _():
                 )
                 manifest_rows.extend(
                     {
+                        "case_id": row["case_id"],
+                        "source_dataset": row["source_dataset"],
+                        "source_index": row["source_index"],
                         "prompt_sha256": hashlib.sha256(
                             row["prompt"].encode()
                         ).hexdigest(),
-                        "source_index": row["source_index"],
                         "source_label": source_label,
                         "label": numeric_label,
                         "split": split,
@@ -537,7 +520,7 @@ def _():
             )
             write_json(Path(run_dir) / "data" / f"{split}.json", rows)
         split_sizes = {key: len(value) for key, value in split_rows.items()}
-        if split_sizes != {"train": 7200, "valid": 900, "test": 900}:
+        if split_sizes != {"train": 8000, "valid": 1000, "test": 1000}:
             raise AssertionError(split_sizes)
 
         manifest_path = Path(run_dir) / "manifests" / "split_manifest.jsonl"
@@ -549,8 +532,8 @@ def _():
             ),
         )
         data_manifest = {
-            "source": str(DATASET_PATH),
-            "source_sha256": DATASET_SHA256,
+            "source": str(dataset_path),
+            "source_sha256": dataset_sha256,
             "seed": SEED,
             "label_mapping": LABELS,
             "source_label_counts": dict(counts),
@@ -559,7 +542,7 @@ def _():
                 split: dict(Counter(row["label"] for row in rows))
                 for split, rows in split_rows.items()
             },
-            "unique_prompts": len(set(prompts)),
+            "unique_prompts": len(prompts),
         }
         write_json(
             Path(run_dir) / "manifests" / "data_manifest.json", data_manifest
@@ -628,7 +611,12 @@ def _():
         ).hexdigest()[:12]
 
     def pipeline_artifacts(config, root=ARTIFACT_ROOT):
+        dataset_path = Path(config["dataset_path"]).expanduser().resolve()
+        if not dataset_path.is_file():
+            raise FileNotFoundError(dataset_path)
         config = {
+            "dataset_path": str(dataset_path),
+            "dataset_sha256": file_sha256(dataset_path),
             "model_id": config["model_id"].strip(),
             "revision": config.get("revision", "").strip(),
             "training_mode": config["training_mode"],
@@ -644,7 +632,7 @@ def _():
             **common,
             "step_version": STEP_VERSIONS["prepare"],
             "upstream_commit": UPSTREAM_COMMIT,
-            "dataset_sha256": DATASET_SHA256,
+            "dataset_sha256": config["dataset_sha256"],
             "seed": SEED,
             "smoke": config["smoke"],
         }
@@ -847,15 +835,16 @@ def _():
                 continue
             base_matches = (
                 saved.get("upstream_commit") == UPSTREAM_COMMIT
-                and saved.get("dataset_sha256") == DATASET_SHA256
+                and saved.get("dataset_sha256") == config["dataset_sha256"]
                 and data_manifest.get("seed") == SEED
                 and bool(saved.get("smoke")) == config["smoke"]
             )
             if not base_matches:
                 continue
             training_matches = _training_matches(saved, config)
-            generation_matches = training_matches and _legacy_generation_matches(
-                run_dir, config
+            generation_matches = (
+                training_matches
+                and _legacy_generation_matches(run_dir, config)
             )
             paths = {
                 "prepare": run_dir,
@@ -908,7 +897,9 @@ def _():
             "artifact_dir": str(artifact["path"]),
             "legacy": bool(artifact.get("legacy")),
         }
-        manifest = None if artifact.get("legacy") else _cache_manifest(artifact)
+        manifest = (
+            None if artifact.get("legacy") else _cache_manifest(artifact)
+        )
         if manifest is not None and isinstance(manifest.get("result"), dict):
             result.update(manifest["result"])
         return result
@@ -940,7 +931,7 @@ def _():
             "resolved_training_mode": resolved_mode,
             "parameter_count": parameter_count,
             "upstream_commit": UPSTREAM_COMMIT,
-            "dataset_sha256": DATASET_SHA256,
+            "dataset_sha256": config["dataset_sha256"],
         }
 
     def prepare_run(pipeline):
@@ -951,7 +942,10 @@ def _():
         artifact["path"].mkdir(parents=True, exist_ok=True)
         source_diff = patch_upstream()
         data_manifest = prepare_data(
-            artifact["path"], smoke=pipeline["config"]["smoke"]
+            artifact["path"],
+            Path(pipeline["config"]["dataset_path"]),
+            pipeline["config"]["dataset_sha256"],
+            smoke=pipeline["config"]["smoke"],
         )
         atomic_text(artifact["path"] / "patched-source.diff", source_diff)
         return _complete_artifact(
@@ -1544,7 +1538,9 @@ def _():
         }
         return _complete_artifact(artifact, result)
 
-    def build_stage2_data(prepare_dir, generation_dir, output_dir, smoke=False):
+    def build_stage2_data(
+        prepare_dir, generation_dir, output_dir, smoke=False
+    ):
         generated = read_jsonl(
             generation_dir / "generated" / "benign_prompts.jsonl"
         )
@@ -1659,7 +1655,9 @@ def _():
         if artifact is None:
             artifact = _resolved_artifact(pipeline, "stage1")
         if artifact is None:
-            raise RuntimeError("Complete stage-one or stage-two training first.")
+            raise RuntimeError(
+                "Complete stage-one or stage-two training first."
+            )
         model, _, _ = load_piguard_model(artifact)
         with torch.no_grad():
             probability = torch.softmax(
@@ -1713,8 +1711,10 @@ def _():
             pass
         else:
             raise AssertionError("insecure remote AI URL was accepted")
-        assert _apportion(5148) == [4118, 515, 515]
-        assert _apportion(3852) == [3082, 385, 385]
+        assert _apportion(5_719) == [4_575, 572, 572]
+        assert _apportion(4_281) == [3_425, 428, 428]
+        assert _apportion(5_057) == [4_045, 506, 506]
+        assert _apportion(4_943) == [3_955, 494, 494]
         parsed = parse_prompt_response(
             '```json\n[{"prompt":"A safe test"}]\n```'
         )
@@ -1766,6 +1766,7 @@ def _():
             ]
 
         base_config = {
+            "dataset_path": str(DEFAULT_DATASET_PATH),
             "model_id": "example/model",
             "revision": "main",
             "training_mode": "full",
@@ -1816,9 +1817,7 @@ def _():
                 )
             )
         smoke_changed = keys(base_config | {"smoke": False})
-        assert all(
-            original[step] != smoke_changed[step] for step in original
-        )
+        assert all(original[step] != smoke_changed[step] for step in original)
 
         with tempfile.TemporaryDirectory() as temporary:
             pipeline = pipeline_artifacts(base_config, root=temporary)
@@ -1857,9 +1856,7 @@ def _():
 
             for number in range(1, 4):
                 append_jsonl(
-                    generated["path"]
-                    / "generated"
-                    / "benign_prompts.jsonl",
+                    generated["path"] / "generated" / "benign_prompts.jsonl",
                     {"prompt": f"cached {number}", "label": 0},
                 )
             _complete_artifact(generated, {"target": 4, "accepted": 4})
@@ -1895,7 +1892,7 @@ def _():
             } | {
                 "resolved_training_mode": "full",
                 "upstream_commit": UPSTREAM_COMMIT,
-                "dataset_sha256": DATASET_SHA256,
+                "dataset_sha256": file_sha256(DEFAULT_DATASET_PATH),
             }
             write_json(legacy / "run_config.json", saved)
             write_json(
@@ -1927,7 +1924,7 @@ def _():
         }
 
     return (
-        ARTIFACT_ROOT,
+        DEFAULT_DATASET_PATH,
         PRESETS,
         STEP_LABELS,
         UPSTREAM_COMMIT,
@@ -1956,13 +1953,18 @@ def title(UPSTREAM_COMMIT, UPSTREAM_REPO, mo):
     dataset-specific evaluation hand-off. The official loss, optimizer loop, scheduler, validation, checkpoint
     selection, and three-epoch production default remain in `train.py`.
 
-    **Task semantics:** WildGuard prompt harmfulness (`unharmful → 0`, `harmful → 1`), not prompt-injection labeling.
+    **Task semantics:** prompt harmfulness (`unharmful → 0`, `harmful → 1`), not prompt-injection labeling.
     """)
     return
 
 
 @app.cell(hide_code=True)
-def controls(mo):
+def controls(DEFAULT_DATASET_PATH, mo):
+    dataset_path = mo.ui.text(
+        value=str(DEFAULT_DATASET_PATH),
+        label="10,000-row training Parquet",
+        full_width=True,
+    )
     backbone_preset = mo.ui.dropdown(
         options=["DeBERTa V3 Base", "Qwen 2.5 3B", "Custom"],
         value="DeBERTa V3 Base",
@@ -2013,6 +2015,7 @@ def controls(mo):
         backbone_preset,
         batch_size,
         custom_model_id,
+        dataset_path,
         evaluate_button,
         generate_button,
         max_length,
@@ -2035,6 +2038,7 @@ def configuration(
     backbone_preset,
     batch_size,
     custom_model_id,
+    dataset_path,
     max_length,
     model_revision,
     pipeline_artifacts,
@@ -2048,6 +2052,7 @@ def configuration(
         else PRESETS[backbone_preset.value]
     )
     run_config = {
+        "dataset_path": dataset_path.value.strip(),
         "model_id": selected_model_id,
         "revision": model_revision.value.strip(),
         "training_mode": training_mode.value,
@@ -2069,13 +2074,14 @@ def control_panel(
     backbone_preset,
     batch_size,
     custom_model_id,
+    dataset_path,
     evaluate_button,
     generate_button,
     max_length,
     mo,
     model_revision,
-    prepare_button,
     pipeline,
+    prepare_button,
     scan_button,
     smoke_mode,
     stage1_button,
@@ -2086,6 +2092,7 @@ def control_panel(
     mo.vstack(
         [
             mo.md("## Configuration"),
+            dataset_path,
             mo.hstack([backbone_preset, custom_model_id]),
             mo.hstack([model_revision, training_mode, trust_remote_code]),
             mo.hstack([smoke_mode, batch_size, max_length]),
@@ -2116,9 +2123,9 @@ def actions(
     generate_button,
     json,
     mo,
+    pipeline,
     prepare_button,
     prepare_run,
-    pipeline,
     run_official_stage,
     scan_biased_tokens,
     scan_button,

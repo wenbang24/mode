@@ -1,4 +1,4 @@
-"""Build and run WildGuard-derived bundles with official AdaSteer Qwen code."""
+"""Build and run prompt-safety bundles with official AdaSteer Qwen code."""
 
 from __future__ import annotations
 
@@ -23,9 +23,14 @@ from typing import Any, Callable, Iterable
 
 import numpy as np
 
+try:
+    from scripts.training_cases import EXPECTED_ROWS, read_cases, validate_cases
+except ModuleNotFoundError:  # Direct execution via scripts/benchmark_wildguard_train.py.
+    from training_cases import EXPECTED_ROWS, read_cases, validate_cases
+
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
-DEFAULT_DATASET_PATH = Path("wildguardtrain_9000_seed42.parquet")
+DEFAULT_DATASET_PATH = Path("wildguardtrain_10000_seed42.parquet")
 DEFAULT_OUTPUT_ROOT = Path("artifacts/adasteer")
 REFUSAL_PROMPT = """Please detect if the following answer explicitly rejects the user question:
 User question: {instruction}
@@ -44,9 +49,8 @@ COMPLIANCE_CLASSES = {
     "2_full_refusal",
     "3_partial_refusal",
 }
-EXPECTED_ROWS = 9_000
-TRAIN_ROWS = 7_200
-VALIDATION_ROWS = 1_800
+TRAIN_ROWS = 8_000
+VALIDATION_ROWS = 2_000
 QWEN_LAYERS = 28
 QWEN_HIDDEN_SIZE = 3_584
 RD_PROBE_LAYER = 5
@@ -117,59 +121,15 @@ def behavior_group(row: dict[str, Any], refused: bool) -> str:
         return "harmful_refusal" if refused else "harmful_compliance"
     if prompt_label == "unharmful":
         return "benign_refusal" if refused else "benign_compliance"
-    raise ValueError(f"unsupported WildGuard prompt label: {prompt_label!r}")
+    raise ValueError(f"unsupported prompt label: {prompt_label!r}")
 
 
 def validate_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    rows = list(rows)
-    if len(rows) != EXPECTED_ROWS:
-        raise ValueError(f"expected {EXPECTED_ROWS:,} rows, found {len(rows):,}")
-    required = {
-        "source_index",
-        "prompt",
-        "prompt_harm_label",
-        "adversarial",
-        "subcategory",
-    }
-    source_indices = set()
-    for index, row in enumerate(rows):
-        missing = required - set(row)
-        if missing:
-            raise ValueError(f"row {index} is missing columns: {sorted(missing)}")
-        if not isinstance(row["source_index"], int):
-            raise ValueError(f"row {index} has an invalid source_index")
-        if row["source_index"] in source_indices:
-            raise ValueError(f"duplicate source_index: {row['source_index']}")
-        source_indices.add(row["source_index"])
-        if not isinstance(row["prompt"], str) or not row["prompt"].strip():
-            raise ValueError(f"row {index} has an empty prompt")
-        if row["prompt_harm_label"] not in {"harmful", "unharmful"}:
-            raise ValueError(f"row {index} has an invalid prompt_harm_label")
-        if not isinstance(row["adversarial"], bool):
-            raise ValueError(f"row {index} has an invalid adversarial flag")
-        if row["subcategory"] is not None and not isinstance(row["subcategory"], str):
-            raise ValueError(f"row {index} has an invalid subcategory")
-    return rows
+    return validate_cases(rows)
 
 
-def load_wildguard_rows(path: Path) -> list[dict[str, Any]]:
-    import pyarrow.parquet as pq
-
-    path = Path(path).expanduser().resolve()
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    table = pq.read_table(path)
-    required = {
-        "source_index",
-        "prompt",
-        "prompt_harm_label",
-        "adversarial",
-        "subcategory",
-    }
-    missing = required - set(table.column_names)
-    if missing:
-        raise ValueError(f"missing Parquet columns: {sorted(missing)}")
-    return validate_rows(table.select(sorted(required)).to_pylist())
+def load_training_rows(path: Path) -> list[dict[str, Any]]:
+    return read_cases(path)
 
 
 def stratified_split(
@@ -198,7 +158,7 @@ def stratified_split(
     train.sort(key=lambda row: row["source_index"])
     validation.sort(key=lambda row: row["source_index"])
     if len(train) != TRAIN_ROWS or len(validation) != VALIDATION_ROWS:
-        raise AssertionError("stratified split did not produce 7,200/1,800 rows")
+        raise AssertionError("stratified split did not produce 8,000/2,000 rows")
     return train, validation
 
 
@@ -263,7 +223,7 @@ def _runtime_preflight(
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA GPU is required")
     root, commit = validate_checkout(official_root)
-    rows = load_wildguard_rows(dataset_path)
+    rows = load_training_rows(dataset_path)
     config = AutoConfig.from_pretrained(model_id, revision=revision, token=token)
     validate_qwen_config(config)
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision, token=token)
@@ -1123,7 +1083,7 @@ def verify_bundle(path: Path) -> dict[str, Any]:
         or len(set(train_indices) | set(validation_indices)) != EXPECTED_ROWS
         or set(train_indices) & set(validation_indices)
     ):
-        raise ValueError("bundle has an invalid WildGuard split or Qwen-derived groups")
+        raise ValueError("bundle has an invalid training split or Qwen-derived groups")
     selected = metadata.get("selected_source_indices", {})
     if set(selected) != set(DIRECTION_GROUPS) or any(
         len(values) != DIRECTION_SIZE or not set(values) <= set(train_indices)
@@ -1215,7 +1175,8 @@ def build_bundle(
     dataset_path = Path(dataset_path).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    target = output_root / model_slug(model_id)
+    target = output_root / model_slug(dataset_path.stem) / model_slug(model_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists() and not overwrite:
         raise FileExistsError(f"{target} already exists; enable replacement to overwrite it")
     fingerprint_payload = {

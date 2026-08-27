@@ -8,7 +8,7 @@ Example:
         --cases 100 \
         --piguard-training-root /content/PIGuard \
         --adasteer-root /content/AdaSteer \
-        --adasteer-bundle artifacts/adasteer/qwen-qwen2.5-7b-instruct \
+        --adasteer-bundle artifacts/adasteer/wildguardtrain_10000_seed42/qwen-qwen2.5-7b-instruct \
         --guardagent-root /content/GuardAgent \
         --allow-unsafe-guardagent-exec
 
@@ -42,6 +42,7 @@ from experts import (
 )
 from experts.base import error_text
 from experts.adasteer_bundle import verify_bundle
+from experts.guardagent import MEMORY_SHOTS, memory_from_rows
 
 
 DATASET_ID = "allenai/wildguardmix"
@@ -374,6 +375,7 @@ def real_builders(
                 args.guardagent_model,
                 args.seed,
                 args.allow_unsafe_guardagent_exec,
+                args.guardagent_memory_dataset,
             ),
         ),
     ]
@@ -405,6 +407,9 @@ def benchmark_config(args: argparse.Namespace) -> dict[str, Any]:
         "max_new_tokens": args.max_new_tokens,
         "guardagent_root": str(args.guardagent_root.resolve()),
         "guardagent_model": args.guardagent_model,
+        "guardagent_memory_dataset": str(
+            args.guardagent_memory_dataset.resolve()
+        ),
         "judge_model": args.judge_model,
         "api_base": args.api_base,
     }
@@ -412,6 +417,7 @@ def benchmark_config(args: argparse.Namespace) -> dict[str, Any]:
 
 def self_test() -> None:
     captured_llm_config: dict[str, Any] = {}
+    captured_memory: dict[str, Any] = {}
 
     class FakeAssistantAgent:
         def __init__(self, **kwargs: Any):
@@ -426,8 +432,8 @@ def self_test() -> None:
         def register_function(self, **kwargs: Any) -> None:
             pass
 
-        def update_memory(self, *args: Any) -> None:
-            pass
+        def update_memory(self, num_shots: int, memory: list[dict[str, str]]) -> None:
+            captured_memory.update(num_shots=num_shots, memory=memory)
 
     class FakeAgentChat:
         AssistantAgent = FakeAssistantAgent
@@ -445,10 +451,21 @@ def self_test() -> None:
     guardagent.seed = 42
     guardagent.autogen = FakeAutoGen
     guardagent.official = FakeOfficial
+    guardagent.memory = memory_from_rows(
+        {
+            "prompt": f"prompt-{index}",
+            "prompt_harm_label": "harmful" if index % 2 else "unharmful",
+        }
+        for index in range(10_000)
+    )
     guardagent._agents()
     assert "functions" not in captured_llm_config
     assert captured_llm_config["tools"][0]["function"]["name"] == "python"
     assert captured_llm_config["max_tokens"] == 256
+    assert captured_memory["num_shots"] == MEMORY_SHOTS
+    assert len(captured_memory["memory"]) == 10_000
+    assert captured_memory["memory"][0]["code"].endswith("guardrailed_answer = answer")
+    assert captured_memory["memory"][1]["code"].endswith("guardrailed_answer = None")
 
     rows = [
         {"prompt": "bad-1", "prompt_harm_label": "harmful", "adversarial": True},
@@ -570,13 +587,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--adasteer-bundle",
         type=Path,
-        default=Path("artifacts/adasteer/qwen-qwen2.5-7b-instruct"),
+        default=Path(
+            "artifacts/adasteer/wildguardtrain_10000_seed42/"
+            "qwen-qwen2.5-7b-instruct"
+        ),
     )
     parser.add_argument("--adasteer-model", default=AdaSteer.model_id)
     parser.add_argument("--adasteer-revision")
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--guardagent-root", type=Path)
     parser.add_argument("--guardagent-model", default=DEFAULT_LLM_MODEL)
+    parser.add_argument(
+        "--guardagent-memory-dataset",
+        type=Path,
+        default=Path("wildguardtrain_10000_seed42.parquet"),
+    )
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
     parser.add_argument("--api-base", default=DEFAULT_API_BASE)
     parser.add_argument("--allow-unsafe-guardagent-exec", action="store_true")
@@ -603,6 +628,10 @@ def validate_args(args: argparse.Namespace) -> tuple[str | None, str]:
     if args.piguard_training_checkpoint and not args.piguard_training_root:
         raise SystemExit(
             "--piguard-training-checkpoint requires --piguard-training-root"
+        )
+    if not args.guardagent_memory_dataset.is_file():
+        raise SystemExit(
+            f"GuardAgent memory dataset does not exist: {args.guardagent_memory_dataset}"
         )
     if not args.allow_unsafe_guardagent_exec:
         raise SystemExit(

@@ -55,15 +55,16 @@ from scripts.experts.adasteer_bundle import (
 )
 
 
-def rows_9000():
+def rows_10000():
     return [
         {
+            "case_id": f"test:{index}",
+            "source_dataset": "test",
             "source_index": index,
             "prompt": f"prompt-{index}",
             "prompt_harm_label": "harmful" if index % 3 else "unharmful",
             "adversarial": bool(index % 2),
             "subcategory": f"category-{index % 7}",
-            "response_refusal_label": "refusal" if index % 5 else "compliance",
         }
         for index in range(EXPECTED_ROWS)
     ]
@@ -131,7 +132,7 @@ class AdaSteerJudgeTest(unittest.TestCase):
 
 class AdaSteerDataTest(unittest.TestCase):
     def test_exact_deterministic_stratified_split(self):
-        rows = rows_9000()
+        rows = rows_10000()
         train, validation = stratified_split(rows)
         train_again, validation_again = stratified_split(rows)
         self.assertEqual(len(train), TRAIN_ROWS)
@@ -164,13 +165,21 @@ class AdaSteerDataTest(unittest.TestCase):
         )
 
     def test_stored_response_labels_cannot_change_qwen_grouping(self):
-        first, second = rows_9000()[:2]
+        first, second = rows_10000()[:2]
         first["prompt_harm_label"] = second["prompt_harm_label"] = "harmful"
         first["response_refusal_label"] = "refusal"
         second["response_refusal_label"] = "compliance"
         self.assertEqual(behavior_group(first, False), behavior_group(second, False))
         self.assertEqual(behavior_group(first, True), behavior_group(second, True))
-        self.assertEqual(len(validate_rows(rows_9000())), EXPECTED_ROWS)
+        self.assertEqual(len(validate_rows(rows_10000())), EXPECTED_ROWS)
+
+    def test_nullable_source_metadata_is_valid(self):
+        rows = rows_10000()
+        for row in rows:
+            row["adversarial"] = None
+            row["subcategory"] = None
+        train, validation = stratified_split(rows)
+        self.assertEqual((len(train), len(validation)), (8_000, 2_000))
 
     def test_selects_13_per_required_qwen_group(self):
         grouped = {
