@@ -9,22 +9,19 @@
 import marimo
 
 __generated_with = "0.24.0"
-app = marimo.App(width="medium")
+app = marimo.App(width="full")
 
 
 @app.cell
 def title(mo):
     mo.md(r"""
-    # WildGuardTrain 10,000-case selector
+    # WildGuard train, validation, and test selector
 
-    Selects 10,000 prompt-response rows from `allenai/wildguardmix` (`wildguardtrain`)
-    after normalized prompt de-duplication, while preserving the joint distribution of:
-    - prompt harmfulness
-    - response harmfulness
-    - response action (`refusal` = blocked, `compliance` = allowed)
-
-    The saved Parquet contains only the common prompt-level fields used by PIGuard,
-    AdaSteer, and GuardAgent.
+    Selects 10,000 training and 1,000 validation cases from `WildGuardTrain`,
+    converts every prompt-labeled `WildGuardTest` case, and removes normalized
+    cross-split overlaps with test > validation > train precedence. Training and
+    validation preserve the joint distribution of prompt harmfulness, response
+    harmfulness, and response refusal.
     """)
     return
 
@@ -39,7 +36,9 @@ def imports():
     from datasets import load_dataset
 
     from scripts.training_cases import (
+        CASE_COLUMNS,
         deduplicate_consistent,
+        normalize_prompt,
         read_cases,
         stratified_sample,
         validate_cases,
@@ -47,11 +46,13 @@ def imports():
     )
 
     return (
+        CASE_COLUMNS,
         Counter,
         Path,
         deduplicate_consistent,
         load_dataset,
         mo,
+        normalize_prompt,
         os,
         read_cases,
         stratified_sample,
@@ -61,16 +62,42 @@ def imports():
 
 
 @app.cell
-def config(Path):
+def configuration(Path):
+    WORKSPACE = Path(__file__).resolve().parent
     DATASET_ID = "allenai/wildguardmix"
-    DATASET_CONFIG = "wildguardtrain"
-    DATASET_SPLIT = "train"
+    DATASET_CONFIGS = {"train": "wildguardtrain", "test": "wildguardtest"}
+    DATASET_SPLITS = {"train": "train", "test": "test"}
     DATASET_REVISION = "d29c47f41c8b51348b5c8e8c81c039b3132b66d1"
-    SOURCE_DATASET = f"{DATASET_ID}/{DATASET_CONFIG}"
-    SAMPLE_SIZE = 10_000
-    SEED = 42
-    ENV_PATH = Path("scripts/.env")
-    OUTPUT_PATH = Path("wildguardtrain_10000_seed42.parquet")
+    ENV_PATH = WORKSPACE / "scripts" / ".env"
+    OUTPUT_PATHS = {
+        "train": WORKSPACE / "wildguardtrain_10000_seed42.parquet",
+        "valid": WORKSPACE / "wildguardtrain_validation_1000_seed42.parquet",
+        "test": WORKSPACE / "wildguardtest.parquet",
+    }
+    EXPECTED_SPLIT_SIZES = {"train": 10_000, "valid": 1_000, "test": 1_699}
+    EXPECTED_LABEL_COUNTS = {
+        "train": {"harmful": 5_720, "unharmful": 4_280},
+        "valid": {"harmful": 571, "unharmful": 429},
+        "test": {"unharmful": 945, "harmful": 754},
+    }
+    EXPECTED_JOINT_QUOTAS = {
+        "train": {
+            ("harmful", "harmful", "compliance"): 2_185,
+            ("harmful", "unharmful", "compliance"): 622,
+            ("harmful", "unharmful", "refusal"): 2_913,
+            ("unharmful", "harmful", "compliance"): 6,
+            ("unharmful", "unharmful", "compliance"): 2_157,
+            ("unharmful", "unharmful", "refusal"): 2_117,
+        },
+        "valid": {
+            ("harmful", "harmful", "compliance"): 218,
+            ("harmful", "unharmful", "compliance"): 62,
+            ("harmful", "unharmful", "refusal"): 291,
+            ("unharmful", "harmful", "compliance"): 1,
+            ("unharmful", "unharmful", "compliance"): 216,
+            ("unharmful", "unharmful", "refusal"): 212,
+        },
+    }
     STRATUM_COLUMNS = (
         "prompt_harm_label",
         "response_harm_label",
@@ -81,42 +108,29 @@ def config(Path):
         "response_harm_label": ("harmful", "unharmful"),
         "response_refusal_label": ("refusal", "compliance"),
     }
-    EXPECTED_ELIGIBLE_ROWS = 18_621
-    EXPECTED_PROMPT_LABEL_COUNTS = {"harmful": 5_719, "unharmful": 4_281}
-    EXPECTED_JOINT_QUOTAS = {
-        ("harmful", "harmful", "compliance"): 2_185,
-        ("harmful", "unharmful", "compliance"): 622,
-        ("harmful", "unharmful", "refusal"): 2_912,
-        ("unharmful", "harmful", "compliance"): 7,
-        ("unharmful", "unharmful", "compliance"): 2_157,
-        ("unharmful", "unharmful", "refusal"): 2_117,
-    }
-    RESPONSE_ACTION = {"refusal": "blocked", "compliance": "allowed"}
+    SEED = 42
     return (
-        DATASET_CONFIG,
+        DATASET_CONFIGS,
         DATASET_ID,
         DATASET_REVISION,
-        DATASET_SPLIT,
+        DATASET_SPLITS,
         ENV_PATH,
-        EXPECTED_ELIGIBLE_ROWS,
         EXPECTED_JOINT_QUOTAS,
-        EXPECTED_PROMPT_LABEL_COUNTS,
-        OUTPUT_PATH,
-        RESPONSE_ACTION,
-        SAMPLE_SIZE,
+        EXPECTED_LABEL_COUNTS,
+        EXPECTED_SPLIT_SIZES,
+        OUTPUT_PATHS,
         SEED,
-        SOURCE_DATASET,
         STRATUM_COLUMNS,
         VALID_LABELS,
     )
 
 
 @app.cell
-def load_data(
-    DATASET_CONFIG,
+def load_sources(
+    DATASET_CONFIGS,
     DATASET_ID,
     DATASET_REVISION,
-    DATASET_SPLIT,
+    DATASET_SPLITS,
     ENV_PATH,
     load_dataset,
     os,
@@ -147,15 +161,17 @@ def load_data(
         raise RuntimeError(
             f"HF_TOKEN is required in the environment or {ENV_PATH}."
         )
-
-    wildguardtrain = load_dataset(
-        DATASET_ID,
-        DATASET_CONFIG,
-        split=DATASET_SPLIT,
-        revision=DATASET_REVISION,
-        token=_hf_token,
-    )
-    return (wildguardtrain,)
+    source_rows = {
+        _split: load_dataset(
+            DATASET_ID,
+            _config,
+            split=DATASET_SPLITS[_split],
+            revision=DATASET_REVISION,
+            token=_hf_token,
+        )
+        for _split, _config in DATASET_CONFIGS.items()
+    }
+    return (source_rows,)
 
 
 @app.cell
@@ -164,216 +180,200 @@ def eligibility(
     STRATUM_COLUMNS,
     VALID_LABELS,
     deduplicate_consistent,
-    mo,
-    wildguardtrain,
+    normalize_prompt,
+    source_rows,
 ):
-    def _has_non_empty_response(row):
-        _response = row.get("response")
-        return isinstance(_response, str) and bool(_response.strip())
+    def _has_non_empty_text(row, column):
+        _value = row.get(column)
+        return isinstance(_value, str) and bool(_value.strip())
 
-    def _is_eligible(row):
-        _prompt = row.get("prompt")
-        return (
-            isinstance(_prompt, str)
-            and bool(_prompt.strip())
-            and _has_non_empty_response(row)
-            and all(
-                row.get(_column) in VALID_LABELS[_column]
-                for _column in STRATUM_COLUMNS
-            )
-        )
-
-    response_row_count = sum(
-        _has_non_empty_response(_row) for _row in wildguardtrain
-    )
-    _eligible_rows = [
+    _training_candidates = [
         {**_row, "source_index": _source_index}
-        for _source_index, _row in enumerate(wildguardtrain)
-        if _is_eligible(_row)
+        for _source_index, _row in enumerate(source_rows["train"])
+        if _has_non_empty_text(_row, "prompt")
+        and _has_non_empty_text(_row, "response")
+        and all(
+            _row.get(_column) in VALID_LABELS[_column]
+            for _column in STRATUM_COLUMNS
+        )
     ]
-    eligible_cases, conflicting_prompt_keys = deduplicate_consistent(
-        _eligible_rows, SEED
-    )
-    eligibility_summary = [
-        {"population": "All WildGuardTrain rows", "rows": len(wildguardtrain)},
-        {"population": "Non-empty responses", "rows": response_row_count},
-        {
-            "population": "Eligible complete labels",
-            "rows": len(_eligible_rows),
-        },
-        {
-            "population": "Conflicting normalized prompt keys removed",
-            "rows": conflicting_prompt_keys,
-        },
-        {
-            "population": "Unique normalized-prompt pool",
-            "rows": len(eligible_cases),
-        },
+    _test_candidates = [
+        {**_row, "source_index": _source_index}
+        for _source_index, _row in enumerate(source_rows["test"])
+        if _has_non_empty_text(_row, "prompt")
+        and _row.get("prompt_harm_label") in VALID_LABELS["prompt_harm_label"]
     ]
-    eligibility_view = mo.vstack(
-        [mo.md("## Eligibility"), mo.ui.table(eligibility_summary)]
+    eligible_training_rows, training_conflicts = deduplicate_consistent(
+        _training_candidates, SEED
     )
-    eligibility_view
-    return conflicting_prompt_keys, eligible_cases
+    test_rows, test_conflicts = deduplicate_consistent(_test_candidates, SEED)
+    assert len(eligible_training_rows) == 18_621
+    assert len(test_rows) == 1_699
+    assert training_conflicts == test_conflicts == 0
+    assert len(source_rows["test"]) - len(_test_candidates) == 26
+
+    _test_keys = {normalize_prompt(_row["prompt"]) for _row in test_rows}
+    training_pool = [
+        _row
+        for _row in eligible_training_rows
+        if normalize_prompt(_row["prompt"]) not in _test_keys
+    ]
+    assert len(training_pool) == 18_620
+    return test_rows, training_pool
 
 
 @app.cell
-def quotas(
-    SAMPLE_SIZE,
+def select_training_and_validation(
+    EXPECTED_JOINT_QUOTAS,
     SEED,
     STRATUM_COLUMNS,
-    eligible_cases,
+    normalize_prompt,
     stratified_sample,
+    training_pool,
 ):
     def joint_key(row):
         return tuple(row[_column] for _column in STRATUM_COLUMNS)
 
-    selected_source_rows, joint_quotas, source_counts = stratified_sample(
-        eligible_cases,
-        SAMPLE_SIZE,
-        SEED,
-        joint_key,
+    training_source_rows, training_quotas, _ = stratified_sample(
+        training_pool, 10_000, SEED, joint_key
     )
-    _repeat_rows, _repeat_quotas, _repeat_counts = stratified_sample(
-        eligible_cases,
-        SAMPLE_SIZE,
-        SEED,
-        joint_key,
-    )
-    assert [row["source_index"] for row in selected_source_rows] == [
-        row["source_index"] for row in _repeat_rows
+    _training_keys = {
+        normalize_prompt(_row["prompt"]) for _row in training_source_rows
+    }
+    _validation_pool = [
+        _row
+        for _row in training_pool
+        if normalize_prompt(_row["prompt"]) not in _training_keys
     ]
-    assert joint_quotas == _repeat_quotas
-    assert source_counts == _repeat_counts
-    return joint_key, joint_quotas, selected_source_rows, source_counts
+    validation_source_rows, validation_quotas, _ = stratified_sample(
+        _validation_pool, 1_000, SEED, joint_key
+    )
+    assert training_quotas == EXPECTED_JOINT_QUOTAS["train"]
+    assert validation_quotas == EXPECTED_JOINT_QUOTAS["valid"]
+
+    _repeat_train, _repeat_train_quotas, _ = stratified_sample(
+        training_pool, 10_000, SEED, joint_key
+    )
+    _repeat_valid, _repeat_valid_quotas, _ = stratified_sample(
+        _validation_pool, 1_000, SEED, joint_key
+    )
+    assert _repeat_train_quotas == training_quotas
+    assert _repeat_valid_quotas == validation_quotas
+    assert [row["source_index"] for row in _repeat_train] == [
+        row["source_index"] for row in training_source_rows
+    ]
+    assert [row["source_index"] for row in _repeat_valid] == [
+        row["source_index"] for row in validation_source_rows
+    ]
+    return training_source_rows, validation_source_rows
 
 
 @app.cell
-def selection(SOURCE_DATASET, selected_source_rows, validate_cases):
-    training_cases = [
-        {
-            "case_id": f"wildguardtrain:{_row['source_index']}",
-            "source_dataset": SOURCE_DATASET,
-            "source_index": _row["source_index"],
-            "prompt": _row["prompt"],
-            "prompt_harm_label": _row["prompt_harm_label"],
-            "adversarial": _row["adversarial"],
-            "subcategory": _row["subcategory"] or None,
+def build_cases(
+    DATASET_CONFIGS,
+    DATASET_ID,
+    test_rows,
+    training_source_rows,
+    validation_source_rows,
+):
+    def _case(split, row):
+        _source_split = "test" if split == "test" else "train"
+        return {
+            "case_id": f"wildguard:{split}:{row['source_index']}",
+            "source_dataset": (
+                f"{DATASET_ID}/{DATASET_CONFIGS[_source_split]}"
+            ),
+            "source_index": row["source_index"],
+            "prompt": row["prompt"].strip(),
+            "prompt_harm_label": row["prompt_harm_label"],
+            "adversarial": row["adversarial"],
+            "subcategory": row["subcategory"] or None,
         }
-        for _row in selected_source_rows
-    ]
-    validate_cases(training_cases)
-    return (training_cases,)
+
+    selected_rows = {
+        "train": [_case("train", _row) for _row in training_source_rows],
+        "valid": [_case("valid", _row) for _row in validation_source_rows],
+        "test": [_case("test", _row) for _row in test_rows],
+    }
+    return (selected_rows,)
 
 
 @app.cell
-def validation(
+def validate_splits(
     Counter,
-    EXPECTED_ELIGIBLE_ROWS,
-    EXPECTED_JOINT_QUOTAS,
-    EXPECTED_PROMPT_LABEL_COUNTS,
-    conflicting_prompt_keys,
-    eligible_cases,
-    joint_key,
-    joint_quotas,
-    mo,
-    selected_source_rows,
-    training_cases,
+    EXPECTED_LABEL_COUNTS,
+    EXPECTED_SPLIT_SIZES,
+    normalize_prompt,
+    selected_rows,
+    validate_cases,
 ):
-    selected_counts = Counter(joint_key(_row) for _row in selected_source_rows)
-    prompt_label_counts = Counter(
-        _row["prompt_harm_label"] for _row in training_cases
-    )
-
-    assert len(eligible_cases) == EXPECTED_ELIGIBLE_ROWS
-    assert conflicting_prompt_keys == 0
-    assert dict(prompt_label_counts) == EXPECTED_PROMPT_LABEL_COUNTS
-    assert dict(selected_counts) == EXPECTED_JOINT_QUOTAS
-    assert joint_quotas == EXPECTED_JOINT_QUOTAS
-
-    validation_summary = [
-        {"check": "Selected rows", "result": f"{len(training_cases):,}"},
-        {
-            "check": "Distinct source rows",
-            "result": f"{len({row['source_index'] for row in training_cases}):,}",
-        },
-        {
-            "check": "Distinct normalized prompts",
-            "result": f"{len(training_cases):,}",
-        },
-        {"check": "Prompt labels", "result": dict(prompt_label_counts)},
-        {"check": "Joint quotas", "result": "exact"},
-        {"check": "Seed repeatability", "result": "identical"},
-    ]
-    validation_view = mo.vstack(
-        [mo.md("## Validation"), mo.ui.table(validation_summary)]
-    )
-    validation_view
-    return (selected_counts,)
+    for _split, _rows in selected_rows.items():
+        validate_cases(_rows, EXPECTED_SPLIT_SIZES[_split])
+        assert dict(
+            Counter(_row["prompt_harm_label"] for _row in _rows)
+        ) == EXPECTED_LABEL_COUNTS[_split]
+    _prompt_keys = {
+        _split: {normalize_prompt(_row["prompt"]) for _row in _rows}
+        for _split, _rows in selected_rows.items()
+    }
+    assert not (_prompt_keys["train"] & _prompt_keys["valid"])
+    assert not (_prompt_keys["train"] & _prompt_keys["test"])
+    assert not (_prompt_keys["valid"] & _prompt_keys["test"])
+    return
 
 
 @app.cell
-def distributions(
-    RESPONSE_ACTION,
-    SAMPLE_SIZE,
-    eligible_cases,
-    mo,
-    selected_counts,
-    source_counts,
+def save_and_validate(
+    CASE_COLUMNS,
+    EXPECTED_SPLIT_SIZES,
+    OUTPUT_PATHS,
+    read_cases,
+    selected_rows,
+    write_cases,
 ):
-    joint_distribution = []
-    for _key in sorted(source_counts):
-        _source_count = source_counts[_key]
-        _selected_count = selected_counts[_key]
-        joint_distribution.append(
-            {
-                "prompt_harm": _key[0],
-                "response_harm": _key[1],
-                "response_action": RESPONSE_ACTION[_key[2]],
-                "source_rows": _source_count,
-                "source_pct": round(
-                    100 * _source_count / len(eligible_cases), 4
-                ),
-                "selected_rows": _selected_count,
-                "selected_pct": round(100 * _selected_count / SAMPLE_SIZE, 4),
-            }
+    output_bytes = {}
+    validated_rows = {}
+    for _split, _rows in selected_rows.items():
+        _expected = EXPECTED_SPLIT_SIZES[_split]
+        output_bytes[_split] = write_cases(
+            OUTPUT_PATHS[_split], _rows, expected_rows=_expected
         )
+        validated_rows[_split] = read_cases(
+            OUTPUT_PATHS[_split], expected_rows=_expected
+        )
+        assert tuple(validated_rows[_split][0]) == CASE_COLUMNS
+        assert [row["case_id"] for row in validated_rows[_split]] == [
+            row["case_id"] for row in _rows
+        ]
+    return output_bytes, validated_rows
 
-    distribution_view = mo.vstack(
+
+@app.cell
+def summary(Counter, OUTPUT_PATHS, mo, output_bytes, source_rows, validated_rows):
+    summary_rows = [
+        {
+            "split": _split,
+            "output rows": len(_rows),
+            "labels": dict(
+                Counter(_row["prompt_harm_label"] for _row in _rows)
+            ),
+            "output": OUTPUT_PATHS[_split].name,
+            "MB": round(output_bytes[_split] / 1_000_000, 2),
+        }
+        for _split, _rows in validated_rows.items()
+    ]
+    mo.vstack(
         [
-            mo.md("## Preserved joint distribution"),
-            mo.ui.table(joint_distribution),
+            mo.md(
+                f"## Selection complete\n\n"
+                f"WildGuardTrain source rows: **{len(source_rows['train']):,}**  \n"
+                f"WildGuardTest source rows: **{len(source_rows['test']):,}**"
+            ),
+            mo.ui.table(summary_rows, selection=None),
+            mo.md("## Preview"),
+            mo.ui.table(validated_rows["train"][:20], selection=None),
         ]
     )
-    distribution_view
-    return
-
-
-@app.cell
-def save_parquet(OUTPUT_PATH, mo, read_cases, training_cases, write_cases):
-    bytes_written = write_cases(OUTPUT_PATH, training_cases)
-    saved_cases = read_cases(OUTPUT_PATH)
-    parquet_row_count = len(saved_cases)
-
-    save_summary = [
-        {"output": str(OUTPUT_PATH.resolve())},
-        {"rows": f"{parquet_row_count:,}"},
-        {"bytes": f"{bytes_written:,}"},
-    ]
-    save_view = mo.vstack(
-        [mo.md("## Saved Parquet"), mo.ui.table(save_summary)]
-    )
-    save_view
-    return
-
-
-@app.cell
-def preview(mo, training_cases):
-    preview_rows = training_cases[:25]
-    preview_view = mo.vstack(
-        [mo.md("## Selected-row preview"), mo.ui.table(preview_rows)]
-    )
-    preview_view
     return
 
 

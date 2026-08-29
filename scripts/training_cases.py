@@ -44,10 +44,10 @@ def case_schema():
 
 
 def validate_cases(
-    rows: Iterable[dict[str, Any]], expected_rows: int = EXPECTED_ROWS
+    rows: Iterable[dict[str, Any]], expected_rows: int | None = EXPECTED_ROWS
 ) -> list[dict[str, Any]]:
     rows = list(rows)
-    if len(rows) != expected_rows:
+    if expected_rows is not None and len(rows) != expected_rows:
         raise ValueError(f"expected {expected_rows:,} rows, found {len(rows):,}")
 
     case_ids: set[str] = set()
@@ -93,7 +93,9 @@ def validate_cases(
     return rows
 
 
-def read_cases(path: Path, expected_rows: int = EXPECTED_ROWS) -> list[dict[str, Any]]:
+def read_cases(
+    path: Path, expected_rows: int | None = EXPECTED_ROWS
+) -> list[dict[str, Any]]:
     import pyarrow.parquet as pq
 
     path = Path(path).expanduser().resolve()
@@ -105,12 +107,16 @@ def read_cases(path: Path, expected_rows: int = EXPECTED_ROWS) -> list[dict[str,
     return validate_cases(table.to_pylist(), expected_rows)
 
 
-def write_cases(path: Path, rows: Iterable[dict[str, Any]]) -> int:
+def write_cases(
+    path: Path,
+    rows: Iterable[dict[str, Any]],
+    expected_rows: int | None = EXPECTED_ROWS,
+) -> int:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     path = Path(path)
-    rows = validate_cases(rows)
+    rows = validate_cases(rows, expected_rows)
     table = pa.Table.from_pylist(rows, schema=case_schema())
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
@@ -120,7 +126,7 @@ def write_cases(path: Path, rows: Iterable[dict[str, Any]]) -> int:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
-    read_cases(path)
+    read_cases(path, expected_rows)
     return path.stat().st_size
 
 

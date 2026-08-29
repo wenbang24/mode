@@ -31,7 +31,6 @@ def _():
     import hashlib
     import importlib
     import json
-    import math
     import os
     import platform
     import random
@@ -47,16 +46,20 @@ def _():
 
     import numpy as np
 
-    from scripts.training_cases import read_cases
+    from scripts.training_cases import normalize_prompt, read_cases
 
     WORKSPACE = Path(__file__).resolve().parent
-    DEFAULT_DATASET_PATH = WORKSPACE / "wildguardtrain_10000_seed42.parquet"
+    DEFAULT_DATASET_PATHS = {
+        "train": WORKSPACE / "wildguardtrain_10000_seed42.parquet",
+        "valid": WORKSPACE / "wildguardtrain_validation_1000_seed42.parquet",
+        "test": WORKSPACE / "wildguardtest.parquet",
+    }
     RUNTIME_ROOT = WORKSPACE / ".piguard"
     UPSTREAM_DIR = RUNTIME_ROOT / "PIGuard"
     ARTIFACT_ROOT = WORKSPACE / "artifacts" / "piguard_custom"
     CACHE_VERSION = 1
     STEP_VERSIONS = {
-        "prepare": 1,
+        "prepare": 2,
         "stage1": 1,
         "scan": 1,
         "generate": 1,
@@ -454,74 +457,67 @@ def _():
         )
         return train_diff + shim_diff
 
-    def _apportion(count, ratios=(0.8, 0.1, 0.1)):
-        raw = [count * ratio for ratio in ratios]
-        result = [math.floor(value) for value in raw]
-        for index in sorted(
-            range(len(raw)),
-            key=lambda i: (raw[i] - result[i], -i),
-            reverse=True,
-        )[: count - sum(result)]:
-            result[index] += 1
-        return result
+    def prepare_data(
+        run_dir, dataset_paths, dataset_sha256s, smoke=False
+    ):
+        source_rows = {
+            "train": read_cases(dataset_paths["train"]),
+            "valid": read_cases(
+                dataset_paths["valid"], expected_rows=None
+            ),
+            "test": read_cases(dataset_paths["test"], expected_rows=None),
+        }
+        if not source_rows["valid"] or not source_rows["test"]:
+            raise ValueError("Validation and test datasets must not be empty.")
+        prompt_keys = {
+            split: {normalize_prompt(row["prompt"]) for row in rows}
+            for split, rows in source_rows.items()
+        }
+        for left, right in (
+            ("train", "valid"),
+            ("train", "test"),
+            ("valid", "test"),
+        ):
+            overlap = prompt_keys[left] & prompt_keys[right]
+            if overlap:
+                raise ValueError(
+                    f"{left} and {right} contain {len(overlap):,} overlapping normalized prompts."
+                )
 
-    def prepare_data(run_dir, dataset_path, dataset_sha256, smoke=False):
-        source = read_cases(dataset_path)
-        prompts = [row["prompt"] for row in source]
-        counts = Counter(row["prompt_harm_label"] for row in source)
-
-        split_rows = {"train": [], "valid": [], "test": []}
+        split_rows = {}
         manifest_rows = []
-        for source_label, numeric_label in LABELS.items():
-            label_rows = [
-                row
-                for row in source
-                if row["prompt_harm_label"] == source_label
+        for split, rows in source_rows.items():
+            split_rows[split] = [
+                {
+                    "prompt": row["prompt"],
+                    "label": LABELS[row["prompt_harm_label"]],
+                }
+                for row in rows
             ]
-            label_rows.sort(
-                key=lambda row: hashlib.sha256(
-                    f"{SEED}\0{row['prompt']}".encode()
-                ).hexdigest()
+            manifest_rows.extend(
+                {
+                    "case_id": row["case_id"],
+                    "source_dataset": row["source_dataset"],
+                    "source_index": row["source_index"],
+                    "prompt_sha256": hashlib.sha256(
+                        row["prompt"].encode()
+                    ).hexdigest(),
+                    "source_label": row["prompt_harm_label"],
+                    "label": LABELS[row["prompt_harm_label"]],
+                    "split": split,
+                }
+                for row in rows
             )
-            train_n, valid_n, test_n = _apportion(len(label_rows))
-            boundaries = (train_n, train_n + valid_n)
-            groups = {
-                "train": label_rows[: boundaries[0]],
-                "valid": label_rows[boundaries[0] : boundaries[1]],
-                "test": label_rows[boundaries[1] :],
-            }
-            if len(groups["test"]) != test_n:
-                raise AssertionError("Stratified split allocation failed.")
-            for split, rows in groups.items():
-                split_rows[split].extend(
-                    {"prompt": row["prompt"], "label": numeric_label}
-                    for row in rows
-                )
-                manifest_rows.extend(
-                    {
-                        "case_id": row["case_id"],
-                        "source_dataset": row["source_dataset"],
-                        "source_index": row["source_index"],
-                        "prompt_sha256": hashlib.sha256(
-                            row["prompt"].encode()
-                        ).hexdigest(),
-                        "source_label": source_label,
-                        "label": numeric_label,
-                        "split": split,
-                    }
-                    for row in rows
-                )
-
-        for split, rows in split_rows.items():
-            rows.sort(
+            split_rows[split].sort(
                 key=lambda row: hashlib.sha256(
                     f"order\0{SEED}\0{row['prompt']}".encode()
                 ).hexdigest()
             )
-            write_json(Path(run_dir) / "data" / f"{split}.json", rows)
+            write_json(
+                Path(run_dir) / "data" / f"{split}.json",
+                split_rows[split],
+            )
         split_sizes = {key: len(value) for key, value in split_rows.items()}
-        if split_sizes != {"train": 8000, "valid": 1000, "test": 1000}:
-            raise AssertionError(split_sizes)
 
         manifest_path = Path(run_dir) / "manifests" / "split_manifest.jsonl"
         atomic_text(
@@ -532,17 +528,23 @@ def _():
             ),
         )
         data_manifest = {
-            "source": str(dataset_path),
-            "source_sha256": dataset_sha256,
+            "sources": {
+                split: {
+                    "path": str(dataset_paths[split]),
+                    "sha256": dataset_sha256s[split],
+                }
+                for split in split_rows
+            },
             "seed": SEED,
             "label_mapping": LABELS,
-            "source_label_counts": dict(counts),
             "split_sizes": split_sizes,
             "split_label_counts": {
                 split: dict(Counter(row["label"] for row in rows))
                 for split, rows in split_rows.items()
             },
-            "unique_prompts": len(prompts),
+            "unique_prompts": {
+                split: len(keys) for split, keys in prompt_keys.items()
+            },
         }
         write_json(
             Path(run_dir) / "manifests" / "data_manifest.json", data_manifest
@@ -611,12 +613,25 @@ def _():
         ).hexdigest()[:12]
 
     def pipeline_artifacts(config, root=ARTIFACT_ROOT):
-        dataset_path = Path(config["dataset_path"]).expanduser().resolve()
-        if not dataset_path.is_file():
-            raise FileNotFoundError(dataset_path)
+        dataset_paths = {
+            split: Path(config[key]).expanduser().resolve()
+            for split, key in {
+                "train": "train_dataset_path",
+                "valid": "validation_dataset_path",
+                "test": "test_dataset_path",
+            }.items()
+        }
+        for dataset_path in dataset_paths.values():
+            if not dataset_path.is_file():
+                raise FileNotFoundError(dataset_path)
         config = {
-            "dataset_path": str(dataset_path),
-            "dataset_sha256": file_sha256(dataset_path),
+            "dataset_paths": {
+                split: str(path) for split, path in dataset_paths.items()
+            },
+            "dataset_sha256s": {
+                split: file_sha256(path)
+                for split, path in dataset_paths.items()
+            },
             "model_id": config["model_id"].strip(),
             "revision": config.get("revision", "").strip(),
             "training_mode": config["training_mode"],
@@ -632,7 +647,7 @@ def _():
             **common,
             "step_version": STEP_VERSIONS["prepare"],
             "upstream_commit": UPSTREAM_COMMIT,
-            "dataset_sha256": config["dataset_sha256"],
+            "dataset_sha256s": config["dataset_sha256s"],
             "seed": SEED,
             "smoke": config["smoke"],
         }
@@ -786,108 +801,9 @@ def _():
             **result,
         }
 
-    def _training_matches(saved, current):
-        return (
-            saved.get("model_id") == current["model_id"]
-            and (saved.get("revision") or "") == current["revision"]
-            and saved.get("training_mode") == current["training_mode"]
-            and bool(saved.get("trust_remote_code"))
-            == current["trust_remote_code"]
-            and bool(saved.get("smoke")) == current["smoke"]
-            and saved.get("batch_size") == current["batch_size"]
-            and saved.get("max_length") == current["max_length"]
-        )
-
-    def _legacy_generation_matches(run_dir, config):
-        manifest_path = run_dir / "manifests" / "ai_generation.json"
-        output_path = run_dir / "generated" / "benign_prompts.jsonl"
-        if not manifest_path.exists() or not output_path.exists():
-            return False
-        try:
-            manifest = read_json(manifest_path)
-            rows = read_jsonl(output_path)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return False
-        target = 4 if config["smoke"] else 1000
-        return (
-            manifest.get("model") == config["ai_model"]
-            and str(manifest.get("base_url", "")).rstrip("/")
-            == config["ai_base_url"]
-            and manifest.get("accepted") == target
-            and len(rows) == target
-        )
-
-    def _legacy_artifact(pipeline, step):
-        root = pipeline["root"]
-        config = pipeline["config"]
-        if not root.exists():
-            return None
-        for run_dir in sorted(root.iterdir()):
-            config_path = run_dir / "run_config.json"
-            if run_dir.name == "cache" or not config_path.exists():
-                continue
-            try:
-                saved = read_json(config_path)
-                data_manifest = read_json(
-                    run_dir / "manifests" / "data_manifest.json"
-                )
-            except (OSError, ValueError, json.JSONDecodeError):
-                continue
-            base_matches = (
-                saved.get("upstream_commit") == UPSTREAM_COMMIT
-                and saved.get("dataset_sha256") == config["dataset_sha256"]
-                and data_manifest.get("seed") == SEED
-                and bool(saved.get("smoke")) == config["smoke"]
-            )
-            if not base_matches:
-                continue
-            training_matches = _training_matches(saved, config)
-            generation_matches = (
-                training_matches
-                and _legacy_generation_matches(run_dir, config)
-            )
-            paths = {
-                "prepare": run_dir,
-                "stage1": run_dir / "stage1",
-                "scan": run_dir,
-                "generate": run_dir,
-                "stage2": run_dir / "stage2",
-                "evaluate": run_dir / "stage2" / "evaluation",
-            }
-            complete = {
-                "prepare": all(
-                    (paths["prepare"] / relative).exists()
-                    for relative in _required_outputs(
-                        pipeline["steps"]["prepare"]
-                    )
-                ),
-                "stage1": training_matches
-                and (paths["stage1"] / "stage_manifest.json").exists()
-                and (paths["stage1"] / "checkpoints/best_model.pth").exists(),
-                "scan": training_matches
-                and (paths["scan"] / "biased_tokens.json").exists(),
-                "generate": generation_matches,
-                "stage2": generation_matches
-                and (paths["stage2"] / "stage_manifest.json").exists()
-                and (paths["stage2"] / "checkpoints/best_model.pth").exists(),
-                "evaluate": generation_matches
-                and (paths["evaluate"] / "metrics.json").exists()
-                and (paths["evaluate"] / "test_predictions.jsonl").exists(),
-            }
-            if complete[step]:
-                return {
-                    **pipeline["steps"][step],
-                    "path": paths[step],
-                    "legacy": True,
-                    "legacy_run": run_dir,
-                }
-        return None
-
     def _resolved_artifact(pipeline, step):
         artifact = pipeline["steps"][step]
-        if _cache_manifest(artifact) is not None:
-            return artifact
-        return _legacy_artifact(pipeline, step)
+        return artifact if _cache_manifest(artifact) is not None else None
 
     def _cached_result(artifact):
         result = {
@@ -895,11 +811,8 @@ def _():
             "step": artifact["step"],
             "key": artifact["key"],
             "artifact_dir": str(artifact["path"]),
-            "legacy": bool(artifact.get("legacy")),
         }
-        manifest = (
-            None if artifact.get("legacy") else _cache_manifest(artifact)
-        )
+        manifest = _cache_manifest(artifact)
         if manifest is not None and isinstance(manifest.get("result"), dict):
             result.update(manifest["result"])
         return result
@@ -931,7 +844,7 @@ def _():
             "resolved_training_mode": resolved_mode,
             "parameter_count": parameter_count,
             "upstream_commit": UPSTREAM_COMMIT,
-            "dataset_sha256": config["dataset_sha256"],
+            "dataset_sha256s": config["dataset_sha256s"],
         }
 
     def prepare_run(pipeline):
@@ -943,8 +856,13 @@ def _():
         source_diff = patch_upstream()
         data_manifest = prepare_data(
             artifact["path"],
-            Path(pipeline["config"]["dataset_path"]),
-            pipeline["config"]["dataset_sha256"],
+            {
+                split: Path(path)
+                for split, path in pipeline["config"][
+                    "dataset_paths"
+                ].items()
+            },
+            pipeline["config"]["dataset_sha256s"],
             smoke=pipeline["config"]["smoke"],
         )
         atomic_text(artifact["path"] / "patched-source.diff", source_diff)
@@ -1082,11 +1000,8 @@ def _():
         return _complete_artifact(artifact, record, config=config)
 
     def _artifact_training_config(artifact):
-        if artifact.get("legacy"):
-            config = read_json(artifact["legacy_run"] / "run_config.json")
-        else:
-            manifest = _cache_manifest(artifact)
-            config = None if manifest is None else manifest.get("config")
+        manifest = _cache_manifest(artifact)
+        config = None if manifest is None else manifest.get("config")
         if not isinstance(config, dict) or not config.get(
             "resolved_training_mode"
         ):
@@ -1679,7 +1594,6 @@ def _():
             if resolved is not None:
                 state = "cached"
                 path = resolved["path"]
-                legacy = bool(resolved.get("legacy"))
             else:
                 path = artifact["path"]
                 state = (
@@ -1687,12 +1601,10 @@ def _():
                     if path.exists() and any(path.iterdir())
                     else "missing"
                 )
-                legacy = False
             status[step] = {
                 "state": state,
                 "key": artifact["key"],
                 "path": path,
-                "legacy": legacy,
             }
         return status
 
@@ -1711,10 +1623,6 @@ def _():
             pass
         else:
             raise AssertionError("insecure remote AI URL was accepted")
-        assert _apportion(5_719) == [4_575, 572, 572]
-        assert _apportion(4_281) == [3_425, 428, 428]
-        assert _apportion(5_057) == [4_045, 506, 506]
-        assert _apportion(4_943) == [3_955, 494, 494]
         parsed = parse_prompt_response(
             '```json\n[{"prompt":"A safe test"}]\n```'
         )
@@ -1766,7 +1674,11 @@ def _():
             ]
 
         base_config = {
-            "dataset_path": str(DEFAULT_DATASET_PATH),
+            "train_dataset_path": str(DEFAULT_DATASET_PATHS["train"]),
+            "validation_dataset_path": str(
+                DEFAULT_DATASET_PATHS["valid"]
+            ),
+            "test_dataset_path": str(DEFAULT_DATASET_PATHS["test"]),
             "model_id": "example/model",
             "revision": "main",
             "training_mode": "full",
@@ -1788,6 +1700,16 @@ def _():
 
         original = keys(base_config)
         assert keys(dict(base_config)) == original
+        path_settings = {
+            "train_dataset_path": DEFAULT_DATASET_PATHS["valid"],
+            "validation_dataset_path": DEFAULT_DATASET_PATHS["test"],
+            "test_dataset_path": DEFAULT_DATASET_PATHS["valid"],
+        }
+        for setting, path in path_settings.items():
+            changed = keys(base_config | {setting: str(path)})
+            assert all(
+                changed[step] != original[step] for step in original
+            )
         ai_changed = keys(
             base_config
             | {
@@ -1878,53 +1800,24 @@ def _():
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             legacy = root / "legacy-run"
-            saved = {
-                key: base_config[key]
-                for key in (
-                    "model_id",
-                    "revision",
-                    "training_mode",
-                    "trust_remote_code",
-                    "smoke",
-                    "batch_size",
-                    "max_length",
-                )
-            } | {
-                "resolved_training_mode": "full",
-                "upstream_commit": UPSTREAM_COMMIT,
-                "dataset_sha256": file_sha256(DEFAULT_DATASET_PATH),
-            }
-            write_json(legacy / "run_config.json", saved)
-            write_json(
-                legacy / "manifests" / "data_manifest.json", {"seed": SEED}
-            )
-            for name in ("train", "valid", "test"):
-                write_json(legacy / "data" / f"{name}.json", [])
-                write_json(legacy / "data" / f"smoke_{name}.json", [])
-            atomic_text(legacy / "patched-source.diff", "test\n")
-            atomic_text(
-                legacy / "stage1" / "checkpoints" / "best_model.pth",
-                "test\n",
-            )
-            write_json(legacy / "stage1" / "stage_manifest.json", {})
+            write_json(legacy / "run_config.json", {})
             legacy_pipeline = pipeline_artifacts(base_config, root=root)
-            assert _legacy_artifact(legacy_pipeline, "prepare") is not None
-            assert _legacy_artifact(legacy_pipeline, "stage1") is not None
+            assert _resolved_artifact(legacy_pipeline, "prepare") is None
+            assert _resolved_artifact(legacy_pipeline, "stage1") is None
             assert not (root / "cache").exists()
         return {
             "ai_url_validation": "ok",
-            "split_math": "ok",
             "ai_response_parsing": "ok",
             "deduplication": "ok",
             "429_retry_and_budget": "ok",
             "jsonl_resume": "ok",
-            "step_cache_keys": "ok",
+            "dedicated_split_cache_keys": "ok",
             "cache_completion_and_partial_resume": "ok",
-            "legacy_cache_discovery": "ok",
+            "legacy_cache_rejected": "ok",
         }
 
     return (
-        DEFAULT_DATASET_PATH,
+        DEFAULT_DATASET_PATHS,
         PRESETS,
         STEP_LABELS,
         UPSTREAM_COMMIT,
@@ -1959,10 +1852,20 @@ def title(UPSTREAM_COMMIT, UPSTREAM_REPO, mo):
 
 
 @app.cell(hide_code=True)
-def controls(DEFAULT_DATASET_PATH, mo):
-    dataset_path = mo.ui.text(
-        value=str(DEFAULT_DATASET_PATH),
+def controls(DEFAULT_DATASET_PATHS, mo):
+    train_dataset_path = mo.ui.text(
+        value=str(DEFAULT_DATASET_PATHS["train"]),
         label="10,000-row training Parquet",
+        full_width=True,
+    )
+    validation_dataset_path = mo.ui.text(
+        value=str(DEFAULT_DATASET_PATHS["valid"]),
+        label="Validation Parquet",
+        full_width=True,
+    )
+    test_dataset_path = mo.ui.text(
+        value=str(DEFAULT_DATASET_PATHS["test"]),
+        label="Test Parquet",
         full_width=True,
     )
     backbone_preset = mo.ui.dropdown(
@@ -2015,7 +1918,6 @@ def controls(DEFAULT_DATASET_PATH, mo):
         backbone_preset,
         batch_size,
         custom_model_id,
-        dataset_path,
         evaluate_button,
         generate_button,
         max_length,
@@ -2025,8 +1927,11 @@ def controls(DEFAULT_DATASET_PATH, mo):
         smoke_mode,
         stage1_button,
         stage2_button,
+        test_dataset_path,
+        train_dataset_path,
         training_mode,
         trust_remote_code,
+        validation_dataset_path,
     )
 
 
@@ -2038,13 +1943,15 @@ def configuration(
     backbone_preset,
     batch_size,
     custom_model_id,
-    dataset_path,
     max_length,
     model_revision,
     pipeline_artifacts,
     smoke_mode,
+    test_dataset_path,
+    train_dataset_path,
     training_mode,
     trust_remote_code,
+    validation_dataset_path,
 ):
     selected_model_id = (
         custom_model_id.value.strip()
@@ -2052,7 +1959,9 @@ def configuration(
         else PRESETS[backbone_preset.value]
     )
     run_config = {
-        "dataset_path": dataset_path.value.strip(),
+        "train_dataset_path": train_dataset_path.value.strip(),
+        "validation_dataset_path": validation_dataset_path.value.strip(),
+        "test_dataset_path": test_dataset_path.value.strip(),
         "model_id": selected_model_id,
         "revision": model_revision.value.strip(),
         "training_mode": training_mode.value,
@@ -2074,7 +1983,6 @@ def control_panel(
     backbone_preset,
     batch_size,
     custom_model_id,
-    dataset_path,
     evaluate_button,
     generate_button,
     max_length,
@@ -2086,13 +1994,18 @@ def control_panel(
     smoke_mode,
     stage1_button,
     stage2_button,
+    test_dataset_path,
+    train_dataset_path,
     training_mode,
     trust_remote_code,
+    validation_dataset_path,
 ):
     mo.vstack(
         [
             mo.md("## Configuration"),
-            dataset_path,
+            train_dataset_path,
+            validation_dataset_path,
+            test_dataset_path,
             mo.hstack([backbone_preset, custom_model_id]),
             mo.hstack([model_revision, training_mode, trust_remote_code]),
             mo.hstack([smoke_mode, batch_size, max_length]),
@@ -2169,7 +2082,6 @@ def status(STEP_LABELS, action_result, artifact_status, mo, pipeline):
     _rows = "\n".join(
         f"- {_icons[item['state']]} {STEP_LABELS[step]} — "
         f"**{item['state']}** · `{item['key']}`"
-        + (" · legacy" if item["legacy"] else "")
         for step, item in _status.items()
     )
     _diff_path = _status["prepare"]["path"] / "patched-source.diff"
