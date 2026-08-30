@@ -4,11 +4,21 @@
 #     "marimo==0.24.0",
 #     "numpy==2.1.3",
 #     "pyarrow==18.1.0",
-#     "torch==2.4.1",
+#     "torch",
 #     "tqdm==4.67.1",
 #     "transformers==4.46.3",
 # ]
 # requires-python = ">=3.10,<3.13"
+#
+# [[tool.uv.index]]
+# name = "pytorch-cu130"
+# url = "https://download.pytorch.org/whl/cu130"
+# explicit = true
+#
+# [tool.uv.sources]
+# torch = [
+#     { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+# ]
 # ///
 
 import marimo
@@ -63,9 +73,40 @@ def imports():
 
 
 @app.cell
-def controls(DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
+def setup_adasteer(Path, mo):
+    import subprocess
+
+    adasteer_checkout = Path("AdaSteer").resolve()
+    if not (adasteer_checkout / ".git").is_dir():
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/MuyuenLP/AdaSteer.git",
+                str(adasteer_checkout),
+            ],
+            check=True,
+        )
+    adasteer_commit = subprocess.run(
+        ["git", "-C", str(adasteer_checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    mo.callout(
+        f"Official AdaSteer checkout ready at `{adasteer_checkout}` "
+        f"(commit `{adasteer_commit}`).",
+        kind="success",
+    )
+    return adasteer_checkout, adasteer_commit
+
+
+@app.cell
+def controls(DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, adasteer_checkout, mo):
     official_root_control = mo.ui.text(
-        value="/content/AdaSteer",
+        value=str(adasteer_checkout),
         label="Official AdaSteer checkout",
         full_width=True,
     )
