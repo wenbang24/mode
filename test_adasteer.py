@@ -5,7 +5,6 @@ import pickle
 import sys
 import tempfile
 import unittest
-from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,9 +13,15 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 
-from scripts.benchmark_wildguard_train import prepare_cases, sample_cases
+from scripts.benchmark_wildguard_train import (
+    bundle_source_indices,
+    prepare_cases,
+    sample_cases,
+)
 from scripts.experts.adasteer import AdaSteer, parse_compliance, parse_refusal
 from scripts.experts.adasteer_bundle import (
+    BUNDLE_SCHEMA_VERSION,
+    DEFAULT_MODEL_ID,
     DIRECTION_GROUPS,
     DIRECTION_SIZE,
     EXPECTED_ROWS,
@@ -25,34 +30,42 @@ from scripts.experts.adasteer_bundle import (
     HD_GRID,
     HD_MAX,
     HD_MIN,
-    QWEN_HIDDEN_SIZE,
-    QWEN_LAYERS,
-    QwenSteeringRuntime,
     COMPLIANCE_PROMPT,
     REFUSAL_PROMPT,
+    REQUIRED_CHECKOUT_FILES,
     RD_GRID,
     RD_MAX,
     RD_MIN,
+    RUNTIME_PROVENANCE,
+    SteeringRuntime,
     TRAIN_ROWS,
-    VALIDATION_ROWS,
     _calibrate_hd,
     _calibrate_rd,
     _evaluate,
+    _format_prompts,
     _install_bundle,
     _tune_hd,
     _tune_rd,
+    artifact_shapes,
     behavior_group,
+    decoder_layers,
     finalize_directions,
     fit_law,
     predict_law,
     select_direction_rows,
-    set_model_coefficients,
     sha256_file,
-    stratified_split,
-    validate_qwen_config,
+    summarize_test_metrics,
+    validate_dataset_splits,
+    validate_model_config,
     validate_rows,
     verify_bundle,
 )
+
+
+TEST_LAYERS = 4
+TEST_WIDTH = 6
+TEST_RD_PROBE_LAYER = 1
+TEST_HD_PROBE_LAYER = 3
 
 
 def rows_10000():
@@ -131,40 +144,39 @@ class AdaSteerJudgeTest(unittest.TestCase):
 
 
 class AdaSteerDataTest(unittest.TestCase):
-    def test_exact_deterministic_stratified_split(self):
-        rows = rows_10000()
-        train, validation = stratified_split(rows)
-        train_again, validation_again = stratified_split(rows)
-        self.assertEqual(len(train), TRAIN_ROWS)
-        self.assertEqual(len(validation), VALIDATION_ROWS)
-        self.assertEqual(
-            [row["source_index"] for row in train],
-            [row["source_index"] for row in train_again],
-        )
-        self.assertEqual(
-            [row["source_index"] for row in validation],
-            [row["source_index"] for row in validation_again],
-        )
-        self.assertFalse(
-            {row["source_index"] for row in train}
-            & {row["source_index"] for row in validation}
-        )
-        all_strata = Counter(
-            (row["prompt_harm_label"], row["adversarial"], row["subcategory"])
-            for row in rows
-        )
-        validation_strata = Counter(
-            (row["prompt_harm_label"], row["adversarial"], row["subcategory"])
-            for row in validation
-        )
-        self.assertTrue(
-            all(
-                abs(validation_strata[key] - count * 0.2) <= 1
-                for key, count in all_strata.items()
-            )
-        )
+    def test_dedicated_splits_use_all_training_rows_and_reject_leakage(self):
+        def held_out(name, offset):
+            return [
+                {
+                    "case_id": f"{name}:{index}",
+                    "source_dataset": name,
+                    "source_index": index,
+                    "prompt": f"prompt-{offset + index}",
+                    "prompt_harm_label": "harmful" if index % 2 else "unharmful",
+                    "adversarial": None,
+                    "subcategory": None,
+                }
+                for index in range(4)
+            ]
 
-    def test_stored_response_labels_cannot_change_qwen_grouping(self):
+        train = rows_10000()
+        validation = held_out("validation", 10_000)
+        test = held_out("test", 20_000)
+        splits = validate_dataset_splits(train, validation, test)
+        self.assertEqual(len(splits["train"]), TRAIN_ROWS)
+        self.assertEqual(
+            splits["validation"][0]["source_index"],
+            splits["test"][0]["source_index"],
+        )
+        self.assertNotEqual(
+            splits["validation"][0]["_cache_id"],
+            splits["test"][0]["_cache_id"],
+        )
+        validation[0]["prompt"] = "  PROMPT-0  "
+        with self.assertRaisesRegex(ValueError, "overlapping normalized prompts"):
+            validate_dataset_splits(train, validation, test)
+
+    def test_stored_response_labels_cannot_change_model_grouping(self):
         first, second = rows_10000()[:2]
         first["prompt_harm_label"] = second["prompt_harm_label"] = "harmful"
         first["response_refusal_label"] = "refusal"
@@ -178,10 +190,23 @@ class AdaSteerDataTest(unittest.TestCase):
         for row in rows:
             row["adversarial"] = None
             row["subcategory"] = None
-        train, validation = stratified_split(rows)
-        self.assertEqual((len(train), len(validation)), (8_000, 2_000))
+        self.assertEqual(len(validate_rows(rows)), TRAIN_ROWS)
 
-    def test_selects_13_per_required_qwen_group(self):
+    def test_held_out_metrics_cover_both_labels(self):
+        metrics = summarize_test_metrics(
+            [{"result": True}, {"result": False}],
+            [
+                {"result": "1_full_compliance"},
+                {"result": "2_full_refusal"},
+                {"result": "1_full_compliance"},
+            ],
+        )
+        self.assertEqual(metrics["rows"], 5)
+        self.assertEqual(metrics["harmful_refusal_rate"], 0.5)
+        self.assertEqual(metrics["benign_full_compliance_rate"], 2 / 3)
+        self.assertAlmostEqual(metrics["overall_success_rate"], 0.6)
+
+    def test_selects_13_per_required_behavior_group(self):
         grouped = {
             name: [
                 {"source_index": offset * 100 + index, "prompt": str(index)}
@@ -208,6 +233,28 @@ class AdaSteerDataTest(unittest.TestCase):
         sampled = sample_cases(cases, 10, 42)
         self.assertFalse({case.dataset_index for case in sampled} & set(range(6)))
         self.assertEqual(sum(case.malicious for case in sampled), 5)
+        metadata = {
+            "datasets": {
+                "train": {
+                    "source_datasets": ["allenai/wildguardmix/wildguardtrain"],
+                    "source_indices": [1, 2],
+                },
+                "validation": {
+                    "source_datasets": ["allenai/wildguardmix/wildguardtrain"],
+                    "source_indices": [3],
+                },
+                "test": {
+                    "source_datasets": ["allenai/wildguardmix/wildguardtest"],
+                    "source_indices": [1],
+                },
+            }
+        }
+        self.assertEqual(
+            bundle_source_indices(
+                metadata, "allenai/wildguardmix/wildguardtrain"
+            ),
+            {1, 2, 3},
+        )
 
 
 class AdaSteerMathTest(unittest.TestCase):
@@ -229,7 +276,7 @@ class AdaSteerMathTest(unittest.TestCase):
                     attention_mask=np.ones((1, 6), dtype=int),
                 )
 
-        runtime = object.__new__(QwenSteeringRuntime)
+        runtime = object.__new__(SteeringRuntime)
         runtime.tokenizer = Tokenizer()
         runtime.max_new_tokens = 5
         runtime.context_window = 10
@@ -237,9 +284,13 @@ class AdaSteerMathTest(unittest.TestCase):
             runtime._encoded(["prompt"], [123])
         self.assertNotIn("truncation", runtime.tokenizer.kwargs)
         self.assertNotIn("max_length", runtime.tokenizer.kwargs)
+        self.assertEqual(
+            _format_prompts(SimpleNamespace(chat_template=None), ["plain"]),
+            ["plain"],
+        )
 
-    def test_qwen_directions_projection_and_fixed_law_bounds(self):
-        shape = (QWEN_LAYERS, 2, QWEN_HIDDEN_SIZE)
+    def test_dynamic_directions_projection_and_fixed_law_bounds(self):
+        shape = (TEST_LAYERS, 2, TEST_WIDTH)
         artifacts = finalize_directions(
             {
                 "harmful_refusal": np.full(shape, 2.0, dtype=np.float32),
@@ -367,31 +418,101 @@ class AdaSteerMathTest(unittest.TestCase):
                 (hd["slope_multiplier"], hd["intercept_offset"]), (0.9, -0.05)
             )
 
-    def test_batch_coefficients_follow_official_model_contract(self):
-        captured = []
+    def test_decoder_hooks_apply_prefill_batches_skip_decode_and_clean_up(self):
+        class Handle:
+            def __init__(self, block):
+                self.block = block
 
-        class FakeTorch:
-            float16 = "float16"
+            def remove(self):
+                self.block.hook = None
 
-            @staticmethod
-            def as_tensor(value, **kwargs):
-                captured.append((value.tolist(), kwargs))
-                return value.tolist()
+        class Block:
+            hook = None
 
-        inner = SimpleNamespace(
-            steer_vector=SimpleNamespace(device="cuda:0"),
-            alpha_list=None,
-            beta_list=None,
+            def register_forward_hook(self, hook):
+                self.hook = hook
+                return Handle(self)
+
+            def __call__(self, hidden):
+                output = (hidden, "cache")
+                return self.hook(self, (), output) if self.hook else output
+
+        runtime = object.__new__(SteeringRuntime)
+        runtime._rd_vectors = np.array(
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32
         )
-        set_model_coefficients(
-            SimpleNamespace(model=inner), FakeTorch, [-0.1, 0.2], [0.3, -0.4]
+        runtime._hd_vectors = np.array(
+            [[2.0, 0.0, -2.0], [1.0, 1.0, 1.0]], dtype=np.float32
         )
-        self.assertEqual(inner.alpha_list, [-0.1, 0.2])
-        self.assertEqual(inner.beta_list, [0.3, -0.4])
-        self.assertEqual(captured[0][1]["device"], "cuda:0")
+        runtime._rd_coefficients = np.array([0.5, -1.0], dtype=np.float32)
+        runtime._hd_coefficients = np.array([0.25, 2.0], dtype=np.float32)
+        blocks = [Block(), Block()]
+        runtime._attach_hooks(blocks)
+
+        hidden = np.zeros((2, 2, 3), dtype=np.float32)
+        steered, cache = blocks[0](hidden)
+        expected = np.array(
+            [
+                [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
+                [[3.0, -2.0, -7.0], [3.0, -2.0, -7.0]],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(steered, expected)
+        self.assertEqual(cache, "cache")
+        np.testing.assert_allclose(
+            blocks[1](hidden)[0],
+            np.array(
+                [
+                    [[2.25, 2.75, 3.25], [2.25, 2.75, 3.25]],
+                    [[-2.0, -3.0, -4.0], [-2.0, -3.0, -4.0]],
+                ],
+                dtype=np.float32,
+            ),
+        )
+        decode = np.zeros((2, 1, 3), dtype=np.float32)
+        self.assertIs(blocks[0](decode)[0], decode)
+
+        runtime._remove_hooks()
+        self.assertTrue(all(block.hook is None for block in blocks))
+        self.assertEqual(runtime._hook_handles, [])
 
 
 class AdaSteerResumeAndBundleTest(unittest.TestCase):
+    def test_cache_keys_isolate_split_local_source_indices(self):
+        runtime = FakeRuntime()
+        items = [
+            {
+                "cache_id": f"{split}:same-case",
+                "source_index": 0,
+                "prompt": split,
+                "rd": 0.1,
+                "hd": 0.0,
+            }
+            for split in ("validation", "test")
+        ]
+        generator = lambda batch: runtime.generate_batch(
+            [item["prompt"] for item in batch],
+            [item["rd"] for item in batch],
+            [item["hd"] for item in batch],
+            [item["source_index"] for item in batch],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            records = _evaluate(
+                items,
+                generator,
+                lambda _prompt, _response: True,
+                "refusal",
+                Path(directory) / "cache.jsonl",
+                "fingerprint",
+                lambda _message: None,
+            )
+        self.assertEqual(runtime.generated, 2)
+        self.assertEqual(
+            {record["cache_id"] for record in records},
+            {"validation:same-case", "test:same-case"},
+        )
+
     def test_evaluation_cache_resumes_and_rejects_stale_fingerprint(self):
         runtime = FakeRuntime()
         items = [
@@ -438,8 +559,8 @@ class AdaSteerResumeAndBundleTest(unittest.TestCase):
                     lambda _message: None,
                 )
 
-    def test_schema_v3_verification_and_schema_v2_rejection(self):
-        shape = (QWEN_LAYERS, 2, QWEN_HIDDEN_SIZE)
+    def test_schema_v5_verification_and_old_or_mismatched_rejection(self):
+        shape = (TEST_LAYERS, 2, TEST_WIDTH)
         artifacts = finalize_directions(
             {
                 "harmful_refusal": np.full(shape, 2.0),
@@ -457,14 +578,13 @@ class AdaSteerResumeAndBundleTest(unittest.TestCase):
                     pickle.dump(value, handle)
                 hashes[relative] = sha256_file(path)
             train = list(range(TRAIN_ROWS))
-            validation = list(range(TRAIN_ROWS, EXPECTED_ROWS))
             law_rd = {
                 "slope": 0.0,
                 "intercept": 0.1,
                 "minimum": RD_MIN,
                 "maximum": RD_MAX,
                 "samples": 13,
-                "probe_layer": 5,
+                "probe_layer": TEST_RD_PROBE_LAYER,
             }
             law_hd = {
                 "slope": 0.0,
@@ -472,20 +592,44 @@ class AdaSteerResumeAndBundleTest(unittest.TestCase):
                 "minimum": HD_MIN,
                 "maximum": HD_MAX,
                 "samples": 13,
-                "probe_layer": 13,
+                "probe_layer": TEST_HD_PROBE_LAYER,
             }
             metadata = {
-                "schema_version": 3,
+                "schema_version": BUNDLE_SCHEMA_VERSION,
                 "build_fingerprint": "f" * 64,
                 "model_id": AdaSteer.model_id,
                 "revision": None,
-                "dataset_sha256": "0" * 64,
-                "dataset_rows": EXPECTED_ROWS,
-                "split_indices": {"train": train, "validation": validation},
-                "qwen_group_counts": {
+                "model_type": "llama",
+                "num_hidden_layers": TEST_LAYERS,
+                "hidden_size": TEST_WIDTH,
+                "steering_runtime": RUNTIME_PROVENANCE,
+                "datasets": {
+                    "train": {
+                        "path": "train.parquet",
+                        "rows": TRAIN_ROWS,
+                        "sha256": "0" * 64,
+                        "source_datasets": ["source/train"],
+                        "source_indices": train,
+                    },
+                    "validation": {
+                        "path": "validation.parquet",
+                        "rows": 4,
+                        "sha256": "1" * 64,
+                        "source_datasets": ["source/validation"],
+                        "source_indices": list(range(4)),
+                    },
+                    "test": {
+                        "path": "test.parquet",
+                        "rows": 4,
+                        "sha256": "2" * 64,
+                        "source_datasets": ["source/test"],
+                        "source_indices": list(range(4)),
+                    },
+                },
+                "behavior_group_counts": {
                     name: TRAIN_ROWS // 4 for name in GROUPS
                 },
-                "qwen_behavior_records": [
+                "behavior_records": [
                     {
                         "source_index": index,
                         "group": GROUPS[index % 4],
@@ -498,11 +642,14 @@ class AdaSteerResumeAndBundleTest(unittest.TestCase):
                     name: list(range(offset * 13, offset * 13 + 13))
                     for offset, name in enumerate(DIRECTION_GROUPS)
                 },
-                "vector_shape": [QWEN_LAYERS, QWEN_HIDDEN_SIZE],
+                "vector_shape": [TEST_LAYERS, TEST_WIDTH],
                 "vector_dtype": "float16",
-                "rd_probe_layer": 5,
-                "hd_probe_layer": 13,
+                "rd_probe_layer": TEST_RD_PROBE_LAYER,
+                "hd_probe_layer": TEST_HD_PROBE_LAYER,
                 "official_commit": "abc123",
+                "official_source_sha256": {
+                    name: "a" * 64 for name in REQUIRED_CHECKOUT_FILES
+                },
                 "dependencies": {
                     name: "test"
                     for name in ("numpy", "pyarrow", "torch", "transformers")
@@ -515,6 +662,15 @@ class AdaSteerResumeAndBundleTest(unittest.TestCase):
                 "validation": {
                     "rd_grid": [{}] * len(RD_GRID),
                     "hd_grid": [{}] * len(HD_GRID),
+                },
+                "test_metrics": {
+                    "rows": 4,
+                    "harmful_rows": 2,
+                    "benign_rows": 2,
+                    "harmful_refusal_rate": 0.5,
+                    "benign_full_compliance_rate": 1.0,
+                    "overall_success_rate": 0.75,
+                    "balanced_success_rate": 0.75,
                 },
                 "generation": {
                     "system_prompt": "",
@@ -532,24 +688,66 @@ class AdaSteerResumeAndBundleTest(unittest.TestCase):
                 "artifact_sha256": hashes,
             }
             (root / "bundle.json").write_text(json.dumps(metadata), encoding="utf-8")
-            self.assertEqual(verify_bundle(root)["schema_version"], 3)
-            metadata["schema_version"] = 2
+            self.assertEqual(
+                verify_bundle(root)["schema_version"], BUNDLE_SCHEMA_VERSION
+            )
+            metadata["schema_version"] = 4
             (root / "bundle.json").write_text(json.dumps(metadata), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "rebuilt"):
                 verify_bundle(root)
+            metadata["schema_version"] = BUNDLE_SCHEMA_VERSION
+            metadata["hidden_size"] += 1
+            (root / "bundle.json").write_text(json.dumps(metadata), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "vector contract"):
+                verify_bundle(root)
 
-    def test_qwen_config_and_atomic_install(self):
-        validate_qwen_config(
-            {"model_type": "qwen2", "num_hidden_layers": 28, "hidden_size": 3584}
+    def test_decoder_model_validation_and_atomic_install(self):
+        self.assertEqual(DEFAULT_MODEL_ID, "Qwen/Qwen2.5-3B-Instruct")
+        qwen_geometry = validate_model_config(
+            {"model_type": "qwen2", "num_hidden_layers": 36, "hidden_size": 2048}
         )
-        with self.assertRaises(ValueError):
-            validate_qwen_config(
+        self.assertEqual(qwen_geometry["num_hidden_layers"], 36)
+        self.assertEqual(
+            validate_model_config(
+                {"model_type": "llama", "num_hidden_layers": 3, "hidden_size": 7},
+                0,
+                2,
+            )["hidden_size"],
+            7,
+        )
+        for config, rd_layer, hd_layer in (
+            (
                 {
-                    "model_type": "qwen2",
-                    "num_hidden_layers": 36,
-                    "hidden_size": 4096,
-                }
-            )
+                    "model_type": "t5",
+                    "is_encoder_decoder": True,
+                    "num_hidden_layers": 12,
+                    "hidden_size": 768,
+                },
+                1,
+                2,
+            ),
+            ({"model_type": "llama", "num_hidden_layers": 0, "hidden_size": 8}, 0, 0),
+            ({"model_type": "llama", "num_hidden_layers": 2, "hidden_size": -1}, 0, 1),
+            ({"model_type": "llama", "num_hidden_layers": 2, "hidden_size": 8}, 0, 2),
+        ):
+            with self.subTest(config=config):
+                with self.assertRaises(ValueError):
+                    validate_model_config(config, rd_layer, hd_layer)
+
+        class Block:
+            def register_forward_hook(self, _hook):
+                return None
+
+        layers = [Block(), Block()]
+        model = SimpleNamespace(model=SimpleNamespace(layers=layers))
+        self.assertIs(decoder_layers(model, 2), layers)
+        with self.assertRaisesRegex(ValueError, r"\.model\.layers"):
+            decoder_layers(SimpleNamespace(), 2)
+        with self.assertRaisesRegex(ValueError, "expected 3"):
+            decoder_layers(model, 3)
+        self.assertEqual(
+            artifact_shapes(2, 7)["HD/class_b.pkl"], (2, 1, 7)
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target, temporary = root / "bundle", root / "temporary"

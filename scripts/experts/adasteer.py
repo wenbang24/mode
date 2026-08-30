@@ -16,8 +16,8 @@ from .adasteer_bundle import (
     COMPLIANCE_CLASSES,
     COMPLIANCE_PROMPT,
     DEFAULT_MODEL_ID,
-    QwenSteeringRuntime,
     REFUSAL_PROMPT,
+    SteeringRuntime,
 )
 from .base import ExpertOutcome, require_prompt
 
@@ -99,7 +99,7 @@ class AdaSteer:
         self.max_new_tokens = max_new_tokens
         self.seed = seed
         self.bundle = Path(bundle).expanduser().resolve()
-        self.runtime = QwenSteeringRuntime(
+        self.runtime = SteeringRuntime(
             root,
             self.bundle,
             model_id,

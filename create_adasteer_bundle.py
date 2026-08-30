@@ -20,11 +20,11 @@ app = marimo.App(width="full")
 @app.cell(hide_code=True)
 def title(mo):
     mo.md("""
-    # Official Qwen AdaSteer bundle notebook
+    # AdaSteer decoder-model bundle notebook
 
-    This marimo notebook uses the official AdaSteer `Probe` and Qwen steering
-    model to reproduce the paper's Qwen procedure over a deterministic
-    8,000/2,000 split of either common 10,000-case prompt-safety artifact.
+    This marimo notebook uses the official AdaSteer `Probe` with a standard
+    text-only decoder model to train on all 10,000 WildGuard or Aegis cases,
+    tune on validation, and report metrics on the untouched test split.
     """)
     return
 
@@ -39,7 +39,6 @@ def imports():
 
     from scripts.experts.adasteer import AdaSteer
     from scripts.experts.adasteer_bundle import (
-        DEFAULT_DATASET_PATH,
         DEFAULT_MODEL_ID,
         DEFAULT_OUTPUT_ROOT,
         build_bundle,
@@ -50,7 +49,6 @@ def imports():
 
     return (
         AdaSteer,
-        DEFAULT_DATASET_PATH,
         DEFAULT_MODEL_ID,
         DEFAULT_OUTPUT_ROOT,
         Path,
@@ -65,7 +63,7 @@ def imports():
 
 
 @app.cell
-def controls(DEFAULT_DATASET_PATH, DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
+def controls(DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
     official_root_control = mo.ui.text(
         value="/content/AdaSteer",
         label="Official AdaSteer checkout",
@@ -73,16 +71,22 @@ def controls(DEFAULT_DATASET_PATH, DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
     )
     model_id_control = mo.ui.text(
         value=DEFAULT_MODEL_ID,
-        label="Qwen-2.5-7B model ID or path",
+        label="Decoder model ID or path",
         full_width=True,
     )
     revision_control = mo.ui.text(
         value="", label="Model revision", full_width=True
     )
-    dataset_control = mo.ui.text(
-        value=str(DEFAULT_DATASET_PATH),
-        label="10,000-row prompt-safety Parquet",
-        full_width=True,
+    dataset_preset_control = mo.ui.dropdown(
+        options=["WildGuard", "Aegis 2.0"],
+        value="WildGuard",
+        label="Dataset",
+    )
+    rd_probe_layer_control = mo.ui.number(
+        start=0, stop=255, value=5, label="RD probe layer"
+    )
+    hd_probe_layer_control = mo.ui.number(
+        start=0, stop=255, value=13, label="HD probe layer"
     )
     output_control = mo.ui.text(
         value=str(DEFAULT_OUTPUT_ROOT),
@@ -101,7 +105,7 @@ def controls(DEFAULT_DATASET_PATH, DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
         value=False, label="Replace an existing bundle"
     )
     preflight_button = mo.ui.run_button(label="1. Preflight")
-    build_button = mo.ui.run_button(label="2. Build bundle")
+    build_button = mo.ui.run_button(label="2. Train, validate, and test")
     demo_prompt_control = mo.ui.text_area(
         value="Explain how rainbows form.",
         label="Demonstration prompt",
@@ -114,7 +118,8 @@ def controls(DEFAULT_DATASET_PATH, DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
             official_root_control,
             model_id_control,
             revision_control,
-            dataset_control,
+            dataset_preset_control,
+            mo.hstack([rd_probe_layer_control, hd_probe_layer_control]),
             output_control,
             api_base_control,
             judge_model_control,
@@ -123,7 +128,8 @@ def controls(DEFAULT_DATASET_PATH, DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
             demo_prompt_control,
             mo.callout(
                 "Requires an fp16 CUDA environment compatible with Transformers 4.46.3. "
-                "Set HACKCLUB_API_KEY for coefficient fitting and HF_TOKEN when the model requires it.",
+                "The full held-out test split runs after validation. Set HACKCLUB_API_KEY "
+                "for judging and HF_TOKEN when the model requires it.",
                 kind="info",
             ),
         ]
@@ -132,15 +138,17 @@ def controls(DEFAULT_DATASET_PATH, DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
     return (
         api_base_control,
         build_button,
-        dataset_control,
+        dataset_preset_control,
         demo_button,
         demo_prompt_control,
         judge_model_control,
+        hd_probe_layer_control,
         model_id_control,
         official_root_control,
         output_control,
         overwrite_control,
         preflight_button,
+        rd_probe_layer_control,
         revision_control,
     )
 
@@ -148,28 +156,52 @@ def controls(DEFAULT_DATASET_PATH, DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, mo):
 @app.cell
 def configuration(
     Path,
-    dataset_control,
+    dataset_preset_control,
+    hd_probe_layer_control,
     model_id_control,
     model_slug,
     official_root_control,
     output_control,
+    rd_probe_layer_control,
     revision_control,
 ):
+    workspace = Path(__file__).resolve().parent
+    dataset_paths = {
+        "WildGuard": {
+            "train": workspace / "wildguardtrain_10000_seed42.parquet",
+            "validation": workspace
+            / "wildguardtrain_validation_1000_seed42.parquet",
+            "test": workspace / "wildguardtest.parquet",
+        },
+        "Aegis 2.0": {
+            "train": workspace / "aegis2_train_10000_seed42.parquet",
+            "validation": workspace / "aegis2_validation.parquet",
+            "test": workspace / "aegis2_test.parquet",
+        },
+    }[dataset_preset_control.value]
     official_root = Path(official_root_control.value).expanduser()
-    dataset_path = Path(dataset_control.value).expanduser()
+    train_path = dataset_paths["train"]
+    validation_path = dataset_paths["validation"]
+    test_path = dataset_paths["test"]
     output_root = Path(output_control.value).expanduser()
     model_id = model_id_control.value.strip()
     revision = revision_control.value.strip() or None
+    rd_probe_layer = int(rd_probe_layer_control.value)
+    hd_probe_layer = int(hd_probe_layer_control.value)
     target_bundle = (
-        output_root / model_slug(dataset_path.stem) / model_slug(model_id)
+        output_root / model_slug(train_path.stem) / model_slug(model_id)
     )
     return (
-        dataset_path,
+        hd_probe_layer,
         model_id,
         official_root,
         output_root,
+        rd_probe_layer,
         revision,
         target_bundle,
+        test_path,
+        train_path,
+        validation_path,
     )
 
 
@@ -182,18 +214,30 @@ def credentials(os):
 
 @app.cell
 def preflight(
-    dataset_path,
     hf_token,
+    hd_probe_layer,
     mo,
     model_id,
     official_root,
     preflight_bundle_inputs,
     preflight_button,
+    rd_probe_layer,
     revision,
+    test_path,
+    train_path,
+    validation_path,
 ):
     if preflight_button.value:
         preflight_result = preflight_bundle_inputs(
-            official_root, dataset_path, model_id, revision, hf_token
+            official_root=official_root,
+            train_path=train_path,
+            validation_path=validation_path,
+            test_path=test_path,
+            model_id=model_id,
+            revision=revision,
+            token=hf_token,
+            rd_probe_layer=rd_probe_layer,
+            hd_probe_layer=hd_probe_layer,
         )
         preflight_view = mo.vstack(
             [mo.md("## Preflight passed"), mo.ui.table([preflight_result])]
@@ -240,8 +284,8 @@ def judge_context(
 def build(
     build_bundle,
     build_button,
-    dataset_path,
     hf_token,
+    hd_probe_layer,
     judge_compliance,
     judge_model_control,
     judge_refusal,
@@ -250,12 +294,18 @@ def build(
     official_root,
     output_root,
     overwrite_control,
+    rd_probe_layer,
     revision,
+    test_path,
+    train_path,
+    validation_path,
 ):
     if build_button.value:
         built_bundle = build_bundle(
             official_root=official_root,
-            dataset_path=dataset_path,
+            train_path=train_path,
+            validation_path=validation_path,
+            test_path=test_path,
             output_root=output_root,
             judge_refusal=judge_refusal,
             judge_compliance=judge_compliance,
@@ -263,12 +313,16 @@ def build(
             revision=revision,
             token=hf_token,
             judge_model=judge_model_control.value.strip(),
+            rd_probe_layer=rd_probe_layer,
+            hd_probe_layer=hd_probe_layer,
             overwrite=overwrite_control.value,
         )
         build_view = mo.callout(f"Saved and verified: `{built_bundle}`", kind="success")
     else:
         built_bundle = None
-        build_view = mo.callout("Press **2. Build bundle** after preflight passes.")
+        build_view = mo.callout(
+            "Press **2. Train, validate, and test** after preflight passes."
+        )
     build_view
     return
 
@@ -285,21 +339,42 @@ def bundle_status(mo, target_bundle, verify_bundle):
                         {
                             "path": str(target_bundle.resolve()),
                             "model": bundle_metadata["model_id"],
-                            "rows": bundle_metadata["dataset_rows"],
-                            "train / validation": "8,000 / 2,000",
-                            "Qwen groups": bundle_metadata[
-                                "qwen_group_counts"
+                            "model type": bundle_metadata["model_type"],
+                            "layers × width": (
+                                f"{bundle_metadata['num_hidden_layers']} × "
+                                f"{bundle_metadata['hidden_size']}"
+                            ),
+                            "RD / HD probe layers": (
+                                f"{bundle_metadata['rd_probe_layer']} / "
+                                f"{bundle_metadata['hd_probe_layer']}"
+                            ),
+                            "train / validation / test": " / ".join(
+                                f"{bundle_metadata['datasets'][split]['rows']:,}"
+                                for split in ("train", "validation", "test")
+                            ),
+                            "behavior groups": bundle_metadata[
+                                "behavior_group_counts"
                             ],
                             "RD / HD calibration": (
                                 f"{len(bundle_metadata['calibration_records']['rd'])} / "
                                 f"{len(bundle_metadata['calibration_records']['hd'])}"
                             ),
-                            "harmful refusal": bundle_metadata[
+                            "validation harmful refusal": bundle_metadata[
                                 "paper_metrics"
                             ]["final_harmful_refusal_rate"],
-                            "benign compliance": bundle_metadata[
+                            "validation benign compliance": bundle_metadata[
                                 "paper_metrics"
                             ]["final_benign_full_compliance_rate"],
+                            "test harmful refusal": bundle_metadata[
+                                "test_metrics"
+                            ]["harmful_refusal_rate"],
+                            "test benign compliance": bundle_metadata[
+                                "test_metrics"
+                            ]["benign_full_compliance_rate"],
+                            "test overall / balanced": (
+                                f"{bundle_metadata['test_metrics']['overall_success_rate']:.1%} / "
+                                f"{bundle_metadata['test_metrics']['balanced_success_rate']:.1%}"
+                            ),
                             "official_commit": bundle_metadata[
                                 "official_commit"
                             ],
@@ -355,7 +430,7 @@ def demonstration(
             expert.close()
         demo_view = mo.vstack(
             [
-                mo.md("## Official AdaSteer demonstration"),
+                mo.md("## AdaSteer demonstration"),
                 mo.ui.table(
                     [
                         {
@@ -388,8 +463,8 @@ def notes(mo):
     mo.md("""
     ## What this workflow owns
 
-    - The official repository owns activation capture and Qwen activation injection.
-    - Qwen's GPT-4o-judged behavior—not stored source response labels—forms
+    - The official repository supplies `Probe`; removable decoder-layer hooks apply steering.
+    - The model's GPT-4o-judged behavior—not stored source response labels—forms
       the RD/HD groups and calibrates the two bounded affine laws.
     - The generated bundle is separate from the checkout, so upstream vectors and
       source files are never overwritten.

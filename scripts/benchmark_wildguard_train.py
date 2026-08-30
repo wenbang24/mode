@@ -8,7 +8,7 @@ Example:
         --cases 100 \
         --piguard-training-root /content/PIGuard \
         --adasteer-root /content/AdaSteer \
-        --adasteer-bundle artifacts/adasteer/wildguardtrain_10000_seed42/qwen-qwen2.5-7b-instruct \
+        --adasteer-bundle artifacts/adasteer/wildguardtrain_10000_seed42/qwen-qwen2.5-3b-instruct \
         --guardagent-root /content/GuardAgent \
         --allow-unsafe-guardagent-exec
 
@@ -130,6 +130,17 @@ def sample_cases(cases: list[Case], count: int, seed: int) -> list[Case]:
     selected = pools[True][: needed[True]] + pools[False][: needed[False]]
     random.Random(seed).shuffle(selected)
     return selected
+
+
+def bundle_source_indices(
+    metadata: dict[str, Any], source_dataset: str
+) -> set[int]:
+    return {
+        index
+        for dataset in metadata["datasets"].values()
+        if source_dataset in dataset["source_datasets"]
+        for index in dataset["source_indices"]
+    }
 
 
 def load_cases(
@@ -589,7 +600,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path(
             "artifacts/adasteer/wildguardtrain_10000_seed42/"
-            "qwen-qwen2.5-7b-instruct"
+            "qwen-qwen2.5-3b-instruct"
         ),
     )
     parser.add_argument("--adasteer-model", default=AdaSteer.model_id)
@@ -658,8 +669,8 @@ def main() -> None:
         return
     hf_token, api_key = validate_args(args)
     bundle_metadata = verify_bundle(args.adasteer_bundle)
-    excluded_indices = set(bundle_metadata["split_indices"]["train"]) | set(
-        bundle_metadata["split_indices"]["validation"]
+    excluded_indices = bundle_source_indices(
+        bundle_metadata, f"{DATASET_ID}/{DATASET_CONFIG}"
     )
     cases = load_cases(args.cases, args.seed, hf_token, excluded_indices)
     config = benchmark_config(args)
