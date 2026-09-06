@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import socket
 import time
 from pathlib import Path
@@ -59,11 +60,12 @@ def parse_judgment(text: Any) -> dict[str, bool] | None:
 
 def parse_refusal(text: Any) -> bool | None:
     value = text.strip() if isinstance(text, str) else ""
-    return True if value == "Yes" else False if value == "No" else None
+    verdict = re.match(r"(yes|no)(?:$|[.,!?:;]+(?=\s|$))", value, re.IGNORECASE)
+    return verdict.group(1).lower() == "yes" if verdict else None
 
 
 def parse_compliance(text: Any) -> str | None:
-    value = text.strip() if isinstance(text, str) else ""
+    value = text.strip().rstrip(".") if isinstance(text, str) else ""
     return value if value in COMPLIANCE_CLASSES else None
 
 
@@ -191,7 +193,7 @@ class AdaSteer:
                 "messages": [{"role": "user", "content": content}],
                 "temperature": 0,
                 "seed": _stable_seed(self.seed, prompt),
-                "max_completion_tokens": 32,
+                "max_completion_tokens": 256,
                 "stream": False,
             }
         ).encode()
@@ -225,13 +227,12 @@ class AdaSteer:
                 last_error = f"HTTP {exc.code}"
                 if exc.code not in {408, 409, 429} and exc.code < 500:
                     break
-                time.sleep(min(2 ** (attempt - 1), 30) + random.random())
             except (URLError, TimeoutError, socket.timeout) as exc:
                 last_error = type(exc).__name__
-                time.sleep(min(2 ** (attempt - 1), 30) + random.random())
             except (KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
                 last_error = f"invalid API response: {type(exc).__name__}: {exc}"
-                break
+            if attempt < max_retries:
+                time.sleep(min(2 ** (attempt - 1), 30) + random.random())
         raise RuntimeError(
             f"AdaSteer {contract} judge failed after {attempt} attempts: {last_error}"
         )

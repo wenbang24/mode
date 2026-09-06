@@ -12,7 +12,6 @@ import random
 import shutil
 import subprocess
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
@@ -874,19 +873,6 @@ def _append_cache(path: Path, records: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
 
 
-def _judge_with_backoff(
-    judge: Callable[[str, str], Any], prompt: str, response: str
-) -> Any:
-    for attempt in range(1, 6):
-        try:
-            return judge(prompt, response)
-        except Exception:
-            if attempt == 5:
-                raise
-            time.sleep(min(2 ** (attempt - 1), 30) + random.random())
-    raise AssertionError("unreachable")
-
-
 def _evaluate(
     items: list[dict[str, Any]],
     generate_batch: Callable[[list[dict[str, Any]]], list[str]],
@@ -896,6 +882,7 @@ def _evaluate(
     fingerprint: str,
     progress: Callable[[str], None] = print,
 ) -> list[dict[str, Any]]:
+    """Cache validated judgments; the judge callback owns its retry budget."""
     cached = _load_cache(cache_path, fingerprint)
     missing = [
         item
@@ -915,7 +902,7 @@ def _evaluate(
             raise RuntimeError("model generation returned the wrong batch size")
         with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as pool:
             futures = {
-                pool.submit(_judge_with_backoff, judge, item["prompt"], response): (
+                pool.submit(judge, item["prompt"], response): (
                     item,
                     response,
                 )
@@ -1818,7 +1805,7 @@ def build_bundle(
         },
         "judge": {
             "model": judge_model,
-            "refusal_contract": "paper_exact_yes_no_v1",
+            "refusal_contract": "paper_leading_yes_no_v2",
             "compliance_contract": "paper_exact_three_class_v1",
             "prompt_sha256": fingerprint_payload["judge_contract_sha256"],
         },

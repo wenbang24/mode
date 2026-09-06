@@ -2,6 +2,6 @@ __marimo__/
 __pycache__/
 */__pycache__/
 .piguard/
-artifacts/piguard_custom/
+artifacts/
 *.pdf
 *.md

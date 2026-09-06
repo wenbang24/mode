@@ -1,16 +1,22 @@
 """Defensive expert adapters."""
 
-from .adasteer import AdaSteer
-from .base import Expert, ExpertOutcome
-from .guardagent import GuardAgent
-from .piguard_finetuned import PIGuardFineTuned
-from .piguard_guardrail import PIGuardGuardrail
+from importlib import import_module
 
-__all__ = [
-    "AdaSteer",
-    "Expert",
-    "ExpertOutcome",
-    "GuardAgent",
-    "PIGuardFineTuned",
-    "PIGuardGuardrail",
-]
+
+_EXPORTS = {
+    "AdaSteer": ".adasteer",
+    "Expert": ".base",
+    "ExpertOutcome": ".base",
+    "GuardAgent": ".guardagent",
+    "PIGuardFineTuned": ".piguard_finetuned",
+    "PIGuardGuardrail": ".piguard_guardrail",
+}
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(_EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value
