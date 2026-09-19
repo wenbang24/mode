@@ -21,6 +21,10 @@ from .adasteer_bundle import (
     SteeringRuntime,
 )
 from .base import ExpertOutcome, require_prompt
+try:
+    from scripts.local_judge import normalize_endpoint, request_headers, positive_timeout
+except ModuleNotFoundError:
+    from local_judge import normalize_endpoint, request_headers, positive_timeout
 
 
 JUDGE_FIELDS = {"safe", "attack_followed", "refusal", "useful"}
@@ -90,11 +94,11 @@ class AdaSteer:
         revision: str | None = None,
         max_new_tokens: int = 128,
         seed: int = 42,
+        judge_timeout: float = 180,
     ):
-        if not api_key:
-            raise ValueError("AdaSteer judge API key is required")
+        self.judge_timeout = positive_timeout(judge_timeout)
         self.api_key = api_key
-        self.api_base = api_base.rstrip("/")
+        self.api_base = normalize_endpoint(api_base)
         self.judge_model = judge_model
         self.model_id = model_id
         self.revision = revision
@@ -135,13 +139,12 @@ class AdaSteer:
                 data=body,
                 method="POST",
                 headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
+                    **request_headers(self.api_key),
                     "User-Agent": "mode-wildguard-benchmark/1.0",
                 },
             )
             try:
-                with urlopen(request, timeout=180) as handle:
+                with urlopen(request, timeout=positive_timeout(getattr(self, "judge_timeout", 180))) as handle:
                     payload = json.load(handle)
                 choice = payload["choices"][0]
                 content = choice["message"]["content"]
@@ -204,13 +207,12 @@ class AdaSteer:
                 data=body,
                 method="POST",
                 headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
+                    **request_headers(self.api_key),
                     "User-Agent": "mode-wildguard-benchmark/1.0",
                 },
             )
             try:
-                with urlopen(request, timeout=180) as handle:
+                with urlopen(request, timeout=positive_timeout(getattr(self, "judge_timeout", 180))) as handle:
                     payload = json.load(handle)
                 raw = payload["choices"][0]["message"]["content"]
                 result = parser(raw)

@@ -46,6 +46,10 @@ def _():
 
     import numpy as np
 
+    from scripts.local_judge import (LocalJudgeServer, server_panel, normalize_endpoint,
+                                     judge_key, request_headers, positive_timeout)
+    local_server = LocalJudgeServer()
+
     from scripts.training_cases import normalize_prompt, read_cases
 
     WORKSPACE = Path(__file__).resolve().parent
@@ -641,6 +645,8 @@ def _():
             "max_length": int(config["max_length"]),
             "ai_base_url": config["ai_base_url"].strip().rstrip("/"),
             "ai_model": config["ai_model"].strip(),
+            "judge_timeout": positive_timeout(config.get("judge_timeout", 120)),
+            "managed_judge": bool(config.get("managed_judge", False)),
         }
         common = {"cache_version": CACHE_VERSION}
         prepare = {
@@ -1146,39 +1152,19 @@ def _():
             self.status = status
             self.retry_after = retry_after
 
-    def _normalize_ai_base_url(base_url):
-        value = base_url.strip().rstrip("/")
-        parsed = urllib.parse.urlparse(value)
-        local = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-        if (
-            not parsed.hostname
-            or parsed.scheme not in {"http", "https"}
-            or (parsed.scheme == "http" and not local)
-            or parsed.username
-            or parsed.password
-            or parsed.params
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError(
-                "AI API base URL must use HTTPS (or HTTP on localhost) and contain no credentials, query, or fragment."
-            )
-        return value
+    _normalize_ai_base_url = normalize_endpoint
 
-    def _ai_transport(base_url, path, api_key, payload=None):
+    def _ai_transport(base_url, path, api_key, payload=None, timeout=120):
         url = f"{_normalize_ai_base_url(base_url)}/{path.lstrip('/')}"
         body = None if payload is None else json.dumps(payload).encode()
         request = urllib.request.Request(
             url,
             data=body,
             method="GET" if payload is None else "POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=request_headers(api_key),
         )
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with urllib.request.urlopen(request, timeout=positive_timeout(timeout)) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as exc:
             retry_after = exc.headers.get("Retry-After")
@@ -1350,15 +1336,11 @@ def _():
             raise RuntimeError(
                 "The token scan returned too few usable tokens."
             )
-        api_key = os.environ.get("AI_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "Set AI_API_KEY in the environment; the notebook never stores it."
-            )
+        api_key = "" if config.get("managed_judge") else judge_key(ai_base_url, "AI_API_KEY")
         if transport is None:
 
             def configured_transport(path, key, payload=None):
-                return _ai_transport(ai_base_url, path, key, payload)
+                return _ai_transport(ai_base_url, path, key, payload, config.get("judge_timeout", 120))
 
             transport = configured_transport
         budget = {"used": 0, "limit": 400}
@@ -1700,6 +1682,11 @@ def _():
 
         original = keys(base_config)
         assert keys(dict(base_config)) == original
+        assert keys(base_config | {"judge_timeout": 999, "managed_judge": True}) == original
+        for setting, value in (("ai_base_url", "http://localhost:8000/v1"), ("ai_model", "local/model")):
+            changed = keys(base_config | {setting: value})
+            assert all(changed[step] == original[step] for step in ("prepare", "stage1", "scan"))
+            assert all(changed[step] != original[step] for step in ("generate", "stage2", "evaluate"))
         path_settings = {
             "train_dataset_path": DEFAULT_DATASET_PATHS["valid"],
             "validation_dataset_path": DEFAULT_DATASET_PATHS["test"],
@@ -1817,6 +1804,7 @@ def _():
         }
 
     return (
+        local_server, server_panel,
         DEFAULT_DATASET_PATHS,
         PRESETS,
         STEP_LABELS,
@@ -1834,6 +1822,22 @@ def _():
         scan_biased_tokens,
         self_check,
     )
+
+
+@app.cell
+def local_server_controls(mo, local_server, server_panel):
+    server_settings, server_view, get_server_status = server_panel(mo, local_server)
+    endpoint_mode = mo.ui.dropdown(options=["Existing endpoint", "Managed local"], value="Existing endpoint", label="AI connection")
+    judge_timeout_control = mo.ui.number(start=1, value=120, label="AI request timeout (seconds)")
+    mo.vstack([endpoint_mode, server_view, judge_timeout_control,
+               mo.md("Stop the local server after prompt generation to free GPU memory before stage-two training.")])
+    return server_settings, get_server_status, endpoint_mode, judge_timeout_control
+
+
+@app.cell
+def local_server_status(mo, get_server_status):
+    mo.ui.table([get_server_status()])
+    return
 
 
 @app.cell
@@ -1937,6 +1941,7 @@ def controls(DEFAULT_DATASET_PATHS, mo):
 
 @app.cell(hide_code=True)
 def configuration(
+    endpoint_mode, server_settings, judge_timeout_control,
     PRESETS,
     ai_base_url,
     ai_model_id,
@@ -1969,8 +1974,12 @@ def configuration(
         "smoke": smoke_mode.value,
         "batch_size": int(batch_size.value),
         "max_length": int(max_length.value),
-        "ai_base_url": ai_base_url.value.strip().rstrip("/"),
-        "ai_model": ai_model_id.value.strip(),
+        "ai_base_url": (f"http://127.0.0.1:{server_settings.value['port']}/v1"
+                        if endpoint_mode.value == "Managed local" else ai_base_url.value.strip().rstrip("/")),
+        "ai_model": (server_settings.value["model"].strip()
+                     if endpoint_mode.value == "Managed local" else ai_model_id.value.strip()),
+        "managed_judge": endpoint_mode.value == "Managed local",
+        "judge_timeout": judge_timeout_control.value,
     }
     pipeline = pipeline_artifacts(run_config)
     return (pipeline,)
@@ -2017,7 +2026,8 @@ def control_panel(
             mo.hstack([ai_base_url, ai_model_id]),
             mo.md(
                 "The endpoint must expose OpenAI-compatible `/models` and `/chat/completions` routes. "
-                "The key is read only from `AI_API_KEY`; it is never stored. Generation is resumable and capped at 400 requests per session."
+                "Use `JUDGE_API_KEY` (or `AI_API_KEY` for hosted endpoints); keys are never stored. "
+                "Local endpoints need no key. Generation is resumable and capped at 400 requests per session."
             ),
             mo.md("## Pipeline"),
             mo.hstack([prepare_button, stage1_button, scan_button]),
@@ -2030,6 +2040,7 @@ def control_panel(
 
 @app.cell
 def actions(
+    local_server, endpoint_mode, server_settings,
     evaluate_button,
     evaluate_stage,
     generate_benign_prompts,
@@ -2054,6 +2065,8 @@ def actions(
         elif scan_button.value:
             _result = scan_biased_tokens(pipeline)
         elif generate_button.value:
+            if endpoint_mode.value == "Managed local":
+                local_server.require_ready(server_settings.value)
             _result = generate_benign_prompts(pipeline)
         elif stage2_button.value:
             _result = run_official_stage(pipeline, "stage2")

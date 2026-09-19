@@ -46,6 +46,8 @@ def imports():
     from types import SimpleNamespace
 
     import marimo as mo
+    from scripts.local_judge import LocalJudgeServer, server_panel, normalize_endpoint, judge_key, positive_timeout
+    local_server = LocalJudgeServer()
 
     from scripts.experts.adasteer import AdaSteer
     from scripts.experts.adasteer_bundle import (
@@ -58,6 +60,7 @@ def imports():
     )
 
     return (
+        local_server, server_panel, normalize_endpoint, judge_key, positive_timeout,
         AdaSteer,
         DEFAULT_MODEL_ID,
         DEFAULT_OUTPUT_ROOT,
@@ -70,6 +73,23 @@ def imports():
         preflight_bundle_inputs,
         verify_bundle,
     )
+
+
+@app.cell
+def local_server_controls(mo, local_server, server_panel):
+    server_settings, server_view, get_server_status = server_panel(mo, local_server)
+    endpoint_mode = mo.ui.dropdown(options=["Existing endpoint", "Managed local"], value="Existing endpoint", label="Judge connection")
+    judge_timeout_control = mo.ui.number(start=1, value=180, label="Judge request timeout (seconds)")
+    check_judge_button = mo.ui.run_button(label="Check judge")
+    mo.vstack([endpoint_mode, server_view, judge_timeout_control, check_judge_button,
+               mo.md("Keep the local judge running throughout the AdaSteer build.")])
+    return server_settings, get_server_status, endpoint_mode, judge_timeout_control, check_judge_button
+
+
+@app.cell
+def local_server_status(mo, get_server_status):
+    mo.ui.table([get_server_status()])
+    return
 
 
 @app.cell
@@ -170,7 +190,8 @@ def controls(DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, adasteer_checkout, mo):
             mo.callout(
                 "Requires an fp16 CUDA environment compatible with Transformers 4.46.3. "
                 "The full held-out test split runs after validation. Set HACKCLUB_API_KEY "
-                "for judging and HF_TOKEN when the model requires it.",
+                "or JUDGE_API_KEY for hosted judging; local endpoints can run without a key. "
+                "Set HF_TOKEN when the model requires it.",
                 kind="info",
             ),
         ]
@@ -249,8 +270,7 @@ def configuration(
 @app.cell
 def credentials(os):
     hf_token = os.environ.get("HF_TOKEN") or None
-    api_key = os.environ.get("HACKCLUB_API_KEY") or ""
-    return api_key, hf_token
+    return (hf_token,)
 
 
 @app.cell
@@ -292,33 +312,50 @@ def preflight(
 
 @app.cell
 def judge_context(
-    AdaSteer,
-    SimpleNamespace,
-    api_base_control,
-    api_key,
-    judge_model_control,
+    AdaSteer, SimpleNamespace, api_base_control, judge_model_control,
+    endpoint_mode, server_settings, judge_timeout_control,
+    local_server, normalize_endpoint, judge_key, positive_timeout,
 ):
+    managed_judge = endpoint_mode.value == "Managed local"
+    local_settings = server_settings.value
+    judge_endpoint = normalize_endpoint(
+        f"http://127.0.0.1:{local_settings['port']}/v1" if managed_judge else api_base_control.value
+    )
+    selected_judge_model = (local_settings["model"] if managed_judge else judge_model_control.value).strip()
+    judge_timeout = positive_timeout(judge_timeout_control.value)
+
     def paper_context():
-        if not api_key:
-            raise RuntimeError("HACKCLUB_API_KEY is required")
+        if not selected_judge_model:
+            raise ValueError("Enter a judge model ID")
+        if managed_judge:
+            local_server.require_ready(local_settings)
         return SimpleNamespace(
-            api_key=api_key,
-            api_base=api_base_control.value.rstrip("/"),
-            judge_model=judge_model_control.value.strip(),
-            seed=42,
+            api_key="" if managed_judge else judge_key(judge_endpoint, "HACKCLUB_API_KEY"),
+            api_base=judge_endpoint, judge_model=selected_judge_model,
+            judge_timeout=judge_timeout, seed=42,
         )
 
     def judge_refusal(prompt, response):
-        return AdaSteer._paper_judge(
-            paper_context(), prompt, response, "refusal"
-        )["result"]
+        return AdaSteer._paper_judge(paper_context(), prompt, response, "refusal")["result"]
 
     def judge_compliance(prompt, response):
-        return AdaSteer._paper_judge(
-            paper_context(), prompt, response, "compliance"
-        )["result"]
+        return AdaSteer._paper_judge(paper_context(), prompt, response, "compliance")["result"]
 
-    return judge_compliance, judge_refusal
+    return judge_compliance, judge_refusal, paper_context, judge_endpoint, selected_judge_model, judge_timeout
+
+
+@app.cell
+def check_judge(mo, check_judge_button, judge_refusal, judge_compliance):
+    if check_judge_button.value:
+        try:
+            result = {
+                "refusal": judge_refusal("Explain rainbows.", "I cannot help with that request."),
+                "compliance": judge_compliance("Say hello.", "Hello!"),
+            }
+            mo.output.replace(mo.ui.table([result]))
+        except Exception as exc:
+            mo.output.replace(mo.callout(str(exc), kind="danger"))
+    return
 
 
 @app.cell
@@ -328,7 +365,9 @@ def build(
     hf_token,
     hd_probe_layer,
     judge_compliance,
-    judge_model_control,
+    selected_judge_model,
+    judge_endpoint,
+    paper_context,
     judge_refusal,
     mo,
     model_id,
@@ -342,6 +381,7 @@ def build(
     validation_path,
 ):
     if build_button.value:
+        paper_context()
         built_bundle = build_bundle(
             official_root=official_root,
             train_path=train_path,
@@ -353,7 +393,8 @@ def build(
             model_id=model_id,
             revision=revision,
             token=hf_token,
-            judge_model=judge_model_control.value.strip(),
+            judge_model=selected_judge_model,
+            judge_endpoint=judge_endpoint,
             rd_probe_layer=rd_probe_layer,
             hd_probe_layer=hd_probe_layer,
             overwrite=overwrite_control.value,
@@ -442,12 +483,11 @@ def bundle_status(mo, target_bundle, verify_bundle):
 @app.cell
 def demonstration(
     AdaSteer,
-    api_base_control,
-    api_key,
+    paper_context,
+    judge_timeout,
     demo_button,
     demo_prompt_control,
     hf_token,
-    judge_model_control,
     mo,
     model_id,
     official_root,
@@ -455,15 +495,17 @@ def demonstration(
     target_bundle,
 ):
     if demo_button.value:
+        context = paper_context()
         expert = AdaSteer(
             official_root,
             target_bundle,
-            api_key,
-            api_base_control.value,
-            judge_model_control.value,
+            context.api_key,
+            context.api_base,
+            context.judge_model,
             model_id,
             hf_token,
             revision,
+            judge_timeout=judge_timeout,
         )
         try:
             demo_outcome = expert.run(demo_prompt_control.value)
@@ -505,7 +547,7 @@ def notes(mo):
     ## What this workflow owns
 
     - The official repository supplies `Probe`; removable decoder-layer hooks apply steering.
-    - The model's GPT-4o-judged behavior—not stored source response labels—forms
+    - The model's selected-judge-labeled behavior—not stored source response labels—forms
       the RD/HD groups and calibrates the two bounded affine laws.
     - The generated bundle is separate from the checkout, so upstream vectors and
       source files are never overwritten.
