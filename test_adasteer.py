@@ -434,6 +434,33 @@ class AdaSteerMathTest(unittest.TestCase):
                 (hd_law["minimum"], hd_law["maximum"]), (HD_MIN, HD_MAX)
             )
 
+    def test_rd_calibration_uses_fallback_candidates(self):
+        calibration_rows = [
+            {"source_index": index, "prompt": f"p-{index}"}
+            for index in range(DIRECTION_SIZE * 2)
+        ]
+
+        def refusal(_prompt, response):
+            source, strength, _hd = response.split("|")
+            return int(source) >= 5 and float(strength) >= 0.03
+
+        with tempfile.TemporaryDirectory() as directory:
+            law, records = _calibrate_rd(
+                FakeRuntime(),
+                calibration_rows,
+                positions(calibration_rows),
+                refusal,
+                Path(directory) / "cache.jsonl",
+                "fingerprint",
+                lambda _message: None,
+            )
+
+        self.assertEqual(len(records), DIRECTION_SIZE)
+        self.assertEqual(
+            {record["source_index"] for record in records}, set(range(5, 18))
+        )
+        self.assertEqual(law["samples"], DIRECTION_SIZE)
+
     def test_grid_ties_are_deterministic_and_prefer_lower_steering(self):
         rows = [{"source_index": index, "prompt": str(index)} for index in range(2)]
         pos = [
@@ -490,10 +517,52 @@ class AdaSteerMathTest(unittest.TestCase):
                 "fingerprint",
                 lambda _message: None,
             )
-            self.assertEqual(len(hd_results), len(HD_GRID))
+            self.assertEqual(len(hd_results), len(HD_GRID) + 1)
             self.assertEqual(
-                (hd["slope_multiplier"], hd["intercept_offset"]), (0.9, -0.05)
+                (hd["slope"], hd["intercept"]), (0.0, 0.0)
             )
+
+    def test_hd_grid_includes_neutral_safety_candidate(self):
+        rows = [{"source_index": index, "prompt": str(index)} for index in range(2)]
+        pos = [
+            {"source_index": index, "rd_position": 0.0, "hd_position": 0.0}
+            for index in range(2)
+        ]
+        rd_law = {
+            "slope": 0.0,
+            "intercept": 0.1,
+            "minimum": RD_MIN,
+            "maximum": RD_MAX,
+            "samples": DIRECTION_SIZE,
+        }
+        hd_law = {
+            "slope": 0.0,
+            "intercept": 0.2,
+            "minimum": HD_MIN,
+            "maximum": HD_MAX,
+            "samples": DIRECTION_SIZE,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            selected, results, result = _tune_hd(
+                FakeRuntime(),
+                rows,
+                pos,
+                rows,
+                pos,
+                rd_law,
+                hd_law,
+                1.0,
+                lambda _prompt, response: float(response.split("|")[2]) == 0.0,
+                lambda _prompt, _response: "1_full_compliance",
+                Path(directory) / "grid.jsonl",
+                "fingerprint",
+                lambda _message: None,
+            )
+
+        self.assertEqual(len(results), len(HD_GRID) + 1)
+        self.assertEqual((selected["slope"], selected["intercept"]), (0.0, 0.0))
+        self.assertEqual(result["harmful_refusal_rate"], 1.0)
 
     def test_decoder_hooks_apply_prefill_batches_skip_decode_and_clean_up(self):
         class Handle:
@@ -738,7 +807,7 @@ class AdaSteerResumeAndBundleTest(unittest.TestCase):
                 },
                 "validation": {
                     "rd_grid": [{}] * len(RD_GRID),
-                    "hd_grid": [{}] * len(HD_GRID),
+                    "hd_grid": [{}] * (len(HD_GRID) + 1),
                 },
                 "test_metrics": {
                     "rows": 4,

@@ -332,7 +332,7 @@ def judge_context(
         return SimpleNamespace(
             api_key="" if managed_judge else judge_key(judge_endpoint, "HACKCLUB_API_KEY"),
             api_base=judge_endpoint, judge_model=selected_judge_model,
-            judge_timeout=judge_timeout, seed=42,
+            judge_timeout=judge_timeout, seed=42, constrain_judgments=managed_judge,
         )
 
     def judge_refusal(prompt, response):
@@ -341,7 +341,7 @@ def judge_context(
     def judge_compliance(prompt, response):
         return AdaSteer._paper_judge(paper_context(), prompt, response, "compliance")["result"]
 
-    return judge_compliance, judge_refusal, paper_context, judge_endpoint, selected_judge_model, judge_timeout
+    return judge_compliance, judge_refusal, paper_context, judge_endpoint, selected_judge_model, judge_timeout, managed_judge
 
 
 @app.cell
@@ -360,6 +360,7 @@ def check_judge(mo, check_judge_button, judge_refusal, judge_compliance):
 
 @app.cell
 def build(
+    managed_judge,
     build_bundle,
     build_button,
     hf_token,
@@ -395,6 +396,7 @@ def build(
             token=hf_token,
             judge_model=selected_judge_model,
             judge_endpoint=judge_endpoint,
+            judge_constrained=managed_judge,
             rd_probe_layer=rd_probe_layer,
             hd_probe_layer=hd_probe_layer,
             overwrite=overwrite_control.value,

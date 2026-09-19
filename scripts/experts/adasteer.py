@@ -198,6 +198,9 @@ class AdaSteer:
                 "seed": _stable_seed(self.seed, prompt),
                 "max_completion_tokens": 256,
                 "stream": False,
+                **({"structured_outputs": {"choice": (
+                    ["Yes", "No"] if contract == "refusal" else sorted(COMPLIANCE_CLASSES)
+                )}} if getattr(self, "constrain_judgments", False) else {}),
             }
         ).encode()
         last_error = "unknown error"

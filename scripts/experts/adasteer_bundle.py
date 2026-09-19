@@ -1154,12 +1154,14 @@ def _calibrate_rd(
                     }
                 )
                 unresolved.pop(row["source_index"])
-        if not unresolved:
+                if len(records) == DIRECTION_SIZE:
+                    break
+        if len(records) == DIRECTION_SIZE:
             break
-    if unresolved:
+    if len(records) < DIRECTION_SIZE:
         raise RuntimeError(
-            "RD calibration found no refusal by 0.20 for source IDs "
-            + str(sorted(unresolved))
+            f"RD calibration found {len(records)} successful cases by {RD_MAX:.2f}; "
+            f"need {DIRECTION_SIZE}; unsuccessful source IDs={sorted(unresolved)}"
         )
     return fit_law(records, "rd_position", RD_MIN, RD_MAX), records
 
@@ -1278,8 +1280,17 @@ def _tune_hd(
     generator = _runtime_generator(runtime)
     harmful_rd = [predict_law(rd_law, value["rd_position"]) for value in harmful_positions]
     benign_rd = [predict_law(rd_law, value["rd_position"]) for value in benign_positions]
-    for slope, offset in HD_GRID:
-        law = _candidate_law(fitted, slope, offset)
+    candidates = [_candidate_law(fitted, slope, offset) for slope, offset in HD_GRID]
+    candidates.append(
+        {
+            **fitted,
+            "slope": 0.0,
+            "intercept": 0.0,
+            "slope_multiplier": 0.0,
+            "intercept_offset": float(-fitted["intercept"]),
+        }
+    )
+    for law in candidates:
         harmful_hd = [predict_law(law, value["hd_position"]) for value in harmful_positions]
         benign_hd = [predict_law(law, value["hd_position"]) for value in benign_positions]
         harmful = _evaluate(
@@ -1306,8 +1317,8 @@ def _tune_hd(
         ) / len(benign)
         results.append(
             {
-                "slope_multiplier": slope,
-                "intercept_offset": offset,
+                "slope_multiplier": law["slope_multiplier"],
+                "intercept_offset": law["intercept_offset"],
                 "slope": law["slope"],
                 "intercept": law["intercept"],
                 "harmful_refusal_rate": refusal_rate,
@@ -1326,8 +1337,7 @@ def _tune_hd(
             -results[index]["mean_absolute_coefficient"],
         ),
     )
-    slope, offset = HD_GRID[selected]
-    return _candidate_law(fitted, slope, offset), results, results[selected]
+    return candidates[selected], results, results[selected]
 
 
 def summarize_test_metrics(
@@ -1501,7 +1511,7 @@ def verify_bundle(path: Path) -> dict[str, Any]:
         ):
             raise ValueError(f"invalid {name} calibration records")
     validation = metadata.get("validation", {})
-    if len(validation.get("rd_grid", [])) != len(RD_GRID) or len(validation.get("hd_grid", [])) != len(HD_GRID):
+    if len(validation.get("rd_grid", [])) != len(RD_GRID) or len(validation.get("hd_grid", [])) != len(HD_GRID) + 1:
         raise ValueError("bundle has incomplete coefficient grids")
     test_metrics = metadata.get("test_metrics", {})
     rates = [
@@ -1585,6 +1595,7 @@ def build_bundle(
     overwrite: bool = False,
     progress: Callable[[str], None] = print,
     judge_endpoint: str | None = None,
+    judge_constrained: bool = False,
 ) -> Path:
     if judge_endpoint is not None:
         judge_endpoint = normalize_endpoint(judge_endpoint)
@@ -1641,6 +1652,8 @@ def build_bundle(
         },
         "seed": SEED,
     }
+    if judge_constrained:
+        fingerprint_payload["judge_constrained"] = True
     fingerprint = hashlib.sha256(
         json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -1718,7 +1731,11 @@ def build_bundle(
         hd_probe_layer=hd_probe_layer,
     )
     try:
-        rd_rows = selected["harmful_compliance"]
+        rd_rows = sorted(
+            grouped["harmful_compliance"], key=lambda row: row["source_index"]
+        )
+        random.Random(f"{SEED}:harmful_compliance").shuffle(rd_rows)
+        rd_rows = rd_rows[: DIRECTION_SIZE * 3]
         rd_positions = _position_records(runtime, rd_rows, position_cache, fingerprint, progress)
         fitted_rd, rd_records = _calibrate_rd(
             runtime,
@@ -1903,6 +1920,7 @@ def build_bundle(
         "judge": {
             "model": judge_model,
             "endpoint": judge_endpoint,
+            "constrained_outputs": judge_constrained,
             "refusal_contract": "paper_leading_yes_no_v2",
             "compliance_contract": "paper_exact_three_class_v1",
             "prompt_sha256": fingerprint_payload["judge_contract_sha256"],

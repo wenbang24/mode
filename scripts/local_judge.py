@@ -96,6 +96,8 @@ class LocalJudgeServer:
         fd, log = tempfile.mkstemp(prefix="mode-vllm-", suffix=".log")
         self.log_path = Path(log)
         env = os.environ.copy()
+        # Molab has CUDA runtime libraries but no nvcc for FlashInfer sampler JIT.
+        env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
         # Never inherit server authentication from an unrelated vLLM deployment.
         for name in ("VLLM_API_KEY", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
             env.pop(name, None)

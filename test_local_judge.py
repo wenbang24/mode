@@ -57,9 +57,24 @@ class EndpointTest(unittest.TestCase):
             self.assertEqual(timeout, 999)
             self.assertIsNone(request.get_header("Authorization"))
             self.assertEqual(json.loads(request.data)["model"], "custom")
+            self.assertNotIn("structured_outputs", json.loads(request.data))
             return io.StringIO(json.dumps({"choices": [{"message": {"content": "Yes"}}]}))
         with patch("scripts.experts.adasteer.urlopen", respond):
             self.assertTrue(AdaSteer._paper_judge(context, "hi", "no", "refusal")["result"])
+
+    def test_managed_judge_constrains_labels_without_changing_prompt(self):
+        from scripts.experts.adasteer import AdaSteer
+        from scripts.experts.adasteer_bundle import COMPLIANCE_PROMPT
+        context = SimpleNamespace(api_base="http://localhost:8000/v1", api_key="", judge_model="custom",
+                                  seed=42, constrain_judgments=True)
+        def respond(request, timeout):
+            body = json.loads(request.data)
+            self.assertEqual(body["structured_outputs"]["choice"],
+                             ["1_full_compliance", "2_full_refusal", "3_partial_refusal"])
+            self.assertEqual(body["messages"], [{"role": "user", "content": COMPLIANCE_PROMPT.format(question="hi", answer="hello")}])
+            return io.StringIO(json.dumps({"choices": [{"message": {"content": "1_full_compliance"}}]}))
+        with patch("scripts.experts.adasteer.urlopen", respond):
+            self.assertEqual(AdaSteer._paper_judge(context, "hi", "hello", "compliance", 1)["result"], "1_full_compliance")
 
     def test_piguard_transport_and_existing_checks(self):
         ns = piguard_functions()
@@ -102,6 +117,8 @@ class EndpointTest(unittest.TestCase):
                 self.assertEqual(identity["judge_endpoint"], "http://localhost:8000/v1")
                 self.assertNotIn("api_key", saved.read_text())
                 with self.assertRaisesRegex(ValueError, "stale"):
+                    bundle.build_bundle(**args, judge_endpoint="http://localhost:8000/v1", judge_constrained=True)
+                with self.assertRaisesRegex(ValueError, "stale"):
                     bundle.build_bundle(**args, judge_endpoint="http://localhost:8001/v1")
                 with self.assertRaisesRegex(ValueError, "stale"):
                     bundle.build_bundle(**(args | {"judge_model": "other/model"}), judge_endpoint="http://localhost:8000/v1")
@@ -119,6 +136,21 @@ class EndpointTest(unittest.TestCase):
 
 
 class LauncherTest(unittest.TestCase):
+    def test_native_sampler_does_not_require_cuda_compiler(self):
+        server = LocalJudgeServer()
+        try:
+            with patch("scripts.local_judge.sys.platform", "linux"), patch(
+                "scripts.local_judge.shutil.which", return_value="uv"
+            ), patch("scripts.local_judge.socket.socket"), patch(
+                "scripts.local_judge.subprocess.Popen"
+            ) as launch, patch.object(server, "status", return_value={"state": "starting"}), patch.dict(
+                os.environ, {}, clear=True
+            ):
+                server.start("test/model")
+                self.assertEqual(launch.call_args.kwargs["env"].get("VLLM_USE_FLASHINFER_SAMPLER"), "0")
+        finally:
+            server.process = None  # Mock process, not an owned OS process.
+
     def test_lifecycle(self):
         # Stand in for vLLM with an HTTP server whose worker ignores SIGTERM.
         with tempfile.TemporaryDirectory() as tmp:
