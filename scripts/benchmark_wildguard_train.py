@@ -10,10 +10,10 @@ Example:
         --adasteer-root /content/AdaSteer \
         --adasteer-bundle artifacts/adasteer/wildguardtrain_10000_seed42/qwen-qwen2.5-3b-instruct \
         --guardagent-root /content/GuardAgent \
-        --allow-unsafe-guardagent-exec
+        --guardagent-policy-bundle artifacts/guardagent/wildguard/openai-gpt-5.6-sol
 
 Set ``HF_TOKEN`` only when a selected model requires authentication, and set
-``HACKCLUB_API_KEY`` for the AdaSteer judge and GuardAgent. The benchmark does
+``JUDGE_API_KEY`` or ``HACKCLUB_API_KEY`` for the AdaSteer judge and GuardAgent. The benchmark does
 not train experts or a router.
 """
 
@@ -25,6 +25,7 @@ import json
 import os
 import random
 import statistics
+import sys
 import tempfile
 import time
 from collections import defaultdict
@@ -43,6 +44,7 @@ from experts import (
 from experts.base import error_text
 from experts.adasteer_bundle import verify_bundle
 from experts.guardagent import MEMORY_SHOTS, memory_from_rows
+from experts.guardagent_policy import verify_policy_bundle
 
 
 DATASET_ID = "allenai/wildguardmix"
@@ -386,7 +388,8 @@ def real_builders(
                 args.guardagent_model,
                 args.seed,
                 args.allow_unsafe_guardagent_exec,
-                args.guardagent_memory_dataset,
+                None if args.guardagent_policy_bundle else args.guardagent_memory_dataset,
+                policy_bundle=args.guardagent_policy_bundle,
             ),
         ),
     ]
@@ -418,9 +421,12 @@ def benchmark_config(args: argparse.Namespace) -> dict[str, Any]:
         "max_new_tokens": args.max_new_tokens,
         "guardagent_root": str(args.guardagent_root.resolve()),
         "guardagent_model": args.guardagent_model,
-        "guardagent_memory_dataset": str(
-            args.guardagent_memory_dataset.resolve()
-        ),
+        "guardagent_memory_dataset": str(args.guardagent_memory_dataset.resolve())
+        if args.guardagent_memory_dataset and not args.guardagent_policy_bundle
+        else None,
+        "guardagent_policy_bundle": str(args.guardagent_policy_bundle.resolve())
+        if args.guardagent_policy_bundle
+        else None,
         "judge_model": args.judge_model,
         "api_base": args.api_base,
     }
@@ -460,6 +466,8 @@ def self_test() -> None:
     guardagent.api_key = "test"
     guardagent.api_base = DEFAULT_API_BASE
     guardagent.seed = 42
+    guardagent.timeout = 120
+    guardagent.num_shots = MEMORY_SHOTS
     guardagent.autogen = FakeAutoGen
     guardagent.official = FakeOfficial
     guardagent.memory = memory_from_rows(
@@ -472,6 +480,8 @@ def self_test() -> None:
     guardagent._agents()
     assert "functions" not in captured_llm_config
     assert captured_llm_config["tools"][0]["function"]["name"] == "python"
+    assert captured_llm_config["tools"][0]["function"]["strict"] is True
+    assert captured_llm_config["tools"][0]["function"]["parameters"]["additionalProperties"] is False
     assert captured_llm_config["max_tokens"] == 256
     assert captured_memory["num_shots"] == MEMORY_SHOTS
     assert len(captured_memory["memory"]) == 10_000
@@ -608,6 +618,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--guardagent-root", type=Path)
     parser.add_argument("--guardagent-model", default=DEFAULT_LLM_MODEL)
+    parser.add_argument("--guardagent-policy-bundle", type=Path)
     parser.add_argument(
         "--guardagent-memory-dataset",
         type=Path,
@@ -640,19 +651,24 @@ def validate_args(args: argparse.Namespace) -> tuple[str | None, str]:
         raise SystemExit(
             "--piguard-training-checkpoint requires --piguard-training-root"
         )
-    if not args.guardagent_memory_dataset.is_file():
+    if args.guardagent_policy_bundle and not args.guardagent_policy_bundle.is_dir():
+        raise SystemExit(
+            f"GuardAgent policy bundle does not exist: {args.guardagent_policy_bundle}"
+        )
+    if not args.guardagent_policy_bundle and not args.guardagent_memory_dataset.is_file():
         raise SystemExit(
             f"GuardAgent memory dataset does not exist: {args.guardagent_memory_dataset}"
         )
-    if not args.allow_unsafe_guardagent_exec:
-        raise SystemExit(
-            "GuardAgent executes model-generated Python; pass "
-            "--allow-unsafe-guardagent-exec to opt in"
+    if args.allow_unsafe_guardagent_exec:
+        print(
+            "warning: --allow-unsafe-guardagent-exec is deprecated and ignored; "
+            "GuardAgent uses restricted AST evaluation",
+            file=sys.stderr,
         )
     hf_token = os.environ.get("HF_TOKEN")
-    api_key = os.environ.get("HACKCLUB_API_KEY")
+    api_key = os.environ.get("JUDGE_API_KEY") or os.environ.get("HACKCLUB_API_KEY")
     if not api_key:
-        raise SystemExit("HACKCLUB_API_KEY is required for AdaSteer and GuardAgent")
+        raise SystemExit("JUDGE_API_KEY or HACKCLUB_API_KEY is required for AdaSteer and GuardAgent")
     try:
         import torch
     except ImportError as exc:
@@ -669,12 +685,20 @@ def main() -> None:
         return
     hf_token, api_key = validate_args(args)
     bundle_metadata = verify_bundle(args.adasteer_bundle)
+    guardagent_metadata = (
+        verify_policy_bundle(args.guardagent_policy_bundle)
+        if args.guardagent_policy_bundle
+        else None
+    )
     excluded_indices = bundle_source_indices(
         bundle_metadata, f"{DATASET_ID}/{DATASET_CONFIG}"
     )
     cases = load_cases(args.cases, args.seed, hf_token, excluded_indices)
     config = benchmark_config(args)
     config["adasteer_bundle_fingerprint"] = bundle_metadata["build_fingerprint"]
+    config["guardagent_bundle_fingerprint"] = (
+        guardagent_metadata["fingerprint"] if guardagent_metadata else None
+    )
     config["excluded_source_indices_sha256"] = hashlib.sha256(
         json.dumps(sorted(excluded_indices), separators=(",", ":")).encode()
     ).hexdigest()

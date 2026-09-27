@@ -65,7 +65,8 @@ class LocalJudgeServer:
         self.log_path = None
         atexit.register(self.stop)
 
-    def start(self, model, port=8000, gpu_memory=0.5, context_length=8192):
+    def start(self, model, port=8000, gpu_memory=0.5, context_length=8192,
+              tool_call_parser=None):
         model = model.strip()
         if not model or model.startswith("-"):
             raise ValueError("Enter a Hugging Face model ID or path")
@@ -75,7 +76,14 @@ class LocalJudgeServer:
             raise ValueError("GPU memory fraction must be between 0 and 1")
         if type(context_length) is not int or context_length < 1:
             raise ValueError("Context length must be a positive integer")
+        if tool_call_parser is not None:
+            tool_call_parser = tool_call_parser.strip()
+            if (not tool_call_parser or tool_call_parser.startswith("-")
+                    or any(character.isspace() for character in tool_call_parser)):
+                raise ValueError("Tool-call parser must be a non-empty parser name")
         settings = dict(model=model, port=port, gpu_memory=gpu_memory, context_length=context_length)
+        if tool_call_parser is not None:
+            settings["tool_call_parser"] = tool_call_parser
         if self.process is not None:
             if self.settings != settings:
                 raise RuntimeError("Stop the server before changing its settings")
@@ -106,6 +114,8 @@ class LocalJudgeServer:
                    "--served-model-name", model, "--gpu-memory-utilization", str(gpu_memory),
                    "--max-model-len", str(context_length), "--max-num-seqs", "4",
                    "--tensor-parallel-size", "1"]
+        if tool_call_parser is not None:
+            command.extend(["--enable-auto-tool-choice", "--tool-call-parser", tool_call_parser])
         with os.fdopen(fd, "wb") as log_file:
             self.process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT,
                                             env=env, start_new_session=True)
@@ -163,14 +173,19 @@ class LocalJudgeServer:
         return self.status()
 
 
-def server_panel(mo, server):
+def server_panel(mo, server, tool_call_parser=None):
     """Callbacks own process actions; reactive notebook evaluation only reads state."""
-    settings = mo.ui.dictionary({
+    fields = {
         "model": mo.ui.text(value=DEFAULT_LOCAL_MODEL, label="Local Hugging Face model ID or path"),
         "port": mo.ui.number(start=1, stop=65535, value=8000, step=1, label="Port"),
         "gpu_memory": mo.ui.number(start=0.05, stop=0.95, value=0.5, step=0.05, label="GPU memory fraction"),
         "context_length": mo.ui.number(start=1, value=8192, step=1, label="Context length"),
-    })
+    }
+    if tool_call_parser is not None:
+        fields["tool_call_parser"] = mo.ui.text(
+            value=tool_call_parser, label="vLLM tool-call parser"
+        )
+    settings = mo.ui.dictionary(fields)
     get_status, set_status = mo.state(server.status())
 
     def action(name):

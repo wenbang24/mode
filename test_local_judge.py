@@ -148,8 +148,28 @@ class LauncherTest(unittest.TestCase):
             ):
                 server.start("test/model")
                 self.assertEqual(launch.call_args.kwargs["env"].get("VLLM_USE_FLASHINFER_SAMPLER"), "0")
+                command = launch.call_args.args[0]
+                self.assertNotIn("--enable-auto-tool-choice", command)
+                self.assertNotIn("--tool-call-parser", command)
         finally:
             server.process = None  # Mock process, not an owned OS process.
+
+    def test_guardagent_tool_calling_flags_are_opt_in(self):
+        server = LocalJudgeServer()
+        try:
+            with patch("scripts.local_judge.sys.platform", "linux"), patch(
+                "scripts.local_judge.shutil.which", return_value="uv"
+            ), patch("scripts.local_judge.socket.socket"), patch(
+                "scripts.local_judge.subprocess.Popen"
+            ) as launch, patch.object(server, "status", return_value={"state": "starting"}):
+                server.start("Qwen/Qwen2.5-14B-Instruct", tool_call_parser="hermes")
+                command = launch.call_args.args[0]
+                self.assertIn("--enable-auto-tool-choice", command)
+                parser_index = command.index("--tool-call-parser")
+                self.assertEqual(command[parser_index + 1], "hermes")
+                self.assertEqual(server.settings["tool_call_parser"], "hermes")
+        finally:
+            server.process = None
 
     def test_lifecycle(self):
         # Stand in for vLLM with an HTTP server whose worker ignores SIGTERM.
