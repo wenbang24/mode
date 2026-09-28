@@ -341,6 +341,21 @@ class GuardAgent:
             recipient.receive(message, guard, request_reply, silent)
 
         self.official.GuardAgent.send = compatible_send
+        execute_parameters = inspect.signature(
+            self.official.GuardAgent.execute_function
+        ).parameters
+        if "call_id" not in execute_parameters:
+            legacy_execute_function = self.official.GuardAgent.execute_function
+
+            def compatible_execute_function(
+                guard: Any,
+                func_call: dict[str, Any],
+                call_id: str | None = None,
+                verbose: bool = False,
+            ) -> tuple[bool, dict[str, Any]]:
+                return legacy_execute_function(guard, func_call)
+
+            self.official.GuardAgent.execute_function = compatible_execute_function
         openai_client = self.official.OpenAI
         api_base = self.api_base
 
@@ -417,7 +432,7 @@ class GuardAgent:
             ],
             "config_list": config_list,
             "timeout": self.timeout,
-            "cache_seed": self.seed,
+            "cache_seed": None,
             "max_tokens": 256,
             "temperature": 0,
         }

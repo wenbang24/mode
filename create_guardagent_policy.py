@@ -22,9 +22,9 @@ def title(mo):
     mo.md("""
     # GuardAgent policy notebook
 
-    Build GuardAgent's online policy memory from all 10,000 WildGuard or Aegis
-    training cases, evaluate the frozen policy on validation, and unlock the
-    untouched test split only after validation is complete. The notebook uses the
+    Build GuardAgent's online policy memory from WildGuard or Aegis training
+    cases, preview validation and test behavior on partial checkpoints, then run
+    the full test stage after training and validation are complete. The notebook uses the
     official two-stage planner/code-generator pinned to commit
     `eb8797f0f3570800c1f596c40418edc929994a24`; generated code is evaluated by a
     restricted assignment-only interpreter.
@@ -66,7 +66,6 @@ def imports():
         model_slug,
         policy_status,
         preflight_policy_inputs,
-        run_policy_stage,
         verify_policy_bundle,
     )
 
@@ -93,12 +92,20 @@ def imports():
         positive_timeout,
         preflight_policy_inputs,
         restricted_execute,
-        run_policy_stage,
         server_panel,
         subprocess,
         time,
         verify_policy_bundle,
     )
+
+
+@app.cell
+def policy_runner():
+    import importlib as _importlib
+    import scripts.experts.guardagent_policy as _policy_module
+
+    run_policy_stage = _importlib.reload(_policy_module).run_policy_stage
+    return (run_policy_stage,)
 
 
 @app.cell(hide_code=True)
@@ -215,13 +222,16 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
     case_budget_control = mo.ui.number(
         start=1, value=100, step=1, label="Cases per action"
     )
+    training_limit_control = mo.ui.number(
+        start=1, value=10_000, step=100, label="Training case limit (total)"
+    )
     overwrite_control = mo.ui.checkbox(
         value=False, label="Replace existing build on the next Train action"
     )
     preflight_button = mo.ui.run_button(label="1. Preflight")
     train_button = mo.ui.run_button(label="2. Train / resume")
-    validation_button = mo.ui.run_button(label="3. Validate / resume")
-    test_button = mo.ui.run_button(label="4. Test / resume")
+    validation_button = mo.ui.run_button(label="3. Validate preview / resume")
+    test_button = mo.ui.run_button(label="4. Test preview / full test")
     refresh_status_button = mo.ui.run_button(label="Refresh status")
     demo_prompt_control = mo.ui.text_area(
         value="Explain how rainbows form.",
@@ -235,7 +245,7 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
             hosted_api_base_control,
             hosted_model_control,
             output_root_control,
-            mo.hstack([case_budget_control, overwrite_control]),
+            mo.hstack([case_budget_control, training_limit_control, overwrite_control]),
             mo.hstack(
                 [
                     preflight_button,
@@ -249,9 +259,17 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
             demo_button,
             mo.callout(
                 "Training appends a memory only when execution succeeds and the verdict "
-                "matches the label. Validation and test are frozen. Errors are checkpointed "
-                "and retried on the next action; five consecutive connection failures stop "
-                "the current action. Excluding preflight and retries, a complete "
+                "matches the label. Training case limit caps the cumulative training total; "
+                "set it to 1,000 or less to preview a smaller build. Cases per action controls "
+                "batch size. Validate after at least one training case. A test preview is "
+                "available after at least one training and validation case, and its results "
+                "are separate from the final bundle. Previewed cases are exploratory, not "
+                "untouched benchmark data. The full test run stays locked until all training "
+                "and validation cases are complete. If you resume training after a validation "
+                "or test preview, those previews are archived and must be rerun against the new "
+                "checkpoint. Errors are checkpointed and retried on the next action; five "
+                "consecutive connection failures stop the current action. Excluding "
+                "preflight and retries, a complete "
                 "A clean run makes three model calls per case (planning, code "
                 "generation, and termination): about 38,097 for WildGuard and "
                 "39,309 for Aegis, before retries.",
@@ -272,6 +290,7 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
         refresh_status_button,
         test_button,
         train_button,
+        training_limit_control,
         validation_button,
     )
 
@@ -292,6 +311,7 @@ def configuration(
     positive_timeout,
     request_timeout_control,
     server_settings,
+    training_limit_control,
 ):
     workspace = Path(__file__).resolve().parent
     dataset_preset = DATASET_PRESETS[dataset_preset_control.value]
@@ -310,6 +330,7 @@ def configuration(
     test_path = dataset_paths["test"]
     output_root = Path(output_root_control.value).expanduser()
     case_budget = int(case_budget_control.value)
+    train_limit = int(training_limit_control.value)
     request_timeout = positive_timeout(request_timeout_control.value)
 
     if connection_mode_control.value == "Managed local":
@@ -338,6 +359,7 @@ def configuration(
         provider,
         request_timeout,
         target_bundle,
+        train_limit,
         test_path,
         tool_call_parser,
         train_path,
@@ -475,6 +497,7 @@ def train_action(
     run_policy_stage,
     target_bundle,
     test_path,
+    train_limit,
     train_button,
     train_path,
     validation_path,
@@ -492,6 +515,7 @@ def train_action(
             identity=train_identity,
             api_key=train_key,
             case_budget=case_budget,
+            train_limit=train_limit,
             timeout=request_timeout,
             overwrite=overwrite_control.value,
         )
@@ -546,9 +570,11 @@ def validation_action(
 @app.cell(hide_code=True)
 def test_action(
     case_budget,
+    expected_counts,
     json,
     mo,
     official_root,
+    policy_status,
     request_timeout,
     resolve_guardagent_run,
     run_policy_stage,
@@ -561,8 +587,16 @@ def test_action(
     test_report = None
     if test_button.value:
         test_preflight, test_identity, test_key = resolve_guardagent_run()
+        status_shapes = {
+            name: range(count) for name, count in expected_counts.items()
+        }
+        current_status = policy_status(target_bundle, status_shapes)
+        official_ready = all(
+            current_status["splits"][split]["complete_cases"] == expected_counts[split]
+            for split in ("train", "validation")
+        )
         test_report = run_policy_stage(
-            split="test",
+            split="test" if official_ready else "test_preview",
             official_root=official_root,
             train_path=train_path,
             validation_path=validation_path,
@@ -574,7 +608,7 @@ def test_action(
             timeout=request_timeout,
         )
     mo.md(
-        "Test action is idle. It remains locked until validation is complete."
+        "Test action is idle."
         if test_report is None
         else "```json\n" + json.dumps(test_report, indent=2) + "\n```"
     )
@@ -609,16 +643,17 @@ def artifact_status(
         status_rows.append(
             {
                 "split": status_split,
-                "complete": status_value["complete_cases"],
-                "expected": status_value["expected_cases"],
+                "completed / expected": (
+                    f"{status_value['complete_cases']} / {status_value['expected_cases']}"
+                ),
                 "attempts": status_value["attempts"],
-                "end-to-end accuracy": status_value["metrics"][
+                "completed-case accuracy": status_value["metrics"][
                     "end_to_end_accuracy"
                 ],
-                "valid-only accuracy": status_value["metrics"][
-                    "valid_only_accuracy"
-                ],
-                "coverage": status_value["metrics"]["executable_coverage"],
+                "valid-only accuracy": status_value["metrics"]["valid_only_accuracy"],
+                "attempt errors": max(
+                    0, status_value["attempts"] - status_value["complete_cases"]
+                ),
             }
         )
     mo.vstack(

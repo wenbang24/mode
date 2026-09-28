@@ -347,16 +347,19 @@ def run_policy_stage(
     identity: dict[str, Any],
     api_key: str,
     case_budget: int = 100,
+    train_limit: int | None = None,
     timeout: float = 120,
     overwrite: bool = False,
     expert_factory: Callable[..., Any] = GuardAgent,
 ) -> dict[str, Any]:
     """Advance one stage by at most ``case_budget`` cases, then checkpoint."""
 
-    if split not in {"train", "validation", "test"}:
-        raise ValueError("split must be train, validation, or test")
+    if split not in {"train", "validation", "test_preview", "test"}:
+        raise ValueError("split must be train, validation, test_preview, or test")
     if type(case_budget) is not int or case_budget < 1:
         raise ValueError("case_budget must be a positive integer")
+    if train_limit is not None and (type(train_limit) is not int or train_limit < 1):
+        raise ValueError("train_limit must be a positive integer")
     root, commit = validate_checkout(official_root, require_pinned=expert_factory is GuardAgent)
     if identity["upstream_commit"] != commit:
         raise ValueError("identity does not match the GuardAgent checkout")
@@ -372,24 +375,48 @@ def run_policy_stage(
         return policy_status(target, rows_by_split)
     train_results = _read_jsonl(state / "train_results.jsonl")
     train_done = _completed(train_results, identity["fingerprint"])
-    if split != "train" and len(train_done) != len(rows_by_split["train"]):
+    if split == "train" and train_limit is not None and len(train_done) > train_limit:
+        raise ValueError(
+            f"training case limit {train_limit:,} is below the {len(train_done):,} "
+            "cases already completed"
+        )
+    if split == "validation" and not train_done:
+        raise RuntimeError("train at least one case before running validation")
+    validation_done = _completed(
+        _read_jsonl(state / "validation_results.jsonl"), identity["fingerprint"]
+    )
+    if split == "test_preview" and (not train_done or not validation_done):
+        raise RuntimeError("train and validate at least one case before running a test preview")
+    if split == "test" and len(train_done) != len(rows_by_split["train"]):
         raise RuntimeError("finish the 10,000-case policy build before held-out evaluation")
     policy = state / "policy.jsonl"
     memory = [dict(item) for item in MEMORY] + _learned_memory(train_results, identity["fingerprint"])
     if len(train_done) == len(rows_by_split["train"]) and not policy.exists():
         _write_policy(policy, memory)
     if split == "test":
-        validation_done = _completed(
-            _read_jsonl(state / "validation_results.jsonl"), identity["fingerprint"]
-        )
         if len(validation_done) != len(rows_by_split["validation"]):
             raise RuntimeError("finish frozen validation before enabling the untouched test split")
+    source_split = "test" if split == "test_preview" else split
     result_path = state / f"{split}_results.jsonl"
     prior = _read_jsonl(result_path)
     done = _completed(prior, identity["fingerprint"])
-    pending = [row for row in rows_by_split[split] if row["case_id"] not in done]
+    pending = [row for row in rows_by_split[source_split] if row["case_id"] not in done]
+    if split == "train" and train_limit is not None:
+        pending = pending[: train_limit - len(train_done)]
     if not pending:
         return _finish_or_status(state, Path(target).expanduser().resolve(), identity, rows_by_split, memory)
+
+    validation_archive = None
+    validation_prior = _read_jsonl(state / "validation_results.jsonl")
+    if split == "train" and validation_prior:
+        validation_archive = state / f"validation_preview_{time.time_ns()}.jsonl"
+        os.replace(state / "validation_results.jsonl", validation_archive)
+    test_preview_archive = None
+    if split in {"train", "validation"}:
+        preview_path = state / "test_preview_results.jsonl"
+        if preview_path.exists():
+            test_preview_archive = state / f"test_preview_{time.time_ns()}.jsonl"
+            os.replace(preview_path, test_preview_archive)
 
     expert = _make_expert(
         expert_factory,
@@ -443,7 +470,13 @@ def run_policy_stage(
     if len(_completed(latest_train, identity["fingerprint"])) == len(rows_by_split["train"]):
         _write_policy(policy, memory)
     status = _finish_or_status(state, Path(target).expanduser().resolve(), identity, rows_by_split, memory)
-    return status | {"processed_this_action": processed, "consecutive_failures": failures}
+    return status | {
+        "processed_this_action": processed,
+        "consecutive_failures": failures,
+        "train_limit": train_limit if split == "train" else None,
+        "validation_preview_archived": str(validation_archive) if validation_archive else None,
+        "test_preview_archived": str(test_preview_archive) if test_preview_archive else None,
+    }
 
 
 def _base_metrics(rows: list[dict[str, Any]], expected_total: int | None = None) -> dict[str, Any]:
@@ -546,15 +579,19 @@ def policy_status(path: Path, rows_by_split: dict[str, list[dict[str, Any]]] | N
     elif (state / "build.json").exists():
         fingerprint = json.loads((state / "build.json").read_text(encoding="utf-8"))["fingerprint"]
     split_status = {}
-    for split in ("train", "validation", "test"):
+    for split in ("train", "validation", "test", "test_preview"):
+        source_split = "test" if split == "test_preview" else split
         rows = _read_jsonl(state / f"{split}_results.jsonl")
         done = _completed(rows, fingerprint) if fingerprint else {}
-        expected = len(rows_by_split[split]) if rows_by_split else None
+        expected = len(rows_by_split[source_split]) if rows_by_split else None
+        metric_total = (
+            expected if expected is not None and len(done) == expected else len(done)
+        )
         split_status[split] = {
             "complete_cases": len(done),
             "expected_cases": expected,
             "attempts": len(rows),
-            "metrics": metrics(list(done.values()), expected),
+            "metrics": metrics(list(done.values()), metric_total),
         }
     complete = metadata_path.exists() and state == path
     policy_path = state / "policy.jsonl"
