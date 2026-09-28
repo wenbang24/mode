@@ -22,12 +22,10 @@ def title(mo):
     mo.md("""
     # GuardAgent policy notebook
 
-    Build GuardAgent's online policy memory from WildGuard or Aegis training
-    cases, preview validation and test behavior on partial checkpoints, then run
-    the full test stage after training and validation are complete. The notebook uses the
-    official two-stage planner/code-generator pinned to commit
-    `eb8797f0f3570800c1f596c40418edc929994a24`; generated code is evaluated by a
-    restricted assignment-only interpreter.
+    Generate GuardAgent examples during training, compile them into a frozen
+    set of term rules, and evaluate those rules on validation and test prompts
+    without model calls. Training uses the official planner/code-generator
+    pinned to commit `eb8797f0f3570800c1f596c40418edc929994a24`.
     """)
     return
 
@@ -53,7 +51,7 @@ def imports():
         ALLOW_CODE,
         BLOCK_CODE,
         MEMORY_SHOTS,
-        GuardAgent,
+        FrozenGuardAgent,
         restricted_execute,
     )
     from scripts.experts.guardagent_policy import (
@@ -75,7 +73,7 @@ def imports():
         BLOCK_CODE,
         DATASET_PRESETS,
         DEFAULT_OUTPUT_ROOT,
-        GuardAgent,
+        FrozenGuardAgent,
         MEMORY_SHOTS,
         Path,
         UPSTREAM_COMMIT,
@@ -130,7 +128,8 @@ def connection_controls(local_server, mo, server_panel):
             check_guardagent_button,
             mo.md(
                 "Managed local starts vLLM 0.27 with automatic tool choice and the "
-                "Hermes parser. Keep it running for the complete build and evaluation."
+                "Hermes parser. Keep it running for training; frozen-policy "
+                "validation and testing do not use the model."
             ),
         ]
     )
@@ -268,11 +267,10 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
                 "and validation cases are complete. If you resume training after a validation "
                 "or test preview, those previews are archived and must be rerun against the new "
                 "checkpoint. Errors are checkpointed and retried on the next action; five "
-                "consecutive connection failures stop the current action. Excluding "
-                "preflight and retries, a complete "
-                "A clean run makes three model calls per case (planning, code "
-                "generation, and termination): about 38,097 for WildGuard and "
-                "39,309 for Aegis, before retries.",
+                "consecutive connection failures stop the current action. "
+                "A clean training case makes three model calls (planning, code "
+                "generation, and termination). Validation, test, and the "
+                "completed policy demonstration use the saved rules only.",
                 kind="info",
             ),
         ]
@@ -386,7 +384,7 @@ def run_context(
     train_path,
     validation_path,
 ):
-    def resolve_guardagent_run():
+    def resolve_guardagent_run(require_model=False):
         preflight_value = preflight_policy_inputs(
             official_root=official_root,
             train_path=train_path,
@@ -394,11 +392,12 @@ def run_context(
             test_path=test_path,
             expected_counts=expected_counts,
         )
-        if provider == "Managed local":
+        if require_model and provider == "Managed local":
             local_server.require_ready(server_settings.value)
-            key_value = ""
-        else:
-            key_value = judge_key(api_endpoint, "HACKCLUB_API_KEY")
+        key_value = (
+            judge_key(api_endpoint, "HACKCLUB_API_KEY")
+            if require_model and provider != "Managed local" else ""
+        )
         identity_value = build_identity(
             dataset=dataset_slug,
             model=core_model,
@@ -504,7 +503,7 @@ def train_action(
 ):
     train_report = None
     if train_button.value:
-        train_preflight, train_identity, train_key = resolve_guardagent_run()
+        train_preflight, train_identity, train_key = resolve_guardagent_run(require_model=True)
         train_report = run_policy_stage(
             split="train",
             official_root=official_root,
@@ -661,7 +660,8 @@ def artifact_status(
             mo.md(
                 f"### Artifact status: **{artifact_status_report['state']}**  \n"
                 f"`{artifact_status_report['path']}`  \n"
-                f"Learned memory size: `{artifact_status_report.get('learned_memory_size')}`"
+                f"Learned memory size: `{artifact_status_report.get('learned_memory_size')}`  \n"
+                f"Frozen rules: `{artifact_status_report.get('policy_rule_count')}`"
             ),
             mo.ui.table(status_rows),
         ]
@@ -671,20 +671,11 @@ def artifact_status(
 
 @app.cell(hide_code=True)
 def demonstration(
-    GuardAgent,
-    MEMORY_SHOTS,
-    api_endpoint,
-    core_model,
+    FrozenGuardAgent,
     demo_button,
     demo_prompt_control,
     json,
-    judge_key,
-    local_server,
     mo,
-    official_root,
-    provider,
-    request_timeout,
-    server_settings,
     target_bundle,
     time,
     verify_policy_bundle,
@@ -692,21 +683,7 @@ def demonstration(
     demo_report = None
     if demo_button.value:
         verified_metadata = verify_policy_bundle(target_bundle)
-        if provider == "Managed local":
-            local_server.require_ready(server_settings.value)
-            demo_key = ""
-        else:
-            demo_key = judge_key(api_endpoint, "HACKCLUB_API_KEY")
-        demo_agent = GuardAgent(
-            official_root,
-            demo_key,
-            api_endpoint,
-            core_model,
-            seed=42,
-            policy_bundle=target_bundle,
-            num_shots=MEMORY_SHOTS,
-            timeout=request_timeout,
-        )
+        demo_agent = FrozenGuardAgent(target_bundle)
         demo_started = time.perf_counter()
         try:
             demo_outcome = demo_agent.run(demo_prompt_control.value)
@@ -714,13 +691,11 @@ def demonstration(
             demo_agent.close()
         demo_report = {
             "verdict": "block" if demo_outcome.block else "allow",
-            "provider": provider,
-            "endpoint": api_endpoint,
-            "model": core_model,
+            "policy_kind": verified_metadata["policy_kind"],
+            "rules": verified_metadata["policy_rule_count"],
             "latency_seconds": time.perf_counter() - demo_started,
-            "retrieved_examples": demo_outcome.metadata["retrieved_examples"],
-            "task_plan": demo_outcome.metadata["task_plan"],
-            "restricted_code": demo_outcome.metadata["generated_code"],
+            "matched_rules": demo_outcome.metadata["matched_rules"],
+            "policy_score": demo_outcome.metadata["policy_score"],
             "bundle_fingerprint": verified_metadata["fingerprint"],
         }
     mo.md(

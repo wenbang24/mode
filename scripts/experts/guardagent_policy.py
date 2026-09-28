@@ -15,7 +15,10 @@ from typing import Any, Callable, Iterable
 from urllib.request import Request, urlopen
 
 from .base import ExpertOutcome, error_text
-from .guardagent import MEMORY, MEMORY_SHOTS, GuardAgent, validate_memory
+from .guardagent import (
+    MEMORY, MEMORY_SHOTS, FrozenGuardAgent, GuardAgentTrainer, compile_frozen_policies,
+    load_frozen_policies, validate_memory,
+)
 
 try:
     from scripts.local_judge import normalize_endpoint, request_headers
@@ -27,7 +30,7 @@ except ModuleNotFoundError:  # Direct imports from scripts/.
 
 UPSTREAM_REPOSITORY = "https://github.com/guardagent/code"
 UPSTREAM_COMMIT = "eb8797f0f3570800c1f596c40418edc929994a24"
-BUNDLE_SCHEMA_VERSION = 1
+BUNDLE_SCHEMA_VERSION = 2
 PROMPT_VERSION = "prompt_gate_v1"
 EXECUTOR_VERSION = "restricted_ast_v1"
 DEFAULT_OUTPUT_ROOT = Path("artifacts/guardagent")
@@ -350,7 +353,7 @@ def run_policy_stage(
     train_limit: int | None = None,
     timeout: float = 120,
     overwrite: bool = False,
-    expert_factory: Callable[..., Any] = GuardAgent,
+    expert_factory: Callable[..., Any] = GuardAgentTrainer,
 ) -> dict[str, Any]:
     """Advance one stage by at most ``case_budget`` cases, then checkpoint."""
 
@@ -360,7 +363,7 @@ def run_policy_stage(
         raise ValueError("case_budget must be a positive integer")
     if train_limit is not None and (type(train_limit) is not int or train_limit < 1):
         raise ValueError("train_limit must be a positive integer")
-    root, commit = validate_checkout(official_root, require_pinned=expert_factory is GuardAgent)
+    root, commit = validate_checkout(official_root, require_pinned=expert_factory is GuardAgentTrainer)
     if identity["upstream_commit"] != commit:
         raise ValueError("identity does not match the GuardAgent checkout")
     paths = {"train": Path(train_path), "validation": Path(validation_path), "test": Path(test_path)}
@@ -391,6 +394,8 @@ def run_policy_stage(
         raise RuntimeError("finish the 10,000-case policy build before held-out evaluation")
     policy = state / "policy.jsonl"
     memory = [dict(item) for item in MEMORY] + _learned_memory(train_results, identity["fingerprint"])
+    frozen = compile_frozen_policies(memory)
+    _write_json(state / "policies.json", frozen)
     if len(train_done) == len(rows_by_split["train"]) and not policy.exists():
         _write_policy(policy, memory)
     if split == "test":
@@ -418,15 +423,18 @@ def run_policy_stage(
             test_preview_archive = state / f"test_preview_{time.time_ns()}.jsonl"
             os.replace(preview_path, test_preview_archive)
 
-    expert = _make_expert(
-        expert_factory,
-        official_root=root,
-        api_key=api_key,
-        endpoint=identity["endpoint"],
-        model=identity["model"],
-        seed=identity["seed"],
-        memory=memory,
-        timeout=timeout,
+    expert = (
+        _make_expert(
+            expert_factory,
+            official_root=root,
+            api_key=api_key,
+            endpoint=identity["endpoint"],
+            model=identity["model"],
+            seed=identity["seed"],
+            memory=memory,
+            timeout=timeout,
+        )
+        if split == "train" else FrozenGuardAgent(policies=frozen)
     )
     failures = processed = 0
     try:
@@ -467,6 +475,7 @@ def run_policy_stage(
     memory = [dict(item) for item in MEMORY] + _learned_memory(
         latest_train, identity["fingerprint"]
     )
+    _write_json(state / "policies.json", compile_frozen_policies(memory))
     if len(_completed(latest_train, identity["fingerprint"])) == len(rows_by_split["train"]):
         _write_policy(policy, memory)
     status = _finish_or_status(state, Path(target).expanduser().resolve(), identity, rows_by_split, memory)
@@ -542,15 +551,25 @@ def _finish_or_status(
             for split in ("train", "validation", "test")
         }
         _write_policy(state / "policy.jsonl", memory)
+        policies = compile_frozen_policies(memory)
+        _write_json(state / "policies.json", policies)
         artifacts = {
             name: sha256_file(state / name)
             for name in (
-                "policy.jsonl", "train_results.jsonl", "validation_results.jsonl", "test_results.jsonl"
+                "policy.jsonl", "policies.json", "train_results.jsonl",
+                "validation_results.jsonl", "test_results.jsonl"
             )
         }
         metadata = identity | {
             "learned_memory_size": len(memory),
             "learned_cases": len(memory) - len(MEMORY),
+            "policy_kind": policies["kind"],
+            "policy_rule_count": len(policies["rules"]),
+            "metric_modes": {
+                "train": "model_generated_examples",
+                "validation": "frozen_policies",
+                "test": "frozen_policies",
+            },
             "split_counts": {name: len(values) for name, values in rows_by_split.items()},
             "metrics": {
                 name: metrics(result_rows[name], len(rows_by_split[name]))
@@ -599,6 +618,11 @@ def policy_status(path: Path, rows_by_split: dict[str, list[dict[str, Any]]] | N
     if policy_path.exists():
         with policy_path.open(encoding="utf-8") as handle:
             learned_memory_size = sum(1 for _ in handle)
+    frozen_path = state / "policies.json"
+    policy_rule_count = (
+        len(json.loads(frozen_path.read_text(encoding="utf-8"))["rules"])
+        if frozen_path.exists() else None
+    )
     return {
         "path": str(state),
         "state": "complete" if complete else "in_progress",
@@ -606,6 +630,7 @@ def policy_status(path: Path, rows_by_split: dict[str, list[dict[str, Any]]] | N
         "fingerprint": fingerprint,
         "splits": split_status,
         "learned_memory_size": learned_memory_size,
+        "policy_rule_count": policy_rule_count,
     }
 
 
@@ -626,6 +651,11 @@ def verify_policy_bundle(path: Path) -> dict[str, Any]:
     )
     if len(memory) != metadata.get("learned_memory_size"):
         raise ValueError("policy memory size differs from metadata")
+    frozen = load_frozen_policies(path)
+    if (frozen["training_examples"] != len(memory)
+            or len(frozen["rules"]) != metadata.get("policy_rule_count")
+            or frozen["kind"] != metadata.get("policy_kind")):
+        raise ValueError("frozen policy differs from bundle metadata")
     for split, expected in metadata["split_counts"].items():
         complete = _completed(_read_jsonl(path / f"{split}_results.jsonl"), metadata["fingerprint"])
         if len(complete) != expected:
@@ -641,12 +671,12 @@ def check_guardagent(
     model: str,
     seed: int = 42,
     timeout: float = 120,
-    expert_factory: Callable[..., Any] = GuardAgent,
+    expert_factory: Callable[..., Any] = GuardAgentTrainer,
 ) -> dict[str, Any]:
     """Check model discovery and a known allow/block pair before a long run."""
 
     root, _commit = validate_checkout(
-        official_root, require_pinned=expert_factory is GuardAgent
+        official_root, require_pinned=expert_factory is GuardAgentTrainer
     )
     endpoint = normalize_endpoint(endpoint)
     request = Request(endpoint + "/models", headers=request_headers(api_key))

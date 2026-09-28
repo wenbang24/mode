@@ -14,7 +14,10 @@ from scripts.experts.guardagent import (
     BLOCK_CODE,
     MEMORY,
     MEMORY_SHOTS,
+    FrozenGuardAgent,
     GuardAgent,
+    GuardAgentTrainer,
+    compile_frozen_policies,
     load_policy_memory,
     restricted_execute,
 )
@@ -56,15 +59,26 @@ class RestrictedExecutorTest(unittest.TestCase):
 
 
 class AdapterTest(unittest.TestCase):
+    def test_frozen_rules_classify_unseen_prompts_without_model_calls(self):
+        self.assertIs(GuardAgent, FrozenGuardAgent)
+        memory = [
+            *MEMORY,
+            {"agent input": "review", "agent output": "bad train request", "subtasks": "block", "code": BLOCK_CODE},
+            {"agent input": "review", "agent output": "good train request", "subtasks": "allow", "code": ALLOW_CODE},
+        ]
+        guard = FrozenGuardAgent(policies=compile_frozen_policies(memory))
+        self.assertTrue(guard.run("bad unseen request").block)
+        self.assertFalse(guard.run("good unseen request").block)
+
     def test_correct_only_learning(self):
-        agent = object.__new__(GuardAgent)
+        agent = object.__new__(GuardAgentTrainer)
         agent.memory = [dict(item) for item in MEMORY]
         agent.num_shots = MEMORY_SHOTS
         updates = []
         agent.guard = SimpleNamespace(update_memory=lambda shots, memory: updates.append((shots, list(memory))))
         good = ExpertOutcome(False, metadata={"task_plan": "safe plan", "generated_code": ALLOW_CODE})
         bad = ExpertOutcome(True, metadata={"task_plan": "wrong plan", "generated_code": BLOCK_CODE})
-        with patch.object(GuardAgent, "run", side_effect=[good, bad]):
+        with patch.object(GuardAgentTrainer, "run", side_effect=[good, bad]):
             outcome, learned = agent.learn("hello", False)
             self.assertFalse(outcome.block)
             self.assertEqual(learned["subtasks"], "safe plan")
@@ -76,7 +90,7 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(updates[-1][0], MEMORY_SHOTS)
 
     def test_nearest_examples_are_stable_and_three_shot(self):
-        agent = object.__new__(GuardAgent)
+        agent = object.__new__(GuardAgentTrainer)
         agent.official = SimpleNamespace(
             Levenshtein=SimpleNamespace(distance=lambda left, right: abs(len(left) - len(right)))
         )
@@ -182,14 +196,17 @@ class PolicyWorkflowTest(unittest.TestCase):
                 self.assertEqual(first["splits"]["train"]["complete_cases"], 1)
                 policy.run_policy_stage(split="train", case_budget=10, **arguments)
                 self.assertTrue((target.with_name(target.name + ".work") / "policy.jsonl").exists())
+                self.assertTrue((target.with_name(target.name + ".work") / "policies.json").exists())
                 policy.run_policy_stage(split="validation", case_budget=10, **arguments)
                 policy.run_policy_stage(split="test", case_budget=10, **arguments)
             metadata = policy.verify_policy_bundle(target)
             self.assertEqual(metadata["split_counts"], {name: 2 for name in rows})
             self.assertEqual(metadata["learned_memory_size"], 4)
+            self.assertGreater(metadata["policy_rule_count"], 0)
             self.assertEqual(len(load_policy_memory(target)), 4)
+            self.assertTrue(FrozenGuardAgent(target).run("bad unseen request").block)
             self.assertEqual(FakeExpert.learn_calls, ["bad train", "good train"])
-            self.assertEqual(set(FakeExpert.run_calls), {row["prompt"] for values in rows.values() for row in values})
+            self.assertEqual(set(FakeExpert.run_calls), {row["prompt"] for row in rows["train"]})
             self.assertEqual(metadata["provider"], "Managed local")
             self.assertEqual(metadata["tool_call_parser"], "hermes")
             stale = identity | {"endpoint": "http://localhost:9000/v1", "fingerprint": "stale"}

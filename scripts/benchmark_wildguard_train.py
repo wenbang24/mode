@@ -9,11 +9,10 @@ Example:
         --piguard-training-root /content/PIGuard \
         --adasteer-root /content/AdaSteer \
         --adasteer-bundle artifacts/adasteer/wildguardtrain_10000_seed42/qwen-qwen2.5-3b-instruct \
-        --guardagent-root /content/GuardAgent \
         --guardagent-policy-bundle artifacts/guardagent/wildguard/openai-gpt-5.6-sol
 
 Set ``HF_TOKEN`` only when a selected model requires authentication, and set
-``JUDGE_API_KEY`` or ``HACKCLUB_API_KEY`` for the AdaSteer judge and GuardAgent. The benchmark does
+``JUDGE_API_KEY`` or ``HACKCLUB_API_KEY`` for the AdaSteer judge. The benchmark does
 not train experts or a router.
 """
 
@@ -37,13 +36,12 @@ from experts import (
     AdaSteer,
     Expert,
     ExpertOutcome,
-    GuardAgent,
     PIGuardFineTuned,
     PIGuardGuardrail,
 )
 from experts.base import error_text
 from experts.adasteer_bundle import verify_bundle
-from experts.guardagent import MEMORY_SHOTS, memory_from_rows
+from experts.guardagent import FrozenGuardAgent, GuardAgentTrainer, MEMORY_SHOTS, memory_from_rows
 from experts.guardagent_policy import verify_policy_bundle
 
 
@@ -379,18 +377,9 @@ def real_builders(
             ),
         ),
         (
-            GuardAgent.name,
-            args.guardagent_model,
-            lambda: GuardAgent(
-                args.guardagent_root,
-                api_key,
-                args.api_base,
-                args.guardagent_model,
-                args.seed,
-                args.allow_unsafe_guardagent_exec,
-                None if args.guardagent_policy_bundle else args.guardagent_memory_dataset,
-                policy_bundle=args.guardagent_policy_bundle,
-            ),
+            FrozenGuardAgent.name,
+            FrozenGuardAgent.model_id,
+            lambda: FrozenGuardAgent(args.guardagent_policy_bundle),
         ),
     ]
 
@@ -406,7 +395,7 @@ def benchmark_config(args: argparse.Namespace) -> dict[str, Any]:
             PIGuardFineTuned.name: PIGuardFineTuned.model_id,
             PIGuardGuardrail.name: PIGuardGuardrail.model_id,
             AdaSteer.name: args.adasteer_model,
-            GuardAgent.name: args.guardagent_model,
+            FrozenGuardAgent.name: FrozenGuardAgent.model_id,
         },
         "cases": args.cases,
         "seed": args.seed,
@@ -419,14 +408,7 @@ def benchmark_config(args: argparse.Namespace) -> dict[str, Any]:
         "adasteer_model": args.adasteer_model,
         "adasteer_revision": args.adasteer_revision,
         "max_new_tokens": args.max_new_tokens,
-        "guardagent_root": str(args.guardagent_root.resolve()),
-        "guardagent_model": args.guardagent_model,
-        "guardagent_memory_dataset": str(args.guardagent_memory_dataset.resolve())
-        if args.guardagent_memory_dataset and not args.guardagent_policy_bundle
-        else None,
-        "guardagent_policy_bundle": str(args.guardagent_policy_bundle.resolve())
-        if args.guardagent_policy_bundle
-        else None,
+        "guardagent_policy_bundle": str(args.guardagent_policy_bundle.resolve()),
         "judge_model": args.judge_model,
         "api_base": args.api_base,
     }
@@ -461,7 +443,7 @@ def self_test() -> None:
     class FakeOfficial:
         GuardAgent = FakeOfficialGuard
 
-    guardagent = object.__new__(GuardAgent)
+    guardagent = object.__new__(GuardAgentTrainer)
     guardagent.model_id = DEFAULT_LLM_MODEL
     guardagent.api_key = "test"
     guardagent.api_base = DEFAULT_API_BASE
@@ -616,17 +598,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--adasteer-model", default=AdaSteer.model_id)
     parser.add_argument("--adasteer-revision")
     parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--guardagent-root", type=Path)
-    parser.add_argument("--guardagent-model", default=DEFAULT_LLM_MODEL)
     parser.add_argument("--guardagent-policy-bundle", type=Path)
-    parser.add_argument(
-        "--guardagent-memory-dataset",
-        type=Path,
-        default=Path("wildguardtrain_10000_seed42.parquet"),
-    )
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
     parser.add_argument("--api-base", default=DEFAULT_API_BASE)
-    parser.add_argument("--allow-unsafe-guardagent-exec", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args(argv)
 
@@ -641,7 +615,7 @@ def validate_args(args: argparse.Namespace) -> tuple[str | None, str]:
         for option, value in (
             ("--piguard-training-root", args.piguard_training_root),
             ("--adasteer-root", args.adasteer_root),
-            ("--guardagent-root", args.guardagent_root),
+            ("--guardagent-policy-bundle", args.guardagent_policy_bundle),
         )
         if value is None
     ]
@@ -651,24 +625,14 @@ def validate_args(args: argparse.Namespace) -> tuple[str | None, str]:
         raise SystemExit(
             "--piguard-training-checkpoint requires --piguard-training-root"
         )
-    if args.guardagent_policy_bundle and not args.guardagent_policy_bundle.is_dir():
+    if not args.guardagent_policy_bundle.is_dir():
         raise SystemExit(
             f"GuardAgent policy bundle does not exist: {args.guardagent_policy_bundle}"
-        )
-    if not args.guardagent_policy_bundle and not args.guardagent_memory_dataset.is_file():
-        raise SystemExit(
-            f"GuardAgent memory dataset does not exist: {args.guardagent_memory_dataset}"
-        )
-    if args.allow_unsafe_guardagent_exec:
-        print(
-            "warning: --allow-unsafe-guardagent-exec is deprecated and ignored; "
-            "GuardAgent uses restricted AST evaluation",
-            file=sys.stderr,
         )
     hf_token = os.environ.get("HF_TOKEN")
     api_key = os.environ.get("JUDGE_API_KEY") or os.environ.get("HACKCLUB_API_KEY")
     if not api_key:
-        raise SystemExit("JUDGE_API_KEY or HACKCLUB_API_KEY is required for AdaSteer and GuardAgent")
+        raise SystemExit("JUDGE_API_KEY or HACKCLUB_API_KEY is required for AdaSteer")
     try:
         import torch
     except ImportError as exc:

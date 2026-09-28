@@ -5,9 +5,6 @@
 #     "numpy>=2.1",
 #     "peft>=0.12",
 #     "pyarrow>=18",
-#     "pyautogen==0.2.35",
-#     "python-levenshtein==0.23.0",
-#     "termcolor==2.4.0",
 #     "torch>=2.4",
 #     "transformers>=4.46,<6",
 # ]
@@ -27,13 +24,13 @@ def title(mo):
     mo.md(r"""
     # Trained guardrail benchmark
 
-    Compare the trained AdaSteer, PIGuard, and GuardAgent artifacts on the full
-    WildGuard or Aegis 2.0 test parquet. All allowed prompts use the same local
+    Select any combination of trained AdaSteer, PIGuard, and GuardAgent artifacts
+    to run on the full WildGuard or Aegis 2.0 test parquet. All allowed prompts use the same local
     **Qwen2.5-3B-Instruct** responder. AdaSteer steers that responder; PIGuard and
     GuardAgent gate the prompt before it reaches the unsteered responder.
 
-    A single local vLLM model runs GuardAgent's policy reasoning and judges every
-    final response. The notebook runs gate, response, and judge passes separately
+    GuardAgent applies its frozen trained policies without model calls. A local
+    vLLM model judges every final response. The notebook runs gate, response, and judge passes separately
     to release GPU memory between model groups. Completed per-case work is saved
     and can be resumed.
     """)
@@ -68,10 +65,9 @@ def imports():
         verify_bundle,
     )
     from scripts.experts.base import error_text
-    from scripts.experts.guardagent import GuardAgent
+    from scripts.experts.guardagent import FrozenGuardAgent
     from scripts.experts.guardagent_policy import (
         DEFAULT_OUTPUT_ROOT as GUARDAGENT_OUTPUT_ROOT,
-        validate_checkout as validate_guardagent_checkout,
         verify_policy_bundle,
     )
     from scripts.experts.piguard_finetuned import PIGuardArtifact
@@ -87,6 +83,11 @@ def imports():
     WORKSPACE = Path(__file__).resolve().parent
     RESPONDER_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
     DATASET_KEYS = {"WildGuard": "wildguard", "Aegis 2.0": "aegis"}
+    GUARDRAIL_OPTIONS = {
+        "AdaSteer": "adasteer",
+        "PIGuard": "piguard",
+        "GuardAgent": "guardagent",
+    }
     DATASET_FILES = {
         "wildguard": ("wildguardtest.parquet", 1699),
         "aegis": ("aegis2_test.parquet", 1914),
@@ -99,8 +100,9 @@ def imports():
         AdaSteer,
         DATASET_FILES,
         DATASET_KEYS,
+        GUARDRAIL_OPTIONS,
         GUARDAGENT_OUTPUT_ROOT,
-        GuardAgent,
+        FrozenGuardAgent,
         PIGuardArtifact,
         REFUSAL_TEXT,
         RESPONDER_MODEL_ID,
@@ -129,7 +131,6 @@ def imports():
         tempfile,
         time,
         validate_adasteer_checkout,
-        validate_guardagent_checkout,
         verify_bundle,
         verify_policy_bundle,
         zipfile,
@@ -137,34 +138,35 @@ def imports():
 
 
 @app.cell
-def dataset_selector(mo):
+def dataset_selector(GUARDRAIL_OPTIONS, mo):
     test_set = mo.ui.dropdown(
         options=["WildGuard", "Aegis 2.0"],
         value="WildGuard",
         label="Full held-out test set",
     )
-    test_set
-    return (test_set,)
+    guardrails = mo.ui.multiselect(
+        options=list(GUARDRAIL_OPTIONS),
+        value=list(GUARDRAIL_OPTIONS),
+        label="Guardrails to test",
+    )
+    mo.vstack([test_set, guardrails])
+    return guardrails, test_set
 
 
 @app.cell(hide_code=True)
 def connection_controls(local_server, mo, server_panel):
-    server_settings, server_view, get_server_status = server_panel(
-        mo, local_server, tool_call_parser="hermes"
-    )
+    server_settings, server_view, get_server_status = server_panel(mo, local_server)
     request_timeout = mo.ui.number(
         start=1, value=180, step=1, label="Local model request timeout (seconds)"
     )
     mo.vstack([
-        mo.md("## Local GuardAgent and response judge"),
+        mo.md("## Local response judge"),
         server_view,
         request_timeout,
         mo.md(
-            "Start the local vLLM server before a run. Its model ID must match "
-            "the model recorded in the selected GuardAgent policy bundle. The "
-            "server is stopped while the shared responder loads, then restarted "
-            "for judging. Managed vLLM requires Linux with an NVIDIA GPU, such "
-            "as Molab."
+            "Start the local vLLM judge before a full run. The server is stopped "
+            "while the shared responder loads, then restarted for judging. Managed "
+            "vLLM requires Linux with an NVIDIA GPU, such as Molab."
         ),
     ])
     return get_server_status, request_timeout, server_settings
@@ -193,22 +195,17 @@ def artifact_controls(
     }[slug]
     adasteer_path = mo.ui.text(
         value=str(defaults["adasteer"]),
-        label="AdaSteer bundle ZIP or directory",
+        label="AdaSteer bundle ZIP or directory (also supplies the shared responder runtime)",
         full_width=True,
     )
     piguard_path = mo.ui.text(
         value=str(defaults["piguard"]),
-        label="Generated PIGuard bundle ZIP",
+        label="Generated PIGuard bundle ZIP (needed when selected)",
         full_width=True,
     )
     guardagent_path = mo.ui.text(
         value=str(defaults["guardagent"]),
-        label="Completed GuardAgent policy bundle or its parent directory",
-        full_width=True,
-    )
-    guardagent_checkout = mo.ui.text(
-        value=str(WORKSPACE / ".guardagent/GuardAgent"),
-        label="Pinned GuardAgent source checkout",
+        label="Completed GuardAgent policy bundle or its parent directory (needed when selected)",
         full_width=True,
     )
     output_root = mo.ui.text(
@@ -223,16 +220,15 @@ def artifact_controls(
     mo.vstack([
         mo.md("## Trained artifacts"),
         mo.md(
-            "Artifact defaults change with the selected dataset. You can edit the "
-            "paths for Molab. Preflight checks dataset provenance and stops before "
-            "loading model weights if any artifact does not match. This workspace "
-            "does not yet contain a completed GuardAgent bundle or an Aegis AdaSteer "
-            "bundle, so provide those artifacts before those selections can pass."
+            "Artifact defaults change with the selected dataset. Preflight checks "
+            "only the selected guardrails and stops before loading model weights "
+            "if an artifact does not match. The AdaSteer bundle is always needed "
+            "for the shared Qwen responder runtime. This workspace does not yet "
+            "contain a completed GuardAgent bundle or an Aegis AdaSteer bundle."
         ),
         adasteer_path,
         piguard_path,
         guardagent_path,
-        guardagent_checkout,
         output_root,
         mo.hstack([prepare_source_button, preflight_button]),
         mo.hstack([smoke_button, full_run_button]),
@@ -240,7 +236,6 @@ def artifact_controls(
     return (
         adasteer_path,
         full_run_button,
-        guardagent_checkout,
         guardagent_path,
         output_root,
         piguard_path,
@@ -256,7 +251,8 @@ def benchmark_helpers(
     AdaSteer,
     DATASET_FILES,
     DATASET_KEYS,
-    GuardAgent,
+    GUARDRAIL_OPTIONS,
+    FrozenGuardAgent,
     JUDGE_RESPONSE_FORMAT,
     JUDGE_SYSTEM_PROMPT,
     PIGuardArtifact,
@@ -280,7 +276,6 @@ def benchmark_helpers(
     tempfile,
     time,
     validate_adasteer_checkout,
-    validate_guardagent_checkout,
     verify_bundle,
     verify_policy_bundle,
     VLLM_VERSION,
@@ -479,12 +474,18 @@ def benchmark_helpers(
         adasteer_path,
         piguard_path,
         guardagent_path,
-        guardagent_checkout,
+        selected_guardrails,
         output_root,
         server_settings,
         request_timeout,
     ):
         dataset = DATASET_KEYS[test_set]
+        selected_guardrails = tuple(
+            method for method in GUARDRAIL_OPTIONS.values()
+            if method in selected_guardrails
+        )
+        if not selected_guardrails:
+            raise ValueError("Select at least one guardrail to benchmark")
         validated_tests = {}
         for name, (test_name, expected_count) in DATASET_FILES.items():
             path = WORKSPACE / test_name
@@ -517,28 +518,21 @@ def benchmark_helpers(
         if source_marker not in sources:
             raise ValueError("AdaSteer bundle source dataset does not match the selected test set")
 
-        piguard_metadata = PIGuardArtifact.inspect_artifact(piguard_path)
-        if piguard_metadata["dataset"] != dataset:
-            raise ValueError(
-                f"PIGuard artifact is tagged {piguard_metadata['dataset']!r}, expected {dataset!r}"
+        piguard_metadata = None
+        if "piguard" in selected_guardrails:
+            piguard_metadata = PIGuardArtifact.inspect_artifact(piguard_path)
+            if piguard_metadata["dataset"] != dataset:
+                raise ValueError(
+                    f"PIGuard artifact is tagged {piguard_metadata['dataset']!r}, expected {dataset!r}"
+                )
+        guardagent_bundle = guardagent_metadata = None
+        if "guardagent" in selected_guardrails:
+            guardagent_bundle, guardagent_metadata = resolve_guardagent_bundle(
+                guardagent_path, dataset, test_hash
             )
-        guardagent_bundle, guardagent_metadata = resolve_guardagent_bundle(
-            guardagent_path, dataset, test_hash
-        )
-        source_root = Path(guardagent_checkout).expanduser().resolve()
-        _, guardagent_commit = validate_guardagent_checkout(source_root)
-        if guardagent_metadata.get("upstream_commit") != guardagent_commit:
-            raise ValueError("GuardAgent source checkout does not match the policy artifact commit")
-        if guardagent_metadata.get("provider") != "Managed local":
-            raise ValueError(
-                "Selected GuardAgent policy was built with a non-local provider; use a policy trained with Managed local to honor the local-model setting"
-            )
-        guard_model = guardagent_metadata.get("model")
         configured_model = str(server_settings["model"]).strip()
-        if configured_model != guard_model:
-            raise ValueError(
-                f"Local vLLM model {configured_model!r} does not match GuardAgent policy model {guard_model!r}"
-            )
+        if not configured_model:
+            raise ValueError("Choose a local judge model")
 
         ada_source = (
             WORKSPACE / ".cache/guardrail_benchmark/adasteer_source"
@@ -555,8 +549,9 @@ def benchmark_helpers(
         timeout = positive_timeout(request_timeout)
         ada_artifact_path = Path(adasteer_path).expanduser().resolve()
         run_config = {
-            "schema_version": 1,
+            "schema_version": 2,
             "dataset": dataset,
+            "selected_guardrails": list(selected_guardrails),
             "test_sha256": test_hash,
             "case_count": len(cases),
             "responding_model": RESPONDER_MODEL_ID,
@@ -565,11 +560,15 @@ def benchmark_helpers(
             "adasteer_bundle_sha256": hash_artifact(
                 ada_artifact_path if ada_artifact_path.is_file() else bundle_dir
             ),
-            "piguard_artifact_sha256": piguard_metadata["sha256"],
-            "guardagent_fingerprint": guardagent_metadata["fingerprint"],
-            "guardagent_model": guard_model,
-            "guardagent_commit": guardagent_commit,
-            "judge_model": guard_model,
+            "piguard_artifact_sha256": piguard_metadata["sha256"] if piguard_metadata else None,
+            "guardagent_fingerprint": guardagent_metadata["fingerprint"] if guardagent_metadata else None,
+            "guardagent_policies_sha256": (
+                guardagent_metadata["artifacts"]["policies.json"]
+                if guardagent_metadata else None
+            ),
+            "guardagent_training_model": guardagent_metadata["model"] if guardagent_metadata else None,
+            "guardagent_policy_kind": guardagent_metadata["policy_kind"] if guardagent_metadata else None,
+            "judge_model": configured_model,
             "local_endpoint": f"http://127.0.0.1:{int(server_settings['port'])}/v1",
             "local_server_settings": dict(server_settings),
             "request_timeout_seconds": timeout,
@@ -587,6 +586,7 @@ def benchmark_helpers(
         target = Path(output_root).expanduser().resolve() / dataset / fingerprint[:16]
         return {
             "dataset": dataset,
+            "selected_guardrails": selected_guardrails,
             "test_path": test_path,
             "test_sha256": test_hash,
             "validated_tests": {
@@ -601,11 +601,10 @@ def benchmark_helpers(
             "adasteer_bundle": bundle_dir,
             "adasteer_metadata": ada_metadata,
             "adasteer_source": ada_source,
-            "piguard_path": Path(piguard_path).expanduser().resolve(),
+            "piguard_path": Path(piguard_path).expanduser().resolve() if piguard_metadata else None,
             "piguard_metadata": piguard_metadata,
             "guardagent_bundle": guardagent_bundle,
             "guardagent_metadata": guardagent_metadata,
-            "guardagent_source": source_root,
             "run_config": run_config,
             "fingerprint": fingerprint,
             "output_dir": target,
@@ -694,7 +693,7 @@ def benchmark_helpers(
         requested = dict(settings)
         requested["model"] = str(requested["model"]).strip()
         if requested["model"] != expected_model:
-            raise ValueError("local vLLM model differs from the GuardAgent policy model")
+            raise ValueError("local vLLM model differs from the configured judge model")
         if server.settings is not None and server.settings != requested:
             if server.process is not None:
                 raise RuntimeError("Stop the local server before changing its settings")
@@ -739,9 +738,10 @@ def benchmark_helpers(
         results = load_latest(results_path, fingerprint) if full else {}
         gates = load_latest(gate_path, fingerprint) if full else {}
         responses = load_latest(response_path, fingerprint) if full else {}
-        methods = ("adasteer", "piguard", "guardagent")
+        methods = run["selected_guardrails"]
         required = {(method, row["case_id"]) for method in methods for row in cases}
-        gate_setup = {"piguard": 0.0, "guardagent": 0.0}
+        gated_methods = tuple(method for method in methods if method in {"piguard", "guardagent"})
+        gate_setup = dict.fromkeys(gated_methods, 0.0)
         respondent_setup = 0.0
         judge_setup = 0.0
 
@@ -755,7 +755,7 @@ def benchmark_helpers(
             previous = responses.get(key)
             return previous is None or bool(previous.get("error"))
 
-        for method in ("piguard", "guardagent"):
+        for method in gated_methods:
             pending = [
                 row for row in cases
                 if needs_response((method, row["case_id"]))
@@ -783,23 +783,7 @@ def benchmark_helpers(
                         token=token,
                     )
                 else:
-                    local_server_ready(
-                        server,
-                        server_settings,
-                        run["guardagent_metadata"]["model"],
-                        run["request_timeout"],
-                        allow_start=True,
-                    )
-                    endpoint = run["run_config"]["local_endpoint"]
-                    expert = GuardAgent(
-                        run["guardagent_source"],
-                        "",
-                        endpoint,
-                        run["guardagent_metadata"]["model"],
-                        seed=42,
-                        policy_bundle=run["guardagent_bundle"],
-                        timeout=run["request_timeout"],
-                    )
+                    expert = FrozenGuardAgent(run["guardagent_bundle"])
                     gate_setup[method] = time.perf_counter() - setup_started
                 if method == "piguard":
                     gate_setup[method] = time.perf_counter() - setup_started
@@ -845,8 +829,6 @@ def benchmark_helpers(
             finally:
                 if expert is not None:
                     expert.close()
-                if method == "guardagent" and server.process is not None:
-                    server.stop()
 
         # Release vLLM before loading the shared HF responder onto the GPU.
         if server.process is not None:
@@ -969,7 +951,7 @@ def benchmark_helpers(
                     _, judge_setup = local_server_ready(
                         server,
                         server_settings,
-                        run["guardagent_metadata"]["model"],
+                        run["run_config"]["judge_model"],
                         run["request_timeout"],
                         allow_start=True,
                     )
@@ -1057,6 +1039,7 @@ def benchmark_helpers(
         expected = len(required)
         return {
             "dataset": run["dataset"],
+            "selected_guardrails": methods,
             "mode": mode,
             "expected_results": expected,
             "recorded_results": len(latest),
@@ -1068,7 +1051,7 @@ def benchmark_helpers(
         }
 
     def summarize_results(rows):
-        methods = ("adasteer", "piguard", "guardagent")
+        methods = tuple(dict.fromkeys(row["expert"] for row in rows))
         summary = []
         for method in methods:
             method_rows = [row for row in rows if row["expert"] == method]
@@ -1161,8 +1144,9 @@ def prepare_source_action(
 
 @app.cell
 def preflight_action(
+    GUARDRAIL_OPTIONS,
     adasteer_path,
-    guardagent_checkout,
+    guardrails,
     guardagent_path,
     get_server_status,
     json,
@@ -1181,10 +1165,13 @@ def preflight_action(
         try:
             preflight_data = prepare_run(
                 test_set=test_set.value,
+                selected_guardrails=[
+                    method for label, method in GUARDRAIL_OPTIONS.items()
+                    if label in guardrails.value
+                ],
                 adasteer_path=adasteer_path.value,
                 piguard_path=piguard_path.value,
                 guardagent_path=guardagent_path.value,
-                guardagent_checkout=guardagent_checkout.value,
                 output_root=output_root.value,
                 server_settings=server_settings.value,
                 request_timeout=positive_timeout(request_timeout.value),
@@ -1192,15 +1179,20 @@ def preflight_action(
             status = get_server_status()
             report = {
                 "dataset": preflight_data["dataset"],
+                "selected_guardrails": preflight_data["selected_guardrails"],
                 "cases": len(preflight_data["cases"]),
                 "validated_tests": preflight_data["validated_tests"],
                 "test_sha256": preflight_data["test_sha256"],
                 "responding_model": preflight_data["run_config"]["responding_model"],
-                "judge_and_guardagent_model": preflight_data["run_config"]["judge_model"],
-                "guardagent_server_state": status["state"],
-                "adasteer_bundle": str(preflight_data["adasteer_bundle"]),
-                "piguard_artifact": str(preflight_data["piguard_path"]),
-                "guardagent_bundle": str(preflight_data["guardagent_bundle"]),
+                "judge_model": preflight_data["run_config"]["judge_model"],
+                "judge_server_state": status["state"],
+                "artifacts": {
+                    "shared_responder_adasteer": str(preflight_data["adasteer_bundle"]),
+                    **({"piguard": str(preflight_data["piguard_path"])}
+                       if preflight_data["piguard_metadata"] else {}),
+                    **({"guardagent": str(preflight_data["guardagent_bundle"])}
+                       if preflight_data["guardagent_bundle"] else {}),
+                },
                 "output_directory": str(preflight_data["output_dir"]),
                 "run_config": str(preflight_data["run_config_path"]),
                 "fingerprint": preflight_data["fingerprint"],
@@ -1216,11 +1208,12 @@ def preflight_action(
 
 @app.cell
 def run_action(
+    GUARDRAIL_OPTIONS,
     adasteer_path,
     error_text,
     full_run_button,
+    guardrails,
     get_server_status,
-    guardagent_checkout,
     guardagent_path,
     json,
     local_server,
@@ -1242,10 +1235,13 @@ def run_action(
         try:
             run = prepare_run(
                 test_set=test_set.value,
+                selected_guardrails=[
+                    method for label, method in GUARDRAIL_OPTIONS.items()
+                    if label in guardrails.value
+                ],
                 adasteer_path=adasteer_path.value,
                 piguard_path=piguard_path.value,
                 guardagent_path=guardagent_path.value,
-                guardagent_checkout=guardagent_checkout.value,
                 output_root=output_root.value,
                 server_settings=server_settings.value,
                 request_timeout=positive_timeout(request_timeout.value),
