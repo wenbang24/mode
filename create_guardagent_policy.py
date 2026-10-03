@@ -257,7 +257,10 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
             demo_prompt_control,
             demo_button,
             mo.callout(
-                "Training appends a memory only when execution succeeds and the verdict "
+                "During training, GuardAgent generates code that checks phrases in the "
+                "candidate prompt; a restricted evaluator interprets its string checks "
+                "and boolean logic. Training appends a memory only when execution succeeds "
+                "and the verdict "
                 "matches the label. Training case limit caps the cumulative training total; "
                 "set it to 1,000 or less to preview a smaller build. Cases per action controls "
                 "batch size. Validate after at least one training case. A test preview is "

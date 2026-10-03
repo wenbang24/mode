@@ -16,8 +16,14 @@ from urllib.request import Request, urlopen
 
 from .base import ExpertOutcome, error_text
 from .guardagent import (
-    MEMORY, MEMORY_SHOTS, FrozenGuardAgent, GuardAgentTrainer, compile_frozen_policies,
-    load_frozen_policies, validate_memory,
+    EXECUTOR_VERSION,
+    MEMORY,
+    MEMORY_SHOTS,
+    FrozenGuardAgent,
+    GuardAgentTrainer,
+    compile_frozen_policies,
+    load_frozen_policies,
+    validate_memory,
 )
 
 try:
@@ -31,8 +37,7 @@ except ModuleNotFoundError:  # Direct imports from scripts/.
 UPSTREAM_REPOSITORY = "https://github.com/guardagent/code"
 UPSTREAM_COMMIT = "eb8797f0f3570800c1f596c40418edc929994a24"
 BUNDLE_SCHEMA_VERSION = 2
-PROMPT_VERSION = "prompt_gate_v1"
-EXECUTOR_VERSION = "restricted_ast_v1"
+PROMPT_VERSION = "prompt_gate_code_v2"
 DEFAULT_OUTPUT_ROOT = Path("artifacts/guardagent")
 MAX_CONSECUTIVE_FAILURES = 5
 DATASET_PRESETS = {
