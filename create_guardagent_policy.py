@@ -222,7 +222,7 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
         start=1, value=100, step=1, label="Cases per action"
     )
     training_limit_control = mo.ui.number(
-        start=1, value=10_000, step=100, label="Training case limit (total)"
+        start=1, value=1_000, step=100, label="Training cases for bundle"
     )
     overwrite_control = mo.ui.checkbox(
         value=False, label="Replace existing build on the next Train action"
@@ -264,13 +264,15 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
                 "retrieve similar training examples and run their saved analyzer programs "
                 "against each prompt, then combine their verdicts. Training appends a memory "
                 "only when execution succeeds and the verdict "
-                "matches the label. Training case limit caps the cumulative training total; "
-                "set it to 1,000 or less to preview a smaller build. Cases per action controls "
+                "matches the label. The training case limit is the total used to build the "
+                "bundle (default 1,000); raise it to 10,000 to use the full training split. "
+                "Training cases are sampled reproducibly and stratified by label; validation "
+                "and test still use their full splits without model calls. Cases per action controls "
                 "batch size. Validate after at least one training case. A test preview is "
                 "available after at least one training and validation case, and its results "
                 "are separate from the final bundle. Previewed cases are exploratory, not "
-                "untouched benchmark data. The full test run stays locked until all training "
-                "and validation cases are complete. If you resume training after a validation "
+                "untouched benchmark data. The full test run stays locked until the selected "
+                "training cases and all validation cases are complete. If you resume training after a validation "
                 "or test preview, those previews are archived and must be rerun against the new "
                 "checkpoint. Errors are checkpointed and retried on the next action; five "
                 "consecutive connection failures stop the current action. "
@@ -334,7 +336,7 @@ def configuration(
     test_path = dataset_paths["test"]
     output_root = Path(output_root_control.value).expanduser()
     case_budget = int(case_budget_control.value)
-    train_limit = int(training_limit_control.value)
+    train_limit = min(int(training_limit_control.value), expected_counts["train"])
     request_timeout = positive_timeout(request_timeout_control.value)
 
     if connection_mode_control.value == "Managed local":
@@ -387,6 +389,7 @@ def run_context(
     server_settings,
     test_path,
     tool_call_parser,
+    train_limit,
     train_path,
     validation_path,
 ):
@@ -414,6 +417,7 @@ def run_context(
             upstream_source_hashes=preflight_value["upstream_source_hashes"],
             seed=42,
             num_shots=MEMORY_SHOTS,
+            train_case_limit=train_limit,
             upstream_commit=preflight_value["official_commit"],
         )
         return preflight_value, identity_value, key_value
@@ -597,7 +601,8 @@ def test_action(
         }
         current_status = policy_status(target_bundle, status_shapes)
         official_ready = all(
-            current_status["splits"][split]["complete_cases"] == expected_counts[split]
+            current_status["splits"][split]["complete_cases"]
+            == current_status["splits"][split]["expected_cases"]
             for split in ("train", "validation")
         )
         test_report = run_policy_stage(
@@ -721,6 +726,7 @@ def built_in_checks(
     json,
     mo,
     restricted_execute,
+    train_limit,
 ):
     allow_check = restricted_execute(ALLOW_CODE, "hello")
     block_check = restricted_execute(BLOCK_CODE, "unsafe")
@@ -728,15 +734,14 @@ def built_in_checks(
         raise AssertionError("restricted executor allow/block check failed")
     if MEMORY_SHOTS != 3:
         raise AssertionError("GuardAgent must use three nearest examples")
-    if expected_counts["train"] != 10_000:
-        raise AssertionError(
-            "policy generation must use all 10,000 training cases"
-        )
+    if not 1 <= train_limit <= expected_counts["train"]:
+        raise AssertionError("training case limit must be within the available training split")
     built_in_check_report = {
         "restricted_allow": "passed",
         "restricted_block": "passed",
         "nearest_examples": MEMORY_SHOTS,
-        "training_cases": expected_counts["train"],
+        "training_cases_for_bundle": train_limit,
+        "available_training_cases": expected_counts["train"],
         "test_locked_until_validation": True,
     }
     mo.callout(json.dumps(built_in_check_report, indent=2), kind="success")

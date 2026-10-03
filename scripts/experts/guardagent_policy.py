@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import shutil
 import statistics
 import subprocess
@@ -123,6 +124,36 @@ def validate_dataset_splits(
     return splits
 
 
+def select_training_rows(
+    rows: list[dict[str, Any]], limit: int | None, seed: int
+) -> list[dict[str, Any]]:
+    """Choose a stable, stratified sample while preserving source order."""
+
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError("training case limit must be a positive integer")
+    if limit is None or limit >= len(rows):
+        return rows
+    grouped = {
+        label: [row for row in rows if row["prompt_harm_label"] == label]
+        for label in ("harmful", "unharmful")
+    }
+    total = len(rows)
+    quotas = {label: 0 for label in grouped}
+    desired = {label: limit * len(group) / total for label, group in grouped.items()}
+    for _ in range(limit):
+        eligible = [label for label, group in grouped.items() if quotas[label] < len(group)]
+        label = max(eligible, key=lambda name: (desired[name] - quotas[name], name))
+        quotas[label] += 1
+    rng = random.Random(seed)
+    selected_ids = set()
+    for label, group in grouped.items():
+        selected_ids.update(
+            row["case_id"]
+            for row in rng.sample(group, quotas[label])
+        )
+    return [row for row in rows if row["case_id"] in selected_ids]
+
+
 def preflight_policy_inputs(
     official_root: Path,
     train_path: Path,
@@ -168,8 +199,11 @@ def build_identity(
     upstream_source_hashes: dict[str, str] | None = None,
     seed: int = 42,
     num_shots: int = MEMORY_SHOTS,
+    train_case_limit: int | None = None,
     upstream_commit: str = UPSTREAM_COMMIT,
 ) -> dict[str, Any]:
+    if train_case_limit is not None and (type(train_case_limit) is not int or train_case_limit < 1):
+        raise ValueError("train_case_limit must be a positive integer")
     identity = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "dataset": dataset,
@@ -185,6 +219,8 @@ def build_identity(
         },
         "seed": seed,
         "num_shots": num_shots,
+        "train_case_limit": train_case_limit,
+        "training_selection": "stratified_seeded_v1",
         "upstream_commit": upstream_commit,
         "prompt_version": PROMPT_VERSION,
         "executor_version": EXECUTOR_VERSION,
@@ -368,12 +404,19 @@ def run_policy_stage(
         raise ValueError("case_budget must be a positive integer")
     if train_limit is not None and (type(train_limit) is not int or train_limit < 1):
         raise ValueError("train_limit must be a positive integer")
+    configured_train_limit = identity.get("train_case_limit")
+    if (configured_train_limit is not None and train_limit is not None
+            and configured_train_limit != train_limit):
+        raise ValueError("train_limit differs from the build identity")
     root, commit = validate_checkout(official_root, require_pinned=expert_factory is GuardAgentTrainer)
     if identity["upstream_commit"] != commit:
         raise ValueError("identity does not match the GuardAgent checkout")
     paths = {"train": Path(train_path), "validation": Path(validation_path), "test": Path(test_path)}
     rows_by_split = validate_dataset_splits(
         *(read_cases(paths[name], expected_rows=None) for name in ("train", "validation", "test"))
+    )
+    rows_by_split["train"] = select_training_rows(
+        rows_by_split["train"], configured_train_limit, identity["seed"]
     )
     actual_hashes = {name: sha256_file(path) for name, path in paths.items()}
     if actual_hashes != identity["source_hashes"]:
@@ -396,7 +439,7 @@ def run_policy_stage(
     if split == "test_preview" and (not train_done or not validation_done):
         raise RuntimeError("train and validate at least one case before running a test preview")
     if split == "test" and len(train_done) != len(rows_by_split["train"]):
-        raise RuntimeError("finish the 10,000-case policy build before held-out evaluation")
+        raise RuntimeError("finish the configured training sample before held-out evaluation")
     policy = state / "policy.jsonl"
     memory = [dict(item) for item in MEMORY] + _learned_memory(train_results, identity["fingerprint"])
     frozen = compile_frozen_policies(memory)
@@ -568,6 +611,9 @@ def _finish_or_status(
         metadata = identity | {
             "learned_memory_size": len(memory),
             "learned_cases": len(memory) - len(MEMORY),
+            "training_label_counts": dict(Counter(
+                row["prompt_harm_label"] for row in rows_by_split["train"]
+            )),
             "policy_kind": policies["kind"],
             "policy_rule_count": len(policies["rules"]),
             "metric_modes": {
@@ -599,15 +645,23 @@ def policy_status(path: Path, rows_by_split: dict[str, list[dict[str, Any]]] | N
     metadata_path = state / "metadata.json"
     fingerprint = None
     if metadata_path.exists():
-        fingerprint = json.loads(metadata_path.read_text(encoding="utf-8"))["fingerprint"]
+        build_info = json.loads(metadata_path.read_text(encoding="utf-8"))
+        fingerprint = build_info["fingerprint"]
     elif (state / "build.json").exists():
-        fingerprint = json.loads((state / "build.json").read_text(encoding="utf-8"))["fingerprint"]
+        build_info = json.loads((state / "build.json").read_text(encoding="utf-8"))
+        fingerprint = build_info["fingerprint"]
+    else:
+        build_info = {}
     split_status = {}
     for split in ("train", "validation", "test", "test_preview"):
         source_split = "test" if split == "test_preview" else split
         rows = _read_jsonl(state / f"{split}_results.jsonl")
         done = _completed(rows, fingerprint) if fingerprint else {}
         expected = len(rows_by_split[source_split]) if rows_by_split else None
+        if source_split == "train" and expected is not None:
+            limit = build_info.get("train_case_limit")
+            if limit is not None:
+                expected = min(expected, limit)
         metric_total = (
             expected if expected is not None and len(done) == expected else len(done)
         )
