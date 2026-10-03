@@ -22,9 +22,9 @@ def title(mo):
     mo.md("""
     # GuardAgent policy notebook
 
-    Generate GuardAgent examples during training, compile them into a frozen
-    set of term rules, and evaluate those rules on validation and test prompts
-    without model calls. Training uses the official planner/code-generator
+    Generate GuardAgent analyzer programs during training, compile them into a
+    frozen program library, and evaluate retrieved programs on validation and
+    test prompts without model calls. Training uses the official planner/code-generator
     pinned to commit `eb8797f0f3570800c1f596c40418edc929994a24`.
     """)
     return
@@ -257,10 +257,13 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
             demo_prompt_control,
             demo_button,
             mo.callout(
-                "During training, GuardAgent generates code that checks phrases in the "
-                "candidate prompt; a restricted evaluator interprets its string checks "
-                "and boolean logic. Training appends a memory only when execution succeeds "
-                "and the verdict "
+                "During training, GuardAgent generates multi-step Python analyzers. A bounded "
+                "interpreter supports branches, bounded loops, collections, comparisons, "
+                "arithmetic, and selected text operations; imports, file/network access, and "
+                "dynamic execution are unavailable. Validation, test, and demonstrations "
+                "retrieve similar training examples and run their saved analyzer programs "
+                "against each prompt, then combine their verdicts. Training appends a memory "
+                "only when execution succeeds and the verdict "
                 "matches the label. Training case limit caps the cumulative training total; "
                 "set it to 1,000 or less to preview a smaller build. Cases per action controls "
                 "batch size. Validate after at least one training case. A test preview is "
@@ -273,7 +276,7 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
                 "consecutive connection failures stop the current action. "
                 "A clean training case makes three model calls (planning, code "
                 "generation, and termination). Validation, test, and the "
-                "completed policy demonstration use the saved rules only.",
+                "completed policy demonstration use the saved programs only.",
                 kind="info",
             ),
         ]
@@ -664,7 +667,7 @@ def artifact_status(
                 f"### Artifact status: **{artifact_status_report['state']}**  \n"
                 f"`{artifact_status_report['path']}`  \n"
                 f"Learned memory size: `{artifact_status_report.get('learned_memory_size')}`  \n"
-                f"Frozen rules: `{artifact_status_report.get('policy_rule_count')}`"
+                f"Saved analyzer programs: `{artifact_status_report.get('policy_rule_count')}`"
             ),
             mo.ui.table(status_rows),
         ]
@@ -695,7 +698,7 @@ def demonstration(
         demo_report = {
             "verdict": "block" if demo_outcome.block else "allow",
             "policy_kind": verified_metadata["policy_kind"],
-            "rules": verified_metadata["policy_rule_count"],
+            "programs": verified_metadata["policy_rule_count"],
             "latency_seconds": time.perf_counter() - demo_started,
             "matched_rules": demo_outcome.metadata["matched_rules"],
             "policy_score": demo_outcome.metadata["policy_score"],

@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 
 from .base import ExpertOutcome, error_text
 from .guardagent import (
+    BUNDLE_SCHEMA_VERSION,
     EXECUTOR_VERSION,
     MEMORY,
     MEMORY_SHOTS,
@@ -36,8 +37,7 @@ except ModuleNotFoundError:  # Direct imports from scripts/.
 
 UPSTREAM_REPOSITORY = "https://github.com/guardagent/code"
 UPSTREAM_COMMIT = "eb8797f0f3570800c1f596c40418edc929994a24"
-BUNDLE_SCHEMA_VERSION = 2
-PROMPT_VERSION = "prompt_gate_code_v2"
+PROMPT_VERSION = "prompt_gate_code_v3"
 DEFAULT_OUTPUT_ROOT = Path("artifacts/guardagent")
 MAX_CONSECUTIVE_FAILURES = 5
 DATASET_PRESETS = {
@@ -572,8 +572,8 @@ def _finish_or_status(
             "policy_rule_count": len(policies["rules"]),
             "metric_modes": {
                 "train": "model_generated_examples",
-                "validation": "frozen_policies",
-                "test": "frozen_policies",
+                "validation": "frozen_analyzer_programs",
+                "test": "frozen_analyzer_programs",
             },
             "split_counts": {name: len(values) for name, values in rows_by_split.items()},
             "metrics": {
