@@ -25,7 +25,8 @@ def title(mo):
     # Trained guardrail benchmark
 
     Select any combination of trained AdaSteer, PIGuard, and GuardAgent artifacts
-    to run on the full WildGuard or Aegis 2.0 test parquet. AdaSteer generates
+    to run on the unseen Aegis router-training pool or the full WildGuard or
+    Aegis 2.0 test parquet. AdaSteer generates
     steered responses and judges them with the local model. PIGuard and GuardAgent
     stop at the gate: blocked prompts are treated as refusals, while allowed
     prompts use the assumption that outputs are harmful for harmful prompts and
@@ -78,7 +79,11 @@ def imports():
 
     WORKSPACE = Path(__file__).resolve().parent
     RESPONDER_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-    DATASET_KEYS = {"WildGuard": "wildguard", "Aegis 2.0": "aegis"}
+    DATASET_KEYS = {
+        "Aegis unseen 1,000": "aegis",
+        "WildGuard": "wildguard",
+        "Aegis 2.0": "aegis",
+    }
     GUARDRAIL_OPTIONS = {
         "AdaSteer": "adasteer",
         "PIGuard": "piguard",
@@ -87,6 +92,7 @@ def imports():
     DATASET_FILES = {
         "wildguard": ("wildguardtest.parquet", 1699),
         "aegis": ("aegis2_test.parquet", 1914),
+        "aegis_unseen": ("aegis2_unseen_1000_seed42.parquet", 1000),
     }
     REFUSAL_TEXT = "I can’t help with that request."
     ADASTEER_REPOSITORY = "https://github.com/MuyuenLP/AdaSteer.git"
@@ -131,16 +137,16 @@ def imports():
 
 
 @app.cell
-def dataset_selector(GUARDRAIL_OPTIONS, mo):
+def dataset_selector(DATASET_KEYS, GUARDRAIL_OPTIONS, mo):
     test_set = mo.ui.dropdown(
-        options=["WildGuard", "Aegis 2.0"],
-        value="WildGuard",
-        label="Full held-out test set",
+        options=list(DATASET_KEYS),
+        value="Aegis unseen 1,000",
+        label="Benchmark prompts (unseen pool trains the router)",
     )
     guardrails = mo.ui.multiselect(
         options=list(GUARDRAIL_OPTIONS),
         value=list(GUARDRAIL_OPTIONS),
-        label="Guardrails to test",
+        label="Guardrails to benchmark",
     )
     mo.vstack([test_set, guardrails])
     return guardrails, test_set
@@ -245,7 +251,7 @@ def artifact_controls(
     prepare_source_button = mo.ui.run_button(label="Prepare AdaSteer source")
     preflight_button = mo.ui.run_button(label="Preflight selected artifacts")
     smoke_button = mo.ui.run_button(label="Smoke run (one harmful + one benign)")
-    full_run_button = mo.ui.run_button(label="Run / resume full test", kind="success")
+    full_run_button = mo.ui.run_button(label="Run / resume full benchmark", kind="success")
     mo.vstack([
         mo.md("## Guardrail inputs"),
         mo.md(
@@ -524,14 +530,24 @@ def benchmark_helpers(
         request_timeout,
     ):
         dataset = DATASET_KEYS[test_set]
+        data_split = "unseen" if test_set == "Aegis unseen 1,000" else "test"
+        split_key = "aegis_unseen" if data_split == "unseen" else dataset
         selected_guardrails = tuple(
             method for method in GUARDRAIL_OPTIONS.values()
             if method in selected_guardrails
         )
         if not selected_guardrails:
             raise ValueError("Select at least one guardrail to benchmark")
+        has_adasteer = "adasteer" in selected_guardrails
         validated_tests = {}
-        for name, (test_name, expected_count) in DATASET_FILES.items():
+        # Canonical prompts are optional for unseen runs; use their pinned hash if absent.
+        canonical_path = WORKSPACE / DATASET_FILES[dataset][0]
+        required_splits = (
+            (split_key, dataset)
+            if has_adasteer and canonical_path.is_file() else (split_key,)
+        )
+        for name in dict.fromkeys(required_splits):
+            test_name, expected_count = DATASET_FILES[name]
             path = WORKSPACE / test_name
             rows = read_cases(path, expected_rows=expected_count)
             validated_tests[name] = {
@@ -540,11 +556,19 @@ def benchmark_helpers(
                 "rows": len(rows),
                 "sha256": sha256_file(path),
             }
-        test_path = validated_tests[dataset]["path"]
-        cases = validated_tests[dataset]["cases"]
-        test_hash = validated_tests[dataset]["sha256"]
+        test_path = validated_tests[split_key]["path"]
+        cases = validated_tests[split_key]["cases"]
+        test_hash = validated_tests[split_key]["sha256"]
+        if data_split == "unseen" and dataset in validated_tests:
+            canonical = validated_tests[dataset]["cases"]
+            prompt_keys = {" ".join(row["prompt"].casefold().split()) for row in canonical}
+            case_ids = {row["case_id"] for row in canonical}
+            if any(
+                " ".join(row["prompt"].casefold().split()) in prompt_keys
+                or row["case_id"] in case_ids for row in cases
+            ):
+                raise ValueError("Unseen case IDs or normalized prompts overlap the canonical test set")
 
-        has_adasteer = "adasteer" in selected_guardrails
         bundle_dir = ada_metadata = ada_source = ada_artifact_path = None
         if has_adasteer:
             bundle_dir = extract_adasteer_bundle(
@@ -558,8 +582,13 @@ def benchmark_helpers(
             if ada_metadata.get("generation", {}).get("do_sample") is not False:
                 raise ValueError("AdaSteer bundle must use deterministic generation (do_sample=False)")
             ada_test = ada_metadata["datasets"]["test"]
-            if ada_test["sha256"] != test_hash:
-                raise ValueError("AdaSteer bundle test parquet hash does not match the selected test set")
+            # Hash of the canonical Aegis test parquet used to build Aegis bundles.
+            canonical_hash = (
+                validated_tests[dataset]["sha256"] if dataset in validated_tests
+                else "9facd918f6ee71bd97fc0703742eebe3d181600fc88a888390eb0b32fb734783"
+            )
+            if ada_test["sha256"] != canonical_hash:
+                raise ValueError("AdaSteer bundle test parquet hash does not match its dataset's canonical test set")
             sources = " ".join(ada_test["source_datasets"]).casefold()
             source_marker = "wildguard" if dataset == "wildguard" else "aegis"
             if source_marker not in sources:
@@ -600,8 +629,10 @@ def benchmark_helpers(
             method in selected_guardrails for method in ("piguard", "guardagent")
         )
         run_config = {
-            "schema_version": 3,
+            "schema_version": 4,
             "dataset": dataset,
+            "data_split": data_split,
+            "data_file": test_path.name,
             "selected_guardrails": list(selected_guardrails),
             "test_sha256": test_hash,
             "case_count": len(cases),
@@ -642,6 +673,7 @@ def benchmark_helpers(
         target = Path(output_root).expanduser().resolve() / dataset / fingerprint[:16]
         return {
             "dataset": dataset,
+            "data_split": data_split,
             "selected_guardrails": selected_guardrails,
             "test_path": test_path,
             "test_sha256": test_hash,
@@ -1373,6 +1405,7 @@ def preflight_action(
             )
             report = {
                 "dataset": preflight_data["dataset"],
+                "data_split": preflight_data["data_split"],
                 "selected_guardrails": preflight_data["selected_guardrails"],
                 "cases": len(preflight_data["cases"]),
                 "validated_tests": preflight_data["validated_tests"],
