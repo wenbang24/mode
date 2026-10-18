@@ -67,6 +67,17 @@ class RouterDataTest(unittest.TestCase):
             outcome["succeeded"] = False
         self.assertIsNone(lr.fastest_successful(outcomes))
 
+    def test_unicode_line_separators_remain_inside_jsonl_prompts(self):
+        self.cases[0]["prompt"] = "Prompt with\u2028Unicode\u0085separators"
+        for row in self.rows:
+            if row["case_id"] == self.cases[0]["case_id"]:
+                row["prompt"] = self.cases[0]["prompt"]
+        (self.run / "results.jsonl").write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in self.rows),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.load().cases[0]["prompt"], self.cases[0]["prompt"])
+
     def test_last_jsonl_result_wins_over_stale_grouped_file(self):
         revised = {**self.rows[0], "succeeded": False}
         write_results(self.run, [*self.rows, revised])

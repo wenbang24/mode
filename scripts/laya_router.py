@@ -130,7 +130,7 @@ def load_benchmark(run_dir, parquet_path, *, expected_rows, split):
 
     results_path = run_dir / "results.jsonl"
     if results_path.is_file():
-        records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        records = [json.loads(line) for line in results_path.read_text(encoding="utf-8").split("\n") if line.strip()]
     else:
         results_path = run_dir / "prompt_results.json"
         grouped = json.loads(results_path.read_text(encoding="utf-8"))
@@ -266,7 +266,7 @@ def inspect_training(data_dir, base_dir, settings):
     question = to_internal("expert", QUESTIONS["expert"])
     truncation = {}
     for name in ("train", "validation"):
-        rows = [json.loads(line) for line in (data_dir / f"{name}.jsonl").read_text().splitlines()]
+        rows = [json.loads(line) for line in (data_dir / f"{name}.jsonl").read_text().split("\n") if line.strip()]
         stats = [build_sequence(tokenizer, row["state"], question, settings["max_len"],
                                 settings["head_max_len"], return_truncation_stats=True)[2] for row in rows]
         truncation[name] = {"cases": len(stats), "truncated": sum(row["truncated"] for row in stats),
@@ -281,7 +281,7 @@ def cuda_smoke_test(prepared, base_dir, output_root, settings):
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA smoke test requires the Molab NVIDIA GPU; no CUDA device is available here")
-    rows = [json.loads(line) for line in (Path(prepared["directory"]) / "train.jsonl").read_text().splitlines()][:20]
+    rows = [json.loads(line) for line in (Path(prepared["directory"]) / "train.jsonl").read_text().split("\n") if line.strip()][:20]
     if len(rows) < 20:
         raise ValueError("CUDA smoke test needs at least 20 labeled training examples")
     root = Path(output_root).expanduser().resolve() / "smoke"

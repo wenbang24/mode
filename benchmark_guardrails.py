@@ -721,7 +721,7 @@ def benchmark_helpers(
         latest = {}
         if not path.is_file():
             return latest
-        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
             if not line.strip():
                 continue
             try:
@@ -1515,6 +1515,49 @@ def run_action(
         _view = mo.md("Smoke and full-test runs are idle.")
     _view
     return (benchmark_result,)
+
+
+@app.cell(hide_code=True)
+def laya_finetuner_download(WORKSPACE, Path, benchmark_result, json, mo, output_root):
+    from scripts.laya_package import build_finetuner_zip, finetuner_files
+
+    _run_directory = None
+    if benchmark_result and benchmark_result.get("mode") == "full" and benchmark_result.get("complete"):
+        _run_directory = Path(benchmark_result["run_config_path"]).parent
+    else:
+        # Keep downloads available after a notebook rerun or reconnect.
+        for _manifest_path in sorted(
+            Path(output_root.value).expanduser().rglob("run_config.json"),
+            key=lambda path: path.stat().st_mtime, reverse=True,
+        ):
+            try:
+                _manifest = json.loads(_manifest_path.read_text())
+                if _manifest.get("dataset") != "aegis" or _manifest.get("data_split") != "unseen":
+                    continue
+                finetuner_files(WORKSPACE, _manifest_path.parent)
+            except (OSError, ValueError):
+                continue
+            _run_directory = _manifest_path.parent
+            break
+    if _run_directory is None:
+        _download_view = mo.md("Complete a full Aegis unseen 1,000 benchmark with all three guardrails to download the Laya finetuner package.")
+    else:
+        try:
+            finetuner_files(WORKSPACE, _run_directory)
+            _download_view = mo.vstack([
+                mo.md("## Download Laya finetuner inputs"),
+                mo.md("Includes the trainer, helper code, both required parquets, and this run's results. Extract the ZIP together. Download the base checkpoint using the trainer's checkpoint button."),
+                mo.plain_text(f"Benchmark: {_run_directory}"),
+                mo.download(
+                    data=lambda: build_finetuner_zip(WORKSPACE, _run_directory),
+                    filename="mode_laya_finetuner.zip", mimetype="application/zip",
+                    label="Download Laya finetuner package",
+                ),
+            ])
+        except Exception as _exc:
+            _download_view = mo.callout(f"Finetuner download unavailable: {_exc}", kind="warn")
+    _download_view
+    return
 
 
 @app.cell

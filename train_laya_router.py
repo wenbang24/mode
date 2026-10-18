@@ -29,6 +29,9 @@ def title(mo):
     The unseen pool is split 80/20 for training and validation with seed 42.
     Laya reserves another 10% of eligible training examples for calibration.
     **Aegis test (1,914 prompts)** stays separate for final evaluation.
+    You can fine-tune before running its benchmark: leave the test benchmark
+    directory blank until step 5. Only the reserved test Parquet is needed
+    during preparation, to check for overlap with training prompts.
 
     Run on Molab with the RTX 6000 Pro (96 GB), from this repository with its
     `scripts/` directory and Parquets available. Locally, open with
@@ -82,13 +85,12 @@ def assumptions(BASE_MODEL, BASE_REVISION, LAYA_COMMIT, OUTCOME_NOTE, mo):
 @app.cell
 def input_controls(WORKSPACE, mo):
     training_benchmark_control = mo.ui.text(
-        value="", label="Unseen Aegis benchmark run directory (contains run_config.json)", full_width=True)
-    test_benchmark_control = mo.ui.text(
-        value="", label="Aegis test benchmark run directory (needed only for final evaluation)", full_width=True)
+        value=str(WORKSPACE / "benchmarks/unseen") if (WORKSPACE / "benchmarks/unseen/run_config.json").is_file() else "",
+        label="Unseen Aegis benchmark run directory (contains run_config.json)", full_width=True)
     train_parquet_control = mo.ui.text(
         value=str(WORKSPACE / "aegis2_unseen_1000_seed42.parquet"), label="Original unseen prompts", full_width=True)
     test_parquet_control = mo.ui.text(
-        value=str(WORKSPACE / "aegis2_test.parquet"), label="Reserved test prompts", full_width=True)
+        value=str(WORKSPACE / "aegis2_test.parquet"), label="Reserved test prompts (Parquet only, for overlap checks)", full_width=True)
     output_control = mo.ui.text(
         value=str(WORKSPACE / "artifacts/laya_router"), label="Artifact output root", full_width=True)
     prepare_button = mo.ui.run_button(label="1 · Validate benchmark and prepare training data")
@@ -96,12 +98,13 @@ def input_controls(WORKSPACE, mo):
         mo.md("## 1 · Benchmark supervision"),
         mo.md("Use a complete run for all three experts, with no outstanding errors. "
               "The run folder is printed by the benchmark. JSONL takes precedence over grouped JSON "
-              "so interrupted/resumed work cannot silently use an older grouped snapshot."),
-        training_benchmark_control, test_benchmark_control, train_parquet_control,
+              "so interrupted/resumed work cannot silently use an older grouped snapshot. "
+              "An Aegis test benchmark run is not required to prepare data or fine-tune."),
+        training_benchmark_control, train_parquet_control,
         test_parquet_control, output_control, prepare_button,
     ])
     return (
-        output_control, prepare_button, test_benchmark_control, test_parquet_control,
+        output_control, prepare_button, test_parquet_control,
         train_parquet_control, training_benchmark_control,
     )
 
@@ -271,6 +274,8 @@ def smoke_action(base_directory, cuda_smoke_test, json, mo, output_control, prep
 
 @app.cell
 def saved_run_controls(mo):
+    test_benchmark_control = mo.ui.text(
+        value="", label="Aegis test benchmark run directory (required only for step 5)", full_width=True)
     saved_run_control = mo.ui.text(
         value="", label="Saved run directory (optional: evaluate/export an earlier completed run)", full_width=True)
     test_button = mo.ui.run_button(label="5 · Evaluate on the reserved Aegis test set")
@@ -281,9 +286,9 @@ def saved_run_controls(mo):
               "Test results never enter fine-tuning or calibration. A saved run path takes precedence "
               "over this session's trained run. Export does not require a test run; absent final-test "
               "results must not be treated as evidence of test performance."),
-        saved_run_control, mo.hstack([test_button, export_button]),
+        test_benchmark_control, saved_run_control, mo.hstack([test_button, export_button]),
     ])
-    return export_button, saved_run_control, test_button
+    return export_button, saved_run_control, test_benchmark_control, test_button
 
 
 @app.cell
