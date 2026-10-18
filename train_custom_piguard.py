@@ -617,6 +617,9 @@ def _():
         ).hexdigest()[:12]
 
     def pipeline_artifacts(config, root=ARTIFACT_ROOT):
+        from scripts.training_cases import sample_test_cases
+        test_case_limit = config.get("test_case_limit", 0)
+        sample_test_cases([], test_case_limit)
         dataset_paths = {
             split: Path(config[key]).expanduser().resolve()
             for split, key in {
@@ -646,6 +649,7 @@ def _():
             "ai_base_url": config["ai_base_url"].strip().rstrip("/"),
             "ai_model": config["ai_model"].strip(),
             "judge_timeout": positive_timeout(config.get("judge_timeout", 120)),
+            "test_case_limit": test_case_limit,
             "managed_judge": bool(config.get("managed_judge", False)),
         }
         common = {"cache_version": CACHE_VERSION}
@@ -715,6 +719,7 @@ def _():
             "batch_size": config["batch_size"],
             "max_length": config["max_length"],
             "threshold": 0.5,
+            "test_case_limit": config["test_case_limit"],
         }
         inputs = {
             "prepare": prepare,
@@ -1478,6 +1483,11 @@ def _():
         model, device, config = load_piguard_model(stage2)
         test_name = "smoke_test.json" if config["smoke"] else "test.json"
         rows = read_json(prepared["path"] / "data" / test_name)
+        from scripts.training_cases import sample_test_cases
+        rows = sample_test_cases(
+            [{**row, "prompt_harm_label": "harmful" if row["label"] else "unharmful"} for row in rows],
+            pipeline["config"]["test_case_limit"], SEED,
+        )
         predictions = []
         batch_size = config["batch_size"]
         with torch.no_grad():
@@ -1516,6 +1526,7 @@ def _():
         recall = tp / (tp + fn) if tp + fn else 0.0
         metrics = {
             "stage": "stage2",
+            "test_case_limit": pipeline["config"]["test_case_limit"],
             "rows": len(rows),
             "accuracy": float((labels == predicted).mean()),
             "benign_accuracy": tn / (tn + fp) if tn + fp else 0.0,
@@ -1681,6 +1692,9 @@ def _():
             }
 
         original = keys(base_config)
+        test_changed = keys(base_config | {"test_case_limit": 100})
+        assert test_changed["evaluate"] != original["evaluate"]
+        assert all(test_changed[step] == original[step] for step in original if step != "evaluate")
         assert keys(dict(base_config)) == original
         assert keys(base_config | {"judge_timeout": 999, "managed_judge": True}) == original
         for setting, value in (("ai_base_url", "http://localhost:8000/v1"), ("ai_model", "local/model")):
@@ -1872,6 +1886,9 @@ def controls(DEFAULT_DATASET_PATHS, mo):
         label="Test Parquet",
         full_width=True,
     )
+    test_limit_control = mo.ui.number(
+        start=0, value=0, step=1, label="Test cases for bundle (0 = all; minimum 2)"
+    )
     backbone_preset = mo.ui.dropdown(
         options=["DeBERTa V3 Base", "Qwen 2.5 3B", "Custom"],
         value="DeBERTa V3 Base",
@@ -1932,6 +1949,7 @@ def controls(DEFAULT_DATASET_PATHS, mo):
         stage1_button,
         stage2_button,
         test_dataset_path,
+        test_limit_control,
         train_dataset_path,
         training_mode,
         trust_remote_code,
@@ -1953,6 +1971,7 @@ def configuration(
     pipeline_artifacts,
     smoke_mode,
     test_dataset_path,
+    test_limit_control,
     train_dataset_path,
     training_mode,
     trust_remote_code,
@@ -1967,6 +1986,7 @@ def configuration(
         "train_dataset_path": train_dataset_path.value.strip(),
         "validation_dataset_path": validation_dataset_path.value.strip(),
         "test_dataset_path": test_dataset_path.value.strip(),
+        "test_case_limit": int(test_limit_control.value),
         "model_id": selected_model_id,
         "revision": model_revision.value.strip(),
         "training_mode": training_mode.value,
@@ -2004,6 +2024,7 @@ def control_panel(
     stage1_button,
     stage2_button,
     test_dataset_path,
+    test_limit_control,
     train_dataset_path,
     training_mode,
     trust_remote_code,
@@ -2015,6 +2036,7 @@ def control_panel(
             train_dataset_path,
             validation_dataset_path,
             test_dataset_path,
+            test_limit_control,
             mo.hstack([backbone_preset, custom_model_id]),
             mo.hstack([model_revision, training_mode, trust_remote_code]),
             mo.hstack([smoke_mode, batch_size, max_length]),

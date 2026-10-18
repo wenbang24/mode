@@ -162,6 +162,9 @@ def controls(DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, adasteer_checkout, mo):
     judge_model_control = mo.ui.text(
         value="openai/gpt-4o", label="Paper judge model", full_width=True
     )
+    test_limit_control = mo.ui.number(
+        start=0, value=0, step=1, label="Test cases for bundle (0 = all; minimum 2)"
+    )
     overwrite_control = mo.ui.checkbox(
         value=False, label="Replace an existing bundle"
     )
@@ -184,12 +187,13 @@ def controls(DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, adasteer_checkout, mo):
             output_control,
             api_base_control,
             judge_model_control,
+            test_limit_control,
             overwrite_control,
             mo.hstack([preflight_button, build_button, demo_button]),
             demo_prompt_control,
             mo.callout(
                 "Requires an fp16 CUDA environment compatible with Transformers 4.46.3. "
-                "The full held-out test split runs after validation. Set HACKCLUB_API_KEY "
+                "The configured test sample runs after validation (0 uses the full split). Set HACKCLUB_API_KEY "
                 "or JUDGE_API_KEY for hosted judging; local endpoints can run without a key. "
                 "Set HF_TOKEN when the model requires it.",
                 kind="info",
@@ -212,6 +216,7 @@ def controls(DEFAULT_MODEL_ID, DEFAULT_OUTPUT_ROOT, adasteer_checkout, mo):
         preflight_button,
         rd_probe_layer_control,
         revision_control,
+        test_limit_control,
     )
 
 
@@ -287,6 +292,7 @@ def preflight(
     test_path,
     train_path,
     validation_path,
+    test_limit_control,
 ):
     if preflight_button.value:
         preflight_result = preflight_bundle_inputs(
@@ -294,6 +300,7 @@ def preflight(
             train_path=train_path,
             validation_path=validation_path,
             test_path=test_path,
+            test_case_limit=int(test_limit_control.value),
             model_id=model_id,
             revision=revision,
             token=hf_token,
@@ -380,6 +387,7 @@ def build(
     test_path,
     train_path,
     validation_path,
+    test_limit_control,
 ):
     if build_button.value:
         paper_context()
@@ -388,6 +396,7 @@ def build(
             train_path=train_path,
             validation_path=validation_path,
             test_path=test_path,
+            test_case_limit=int(test_limit_control.value),
             output_root=output_root,
             judge_refusal=judge_refusal,
             judge_compliance=judge_compliance,

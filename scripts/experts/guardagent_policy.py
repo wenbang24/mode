@@ -30,10 +30,10 @@ from .guardagent import (
 
 try:
     from scripts.local_judge import normalize_endpoint, request_headers
-    from scripts.training_cases import normalize_prompt, read_cases, validate_cases
+    from scripts.training_cases import normalize_prompt, read_cases, sample_test_cases, validate_cases
 except ModuleNotFoundError:  # Direct imports from scripts/.
     from local_judge import normalize_endpoint, request_headers
-    from training_cases import normalize_prompt, read_cases, validate_cases
+    from training_cases import normalize_prompt, read_cases, sample_test_cases, validate_cases
 
 
 UPSTREAM_REPOSITORY = "https://github.com/guardagent/code"
@@ -45,13 +45,11 @@ DATASET_PRESETS = {
     "WildGuard": {
         "slug": "wildguard",
         "train": ("wildguardtrain_10000_seed42.parquet", 10_000),
-        "validation": ("wildguardtrain_validation_1000_seed42.parquet", 1_000),
         "test": ("wildguardtest.parquet", 1_699),
     },
     "Aegis 2.0": {
         "slug": "aegis",
         "train": ("aegis2_train_10000_seed42.parquet", 10_000),
-        "validation": ("aegis2_validation.parquet", 1_189),
         "test": ("aegis2_test.parquet", 1_914),
     },
 }
@@ -97,13 +95,11 @@ def validate_checkout(root: Path, require_pinned: bool = True) -> tuple[Path, st
 
 def validate_dataset_splits(
     train_rows: Iterable[dict[str, Any]],
-    validation_rows: Iterable[dict[str, Any]],
     test_rows: Iterable[dict[str, Any]],
     expected_counts: dict[str, int] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     splits = {
         "train": validate_cases(train_rows, expected_rows=None),
-        "validation": validate_cases(validation_rows, expected_rows=None),
         "test": validate_cases(test_rows, expected_rows=None),
     }
     if expected_counts:
@@ -114,7 +110,7 @@ def validate_dataset_splits(
         name: {normalize_prompt(row["prompt"]) for row in rows}
         for name, rows in splits.items()
     }
-    for left, right in (("train", "validation"), ("train", "test"), ("validation", "test")):
+    for left, right in (("train", "test"),):
         overlap = prompt_sets[left] & prompt_sets[right]
         if overlap:
             raise ValueError(f"{left} and {right} contain {len(overlap):,} overlapping prompts")
@@ -157,18 +153,16 @@ def select_training_rows(
 def preflight_policy_inputs(
     official_root: Path,
     train_path: Path,
-    validation_path: Path,
     test_path: Path,
     expected_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     root, commit = validate_checkout(official_root)
     paths = {
         "train": Path(train_path).expanduser().resolve(),
-        "validation": Path(validation_path).expanduser().resolve(),
         "test": Path(test_path).expanduser().resolve(),
     }
     rows = validate_dataset_splits(
-        *(read_cases(paths[name], expected_rows=None) for name in ("train", "validation", "test")),
+        *(read_cases(paths[name], expected_rows=None) for name in ("train", "test")),
         expected_counts=expected_counts,
     )
     return {
@@ -200,10 +194,12 @@ def build_identity(
     seed: int = 42,
     num_shots: int = MEMORY_SHOTS,
     train_case_limit: int | None = None,
+    test_case_limit: int = 0,
     upstream_commit: str = UPSTREAM_COMMIT,
 ) -> dict[str, Any]:
     if train_case_limit is not None and (type(train_case_limit) is not int or train_case_limit < 1):
         raise ValueError("train_case_limit must be a positive integer")
+    sample_test_cases([], test_case_limit)
     identity = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "dataset": dataset,
@@ -220,6 +216,7 @@ def build_identity(
         "seed": seed,
         "num_shots": num_shots,
         "train_case_limit": train_case_limit,
+        "test_case_limit": test_case_limit,
         "training_selection": "stratified_seeded_v1",
         "upstream_commit": upstream_commit,
         "prompt_version": PROMPT_VERSION,
@@ -385,7 +382,6 @@ def run_policy_stage(
     split: str,
     official_root: Path,
     train_path: Path,
-    validation_path: Path,
     test_path: Path,
     target: Path,
     identity: dict[str, Any],
@@ -398,8 +394,8 @@ def run_policy_stage(
 ) -> dict[str, Any]:
     """Advance one stage by at most ``case_budget`` cases, then checkpoint."""
 
-    if split not in {"train", "validation", "test_preview", "test"}:
-        raise ValueError("split must be train, validation, test_preview, or test")
+    if split not in {"train", "test_preview", "test"}:
+        raise ValueError("split must be train, test_preview, or test")
     if type(case_budget) is not int or case_budget < 1:
         raise ValueError("case_budget must be a positive integer")
     if train_limit is not None and (type(train_limit) is not int or train_limit < 1):
@@ -411,12 +407,15 @@ def run_policy_stage(
     root, commit = validate_checkout(official_root, require_pinned=expert_factory is GuardAgentTrainer)
     if identity["upstream_commit"] != commit:
         raise ValueError("identity does not match the GuardAgent checkout")
-    paths = {"train": Path(train_path), "validation": Path(validation_path), "test": Path(test_path)}
+    paths = {"train": Path(train_path), "test": Path(test_path)}
     rows_by_split = validate_dataset_splits(
-        *(read_cases(paths[name], expected_rows=None) for name in ("train", "validation", "test"))
+        *(read_cases(paths[name], expected_rows=None) for name in ("train", "test"))
     )
     rows_by_split["train"] = select_training_rows(
         rows_by_split["train"], configured_train_limit, identity["seed"]
+    )
+    rows_by_split["test"] = sample_test_cases(
+        rows_by_split["test"], identity.get("test_case_limit", 0), identity["seed"]
     )
     actual_hashes = {name: sha256_file(path) for name, path in paths.items()}
     if actual_hashes != identity["source_hashes"]:
@@ -431,13 +430,8 @@ def run_policy_stage(
             f"training case limit {train_limit:,} is below the {len(train_done):,} "
             "cases already completed"
         )
-    if split == "validation" and not train_done:
-        raise RuntimeError("train at least one case before running validation")
-    validation_done = _completed(
-        _read_jsonl(state / "validation_results.jsonl"), identity["fingerprint"]
-    )
-    if split == "test_preview" and (not train_done or not validation_done):
-        raise RuntimeError("train and validate at least one case before running a test preview")
+    if split == "test_preview" and not train_done:
+        raise RuntimeError("train at least one case before running a test preview")
     if split == "test" and len(train_done) != len(rows_by_split["train"]):
         raise RuntimeError("finish the configured training sample before held-out evaluation")
     policy = state / "policy.jsonl"
@@ -446,9 +440,6 @@ def run_policy_stage(
     _write_json(state / "policies.json", frozen)
     if len(train_done) == len(rows_by_split["train"]) and not policy.exists():
         _write_policy(policy, memory)
-    if split == "test":
-        if len(validation_done) != len(rows_by_split["validation"]):
-            raise RuntimeError("finish frozen validation before enabling the untouched test split")
     source_split = "test" if split == "test_preview" else split
     result_path = state / f"{split}_results.jsonl"
     prior = _read_jsonl(result_path)
@@ -459,13 +450,8 @@ def run_policy_stage(
     if not pending:
         return _finish_or_status(state, Path(target).expanduser().resolve(), identity, rows_by_split, memory)
 
-    validation_archive = None
-    validation_prior = _read_jsonl(state / "validation_results.jsonl")
-    if split == "train" and validation_prior:
-        validation_archive = state / f"validation_preview_{time.time_ns()}.jsonl"
-        os.replace(state / "validation_results.jsonl", validation_archive)
     test_preview_archive = None
-    if split in {"train", "validation"}:
+    if split == "train":
         preview_path = state / "test_preview_results.jsonl"
         if preview_path.exists():
             test_preview_archive = state / f"test_preview_{time.time_ns()}.jsonl"
@@ -531,7 +517,6 @@ def run_policy_stage(
         "processed_this_action": processed,
         "consecutive_failures": failures,
         "train_limit": train_limit if split == "train" else None,
-        "validation_preview_archived": str(validation_archive) if validation_archive else None,
         "test_preview_archived": str(test_preview_archive) if test_preview_archive else None,
     }
 
@@ -589,14 +574,14 @@ def _finish_or_status(
     status = policy_status(state, rows_by_split)
     all_splits_complete = all(
         status["splits"][split]["complete_cases"] == len(rows_by_split[split])
-        for split in ("train", "validation", "test")
+        for split in ("train", "test")
     )
     if all_splits_complete and state != target:
         result_rows = {
             split: list(_completed(
                 _read_jsonl(state / f"{split}_results.jsonl"), identity["fingerprint"]
             ).values())
-            for split in ("train", "validation", "test")
+            for split in ("train", "test")
         }
         _write_policy(state / "policy.jsonl", memory)
         policies = compile_frozen_policies(memory)
@@ -605,7 +590,7 @@ def _finish_or_status(
             name: sha256_file(state / name)
             for name in (
                 "policy.jsonl", "policies.json", "train_results.jsonl",
-                "validation_results.jsonl", "test_results.jsonl"
+                "test_results.jsonl"
             )
         }
         metadata = identity | {
@@ -618,7 +603,6 @@ def _finish_or_status(
             "policy_rule_count": len(policies["rules"]),
             "metric_modes": {
                 "train": "model_generated_examples",
-                "validation": "frozen_analyzer_programs",
                 "test": "frozen_analyzer_programs",
             },
             "split_counts": {name: len(values) for name, values in rows_by_split.items()},
@@ -653,7 +637,7 @@ def policy_status(path: Path, rows_by_split: dict[str, list[dict[str, Any]]] | N
     else:
         build_info = {}
     split_status = {}
-    for split in ("train", "validation", "test", "test_preview"):
+    for split in ("train", "test", "test_preview"):
         source_split = "test" if split == "test_preview" else split
         rows = _read_jsonl(state / f"{split}_results.jsonl")
         done = _completed(rows, fingerprint) if fingerprint else {}
@@ -661,6 +645,10 @@ def policy_status(path: Path, rows_by_split: dict[str, list[dict[str, Any]]] | N
         if source_split == "train" and expected is not None:
             limit = build_info.get("train_case_limit")
             if limit is not None:
+                expected = min(expected, limit)
+        if source_split == "test" and expected is not None:
+            limit = build_info.get("test_case_limit", 0)
+            if limit:
                 expected = min(expected, limit)
         metric_total = (
             expected if expected is not None and len(done) == expected else len(done)

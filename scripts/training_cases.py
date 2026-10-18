@@ -184,3 +184,21 @@ def stratified_sample(
     if len(selected) != sample_size:
         raise AssertionError("stratified sampling returned the wrong row count")
     return [rows[index] for index in selected], quotas, counts
+
+
+def sample_test_cases(rows: list[dict[str, Any]], limit: int = 0, seed: int = 42) -> list[dict[str, Any]]:
+    """Select a stable label-stratified test sample; zero uses the full split."""
+    if type(limit) is not int or limit < 0 or limit == 1:
+        raise ValueError("test case limit must be 0 (all) or an integer >= 2")
+    if not limit or limit >= len(rows):
+        return rows
+    groups = [[i for i, row in enumerate(rows) if row["prompt_harm_label"] == label]
+              for label in ("harmful", "unharmful")]
+    if not all(groups):
+        raise ValueError("test sample requires harmful and unharmful cases")
+    harmful_count = round(limit * len(groups[0]) / len(rows))
+    harmful_count = max(1, limit - len(groups[1]), harmful_count)
+    harmful_count = min(len(groups[0]), limit - 1, harmful_count)
+    rng = random.Random(seed)
+    selected = set(rng.sample(groups[0], harmful_count) + rng.sample(groups[1], limit - harmful_count))
+    return [row for i, row in enumerate(rows) if i in selected]

@@ -155,52 +155,71 @@ class PolicyWorkflowTest(unittest.TestCase):
     def test_split_isolation_and_counts(self):
         rows = {
             "train": [case("t1", "bad train", "harmful", 1), case("t2", "good train", "unharmful", 2)],
-            "validation": [case("v1", "bad validation", "harmful", 3), case("v2", "good validation", "unharmful", 4)],
             "test": [case("s1", "bad test", "harmful", 5), case("s2", "good test", "unharmful", 6)],
         }
         checked = policy.validate_dataset_splits(
-            rows["train"], rows["validation"], rows["test"],
-            {"train": 2, "validation": 2, "test": 2},
+            rows["train"], rows["test"],
+            {"train": 2, "test": 2},
         )
         self.assertEqual({name: len(values) for name, values in checked.items()}, {name: 2 for name in rows})
         rows["test"][0] = case("s1", "bad train", "harmful", 5)
         with self.assertRaisesRegex(ValueError, "overlapping"):
-            policy.validate_dataset_splits(rows["train"], rows["validation"], rows["test"])
+            policy.validate_dataset_splits(rows["train"], rows["test"])
 
     def test_resumable_frozen_bundle_and_verification(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             rows = {
                 "train": [case("t1", "bad train", "harmful", 1), case("t2", "good train", "unharmful", 2)],
-                "validation": [case("v1", "bad validation", "harmful", 3), case("v2", "good validation", "unharmful", 4)],
-                "test": [case("s1", "bad test", "harmful", 5), case("s2", "good test", "unharmful", 6)],
+                "test": [
+                    case("s1", "bad test", "harmful", 5),
+                    case("s2", "good test", "unharmful", 6),
+                    case("s3", "bad extra test", "harmful", 7),
+                    case("s4", "good extra test", "unharmful", 8),
+                ],
             }
             paths = {}
             for split, values in rows.items():
                 paths[split] = root / f"{split}.parquet"
-                write_cases(paths[split], values, expected_rows=2)
+                write_cases(paths[split], values, expected_rows=len(values))
             hashes = {name: policy.sha256_file(path) for name, path in paths.items()}
             identity = policy.build_identity(
                 dataset="fixture", model="fake/model", provider="Managed local",
                 endpoint="http://localhost:8000/v1", tool_call_parser="hermes",
                 source_hashes=hashes, upstream_commit="fixture-commit",
+                test_case_limit=2,
             )
             target = root / "artifacts" / "fixture" / "fake-model"
             arguments = dict(
-                official_root=root, train_path=paths["train"], validation_path=paths["validation"],
+                official_root=root, train_path=paths["train"],
                 test_path=paths["test"], target=target, identity=identity, api_key="",
                 timeout=1, expert_factory=FakeExpert,
             )
             with patch.object(policy, "validate_checkout", return_value=(root, "fixture-commit")):
                 first = policy.run_policy_stage(split="train", case_budget=1, **arguments)
                 self.assertEqual(first["splits"]["train"]["complete_cases"], 1)
-                policy.run_policy_stage(split="train", case_budget=10, **arguments)
+                with self.assertRaisesRegex(RuntimeError, "finish the configured training"):
+                    policy.run_policy_stage(split="test", case_budget=1, **arguments)
+                preview = policy.run_policy_stage(split="test_preview", case_budget=1, **arguments)
+                self.assertEqual(preview["splits"]["test_preview"]["complete_cases"], 1)
+                resumed = policy.run_policy_stage(split="train", case_budget=10, **arguments)
+                self.assertTrue(Path(resumed["test_preview_archived"]).exists())
                 self.assertTrue((target.with_name(target.name + ".work") / "policy.jsonl").exists())
                 self.assertTrue((target.with_name(target.name + ".work") / "policies.json").exists())
-                policy.run_policy_stage(split="validation", case_budget=10, **arguments)
+                with self.assertRaisesRegex(ValueError, "split must be"):
+                    policy.run_policy_stage(split="validation", **arguments)
+                before = policy.sha256_file(target.with_name(target.name + ".work") / "policies.json")
+                partial = policy.run_policy_stage(split="test", case_budget=1, **arguments)
+                self.assertFalse(partial["complete"])
+                self.assertEqual(partial["splits"]["test"]["expected_cases"], 2)
                 policy.run_policy_stage(split="test", case_budget=10, **arguments)
+                self.assertEqual(policy.sha256_file(target / "policies.json"), before)
             metadata = policy.verify_policy_bundle(target)
-            self.assertEqual(metadata["split_counts"], {name: 2 for name in rows})
+            self.assertEqual(metadata["split_counts"], {"train": 2, "test": 2})
+            self.assertFalse((target / "validation_results.jsonl").exists())
+            selected = policy.sample_test_cases(rows["test"], 2, identity["seed"])
+            results = [json.loads(line) for line in (target / "test_results.jsonl").read_text().splitlines()]
+            self.assertEqual({row["case_id"] for row in results}, {row["case_id"] for row in selected})
             self.assertEqual(metadata["learned_memory_size"], 4)
             self.assertGreater(metadata["policy_rule_count"], 0)
             self.assertEqual(len(load_policy_memory(target)), 4)
@@ -235,10 +254,6 @@ class PolicyWorkflowTest(unittest.TestCase):
                          "harmful" if index % 2 else "unharmful", index)
                     for index in range(6)
                 ],
-                "validation": [
-                    case("v1", "bad validation", "harmful", 10),
-                    case("v2", "good validation", "unharmful", 11),
-                ],
                 "test": [
                     case("s1", "bad test", "harmful", 12),
                     case("s2", "good test", "unharmful", 13),
@@ -257,7 +272,7 @@ class PolicyWorkflowTest(unittest.TestCase):
             with patch.object(policy, "validate_checkout", return_value=(root, "fixture-commit")):
                 status = policy.run_policy_stage(
                     split="train", official_root=root, train_path=paths["train"],
-                    validation_path=paths["validation"], test_path=paths["test"],
+                    test_path=paths["test"],
                     target=root / "bundle", identity=identity, api_key="key",
                     case_budget=6, timeout=1, expert_factory=AlwaysFailExpert,
                 )

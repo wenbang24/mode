@@ -27,11 +27,12 @@ try:
         normalize_prompt,
         read_cases,
         stratified_sample,
+        sample_test_cases,
         validate_cases,
     )
 except ModuleNotFoundError:  # Direct execution via scripts/benchmark_wildguard_train.py.
     from local_judge import normalize_endpoint
-    from training_cases import EXPECTED_ROWS, normalize_prompt, read_cases, stratified_sample, validate_cases
+    from training_cases import EXPECTED_ROWS, normalize_prompt, read_cases, stratified_sample, sample_test_cases, validate_cases
 
 
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
@@ -219,6 +220,7 @@ def load_dataset_splits(
     train_path: Path, validation_path: Path, test_path: Path, *,
     train_size: int = DEFAULT_TRAIN_SIZE, validation_size: int = DEFAULT_VALIDATION_SIZE,
     sample_seed: int = SEED,
+    test_case_limit: int = 0,
 ) -> tuple[dict[str, Path], dict[str, list[dict[str, Any]]]]:
     paths = {
         "train": Path(train_path).expanduser().resolve(),
@@ -239,6 +241,7 @@ def load_dataset_splits(
         )
         if {row["prompt_harm_label"] for row in rows[name]} != {"harmful", "unharmful"}:
             raise ValueError(f"{name} sample must contain harmful and unharmful cases; increase its size")
+    rows["test"] = sample_test_cases(rows["test"], test_case_limit, sample_seed)
     return paths, rows
 
 
@@ -383,6 +386,7 @@ def _runtime_preflight(
     train_size: int = DEFAULT_TRAIN_SIZE,
     validation_size: int = DEFAULT_VALIDATION_SIZE,
     sample_seed: int = SEED,
+    test_case_limit: int = 0,
 ) -> tuple[
     Path,
     str,
@@ -404,7 +408,7 @@ def _runtime_preflight(
     root, commit = validate_checkout(official_root)
     paths, rows = load_dataset_splits(train_path, validation_path, test_path,
                                     train_size=train_size, validation_size=validation_size,
-                                    sample_seed=sample_seed)
+                                    sample_seed=sample_seed, test_case_limit=test_case_limit)
     config = AutoConfig.from_pretrained(
         model_id, revision=revision, token=token, trust_remote_code=False
     )
@@ -440,6 +444,7 @@ def preflight_bundle_inputs(
     validation_size: int = DEFAULT_VALIDATION_SIZE,
     calibration_size: int = DEFAULT_CALIBRATION_SIZE,
     sample_seed: int = SEED,
+    test_case_limit: int = 0,
 ) -> dict[str, Any]:
     settings = sampling_settings(train_size, validation_size, calibration_size, sample_seed)
     root, commit, paths, rows, config, _tokenizer = _runtime_preflight(
@@ -454,6 +459,7 @@ def preflight_bundle_inputs(
         hd_probe_layer,
         check_model_stack=True,
         train_size=train_size, validation_size=validation_size, sample_seed=sample_seed,
+        test_case_limit=test_case_limit,
     )
     geometry = validate_model_config(config, rd_probe_layer, hd_probe_layer)
     return {
@@ -1596,6 +1602,7 @@ def build_bundle(
     progress: Callable[[str], None] = print,
     judge_endpoint: str | None = None,
     judge_constrained: bool = False,
+    test_case_limit: int = 0,
 ) -> Path:
     if judge_endpoint is not None:
         judge_endpoint = normalize_endpoint(judge_endpoint)
@@ -1609,6 +1616,7 @@ def build_bundle(
         token,
         rd_probe_layer,
         hd_probe_layer,
+        test_case_limit=test_case_limit,
     )
     geometry = validate_model_config(config, rd_probe_layer, hd_probe_layer)
     train_rows = rows["train"]
@@ -1628,6 +1636,7 @@ def build_bundle(
         "rd_probe_layer": rd_probe_layer,
         "hd_probe_layer": hd_probe_layer,
         "steering_runtime": RUNTIME_PROVENANCE,
+        "test_case_limit": test_case_limit,
         "dataset_sha256": {
             name: sha256_file(dataset_path) for name, dataset_path in paths.items()
         },
@@ -1911,6 +1920,7 @@ def build_bundle(
             ],
         },
         "test_metrics": test_metrics,
+        "test_case_limit": test_case_limit,
         "generation": {
             "system_prompt": "",
             "do_sample": False,

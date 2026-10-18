@@ -23,8 +23,8 @@ def title(mo):
     # GuardAgent policy notebook
 
     Generate GuardAgent analyzer programs during training, compile them into a
-    frozen program library, and evaluate retrieved programs on validation and
-    test prompts without model calls. Training uses the official planner/code-generator
+    frozen program library, and evaluate retrieved programs on test prompts without
+    model calls. Training uses the official planner/code-generator
     pinned to commit `eb8797f0f3570800c1f596c40418edc929994a24`.
     """)
     return
@@ -129,7 +129,7 @@ def connection_controls(local_server, mo, server_panel):
             mo.md(
                 "Managed local starts vLLM 0.27 with automatic tool choice and the "
                 "Hermes parser. Keep it running for training; frozen-policy "
-                "validation and testing do not use the model."
+                "testing does not use the model."
             ),
         ]
     )
@@ -224,32 +224,33 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
     training_limit_control = mo.ui.number(
         start=1, value=1_000, step=100, label="Training cases for bundle"
     )
+    test_limit_control = mo.ui.number(
+        start=0, value=0, step=1, label="Test cases for bundle (0 = all; minimum 2)"
+    )
     overwrite_control = mo.ui.checkbox(
         value=False, label="Replace existing build on the next Train action"
     )
     preflight_button = mo.ui.run_button(label="1. Preflight")
     train_button = mo.ui.run_button(label="2. Train / resume")
-    validation_button = mo.ui.run_button(label="3. Validate preview / resume")
-    test_button = mo.ui.run_button(label="4. Test preview / full test")
+    test_button = mo.ui.run_button(label="3. Test preview / finish bundle")
     refresh_status_button = mo.ui.run_button(label="Refresh status")
     demo_prompt_control = mo.ui.text_area(
         value="Explain how rainbows form.",
         label="Demonstration prompt",
         full_width=True,
     )
-    demo_button = mo.ui.run_button(label="5. Run demonstration")
+    demo_button = mo.ui.run_button(label="4. Run demonstration")
     mo.vstack(
         [
             dataset_preset_control,
             hosted_api_base_control,
             hosted_model_control,
             output_root_control,
-            mo.hstack([case_budget_control, training_limit_control, overwrite_control]),
+            mo.hstack([case_budget_control, training_limit_control, test_limit_control, overwrite_control]),
             mo.hstack(
                 [
                     preflight_button,
                     train_button,
-                    validation_button,
                     test_button,
                 ]
             ),
@@ -260,25 +261,15 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
                 "During training, GuardAgent generates multi-step Python analyzers. A bounded "
                 "interpreter supports branches, bounded loops, collections, comparisons, "
                 "arithmetic, and selected text operations; imports, file/network access, and "
-                "dynamic execution are unavailable. Validation, test, and demonstrations "
-                "retrieve similar training examples and run their saved analyzer programs "
-                "against each prompt, then combine their verdicts. Training appends a memory "
-                "only when execution succeeds and the verdict "
-                "matches the label. The training case limit is the total used to build the "
-                "bundle (default 1,000); raise it to 10,000 to use the full training split. "
-                "Training cases are sampled reproducibly and stratified by label; validation "
-                "and test still use their full splits without model calls. Cases per action controls "
-                "batch size. Validate after at least one training case. A test preview is "
-                "available after at least one training and validation case, and its results "
-                "are separate from the final bundle. Previewed cases are exploratory, not "
-                "untouched benchmark data. The full test run stays locked until the selected "
-                "training cases and all validation cases are complete. If you resume training after a validation "
-                "or test preview, those previews are archived and must be rerun against the new "
-                "checkpoint. Errors are checkpointed and retried on the next action; five "
-                "consecutive connection failures stop the current action. "
-                "A clean training case makes three model calls (planning, code "
-                "generation, and termination). Validation, test, and the "
-                "completed policy demonstration use the saved programs only.",
+                "dynamic execution are unavailable. Testing and demonstrations retrieve "
+                "training examples and run their saved analyzers without model calls. "
+                "Training appends memory only when execution succeeds and the verdict matches "
+                "the label. Training defaults to 1,000 cases. Test cases for bundle selects a "
+                "reproducible, label-stratified sample (0 uses all cases; otherwise at least 2). "
+                "Cases per action controls batch size. A test preview is available after one "
+                "training case; final testing requires the configured training sample to finish. "
+                "Resuming training archives test previews. Errors are saved and retried on the "
+                "next action; five consecutive failures stop the action.",
                 kind="info",
             ),
         ]
@@ -297,7 +288,7 @@ def workflow_controls(DATASET_PRESETS, DEFAULT_OUTPUT_ROOT, mo):
         test_button,
         train_button,
         training_limit_control,
-        validation_button,
+        test_limit_control,
     )
 
 
@@ -318,25 +309,26 @@ def configuration(
     request_timeout_control,
     server_settings,
     training_limit_control,
+    test_limit_control,
 ):
     workspace = Path(__file__).resolve().parent
     dataset_preset = DATASET_PRESETS[dataset_preset_control.value]
     dataset_slug = dataset_preset["slug"]
     dataset_paths = {
         split_name: workspace / dataset_preset[split_name][0]
-        for split_name in ("train", "validation", "test")
+        for split_name in ("train", "test")
     }
     expected_counts = {
         split_name: dataset_preset[split_name][1]
-        for split_name in ("train", "validation", "test")
+        for split_name in ("train", "test")
     }
     official_root = guardagent_checkout
     train_path = dataset_paths["train"]
-    validation_path = dataset_paths["validation"]
     test_path = dataset_paths["test"]
     output_root = Path(output_root_control.value).expanduser()
     case_budget = int(case_budget_control.value)
     train_limit = min(int(training_limit_control.value), expected_counts["train"])
+    test_limit = int(test_limit_control.value)
     request_timeout = positive_timeout(request_timeout_control.value)
 
     if connection_mode_control.value == "Managed local":
@@ -366,10 +358,10 @@ def configuration(
         request_timeout,
         target_bundle,
         train_limit,
+        test_limit,
         test_path,
         tool_call_parser,
         train_path,
-        validation_path,
     )
 
 
@@ -390,14 +382,13 @@ def run_context(
     test_path,
     tool_call_parser,
     train_limit,
+    test_limit,
     train_path,
-    validation_path,
 ):
     def resolve_guardagent_run(require_model=False):
         preflight_value = preflight_policy_inputs(
             official_root=official_root,
             train_path=train_path,
-            validation_path=validation_path,
             test_path=test_path,
             expected_counts=expected_counts,
         )
@@ -418,6 +409,7 @@ def run_context(
             seed=42,
             num_shots=MEMORY_SHOTS,
             train_case_limit=train_limit,
+            test_case_limit=test_limit,
             upstream_commit=preflight_value["official_commit"],
         )
         return preflight_value, identity_value, key_value
@@ -435,14 +427,12 @@ def preflight_action(
     preflight_policy_inputs,
     test_path,
     train_path,
-    validation_path,
 ):
     preflight_report = None
     if preflight_button.value:
         preflight_report = preflight_policy_inputs(
             official_root=official_root,
             train_path=train_path,
-            validation_path=validation_path,
             test_path=test_path,
             expected_counts=expected_counts,
         )
@@ -509,7 +499,6 @@ def train_action(
     train_limit,
     train_button,
     train_path,
-    validation_path,
 ):
     train_report = None
     if train_button.value:
@@ -518,7 +507,6 @@ def train_action(
             split="train",
             official_root=official_root,
             train_path=train_path,
-            validation_path=validation_path,
             test_path=test_path,
             target=target_bundle,
             identity=train_identity,
@@ -537,46 +525,6 @@ def train_action(
 
 
 @app.cell(hide_code=True)
-def validation_action(
-    case_budget,
-    json,
-    mo,
-    official_root,
-    request_timeout,
-    resolve_guardagent_run,
-    run_policy_stage,
-    target_bundle,
-    test_path,
-    train_path,
-    validation_button,
-    validation_path,
-):
-    validation_report = None
-    if validation_button.value:
-        validation_preflight, validation_identity, validation_key = (
-            resolve_guardagent_run()
-        )
-        validation_report = run_policy_stage(
-            split="validation",
-            official_root=official_root,
-            train_path=train_path,
-            validation_path=validation_path,
-            test_path=test_path,
-            target=target_bundle,
-            identity=validation_identity,
-            api_key=validation_key,
-            case_budget=case_budget,
-            timeout=request_timeout,
-        )
-    mo.md(
-        "Validation action is idle."
-        if validation_report is None
-        else "```json\n" + json.dumps(validation_report, indent=2) + "\n```"
-    )
-    return (validation_report,)
-
-
-@app.cell(hide_code=True)
 def test_action(
     case_budget,
     expected_counts,
@@ -591,25 +539,21 @@ def test_action(
     test_button,
     test_path,
     train_path,
-    validation_path,
 ):
     test_report = None
     if test_button.value:
         test_preflight, test_identity, test_key = resolve_guardagent_run()
-        status_shapes = {
-            name: range(count) for name, count in expected_counts.items()
-        }
-        current_status = policy_status(target_bundle, status_shapes)
-        official_ready = all(
-            current_status["splits"][split]["complete_cases"]
-            == current_status["splits"][split]["expected_cases"]
-            for split in ("train", "validation")
+        _status_shapes = {name: range(count) for name, count in expected_counts.items()}
+        current_status = policy_status(target_bundle, _status_shapes)
+        _train_status = current_status.get("splits", {}).get("train", {})
+        official_ready = (
+            _train_status.get("expected_cases") is not None
+            and _train_status.get("complete_cases") == _train_status["expected_cases"]
         )
         test_report = run_policy_stage(
             split="test" if official_ready else "test_preview",
             official_root=official_root,
             train_path=train_path,
-            validation_path=validation_path,
             test_path=test_path,
             target=target_bundle,
             identity=test_identity,
@@ -634,12 +578,10 @@ def artifact_status(
     target_bundle,
     test_report,
     train_report,
-    validation_report,
 ):
     _ = (
         refresh_status_button.value,
         train_report,
-        validation_report,
         test_report,
     )
     status_shapes = {
@@ -727,6 +669,7 @@ def built_in_checks(
     mo,
     restricted_execute,
     train_limit,
+    test_limit,
 ):
     allow_check = restricted_execute(ALLOW_CODE, "hello")
     block_check = restricted_execute(BLOCK_CODE, "unsafe")
@@ -742,7 +685,8 @@ def built_in_checks(
         "nearest_examples": MEMORY_SHOTS,
         "training_cases_for_bundle": train_limit,
         "available_training_cases": expected_counts["train"],
-        "test_locked_until_validation": True,
+        "test_cases_for_bundle": test_limit,
+        "test_locked_until_training_complete": True,
     }
     mo.callout(json.dumps(built_in_check_report, indent=2), kind="success")
     return
