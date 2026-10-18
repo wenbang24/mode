@@ -24,6 +24,9 @@ def title(mo):
     prompt-safety schema. Blank/`REDACTED` prompts, conflicting normalized labels,
     duplicates, and cross-split overlaps are removed with test > validation > train
     precedence.
+
+    Also selects 1,000 additional cases, excluding case IDs and normalized
+    prompts from every existing Parquet in the workspace, including WildGuard.
     """)
     return
 
@@ -282,6 +285,65 @@ def save_and_validate(
             row["case_id"] for row in _rows
         ]
     return output_bytes, validated_rows
+
+
+@app.cell
+def select_unseen(
+    OUTPUT_PATHS,
+    SEED,
+    normalize_prompt,
+    pq,
+    read_cases,
+    stratified_sample,
+    training_pool,
+    validated_rows,
+    write_cases,
+):
+    # Depend on the saved splits so they are included in the exclusions.
+    assert validated_rows
+    _workspace = OUTPUT_PATHS["train"].parent
+    unseen_path = _workspace / "aegis2_unseen_1000_seed42.parquet"
+    _existing_paths = sorted(
+        path for path in _workspace.rglob("*.parquet")
+        if path.resolve() != unseen_path.resolve()
+    )
+    _excluded_prompts = set()
+    _excluded_ids = set()
+    for _path in _existing_paths:
+        _table = pq.read_table(_path, columns=["case_id", "prompt"])
+        for _row in _table.to_pylist():
+            _excluded_prompts.add(normalize_prompt(_row["prompt"]))
+            _excluded_ids.add(_row["case_id"])
+    _pool = [
+        row for row in training_pool
+        if normalize_prompt(row["prompt"]) not in _excluded_prompts
+        and row["case_id"] not in _excluded_ids
+    ]
+    unseen_rows, unseen_label_counts, _ = stratified_sample(
+        _pool, 1_000, SEED, key=lambda row: row["prompt_harm_label"]
+    )
+    assert len(unseen_rows) == 1_000
+    assert not ({normalize_prompt(row["prompt"]) for row in unseen_rows} & _excluded_prompts)
+    assert not ({row["case_id"] for row in unseen_rows} & _excluded_ids)
+    write_cases(unseen_path, unseen_rows, expected_rows=1_000)
+    assert read_cases(unseen_path, expected_rows=1_000) == unseen_rows
+    unseen_report = {
+        "output": str(unseen_path),
+        "cases": len(unseen_rows),
+        "labels": unseen_label_counts,
+        "eligible unused cases": len(_pool),
+        "excluded parquet files": [str(path.relative_to(_workspace)) for path in _existing_paths],
+    }
+    return unseen_path, unseen_report, unseen_rows
+
+
+@app.cell
+def unseen_summary(mo, unseen_report):
+    mo.vstack([
+        mo.md("## Additional 1,000 cases with no existing Parquet overlap"),
+        mo.ui.table([unseen_report], selection=None),
+    ])
+    return
 
 
 @app.cell

@@ -165,6 +165,43 @@ def connection_controls(local_server, mo, server_panel):
     return get_server_status, request_timeout, server_settings
 
 
+@app.cell(hide_code=True)
+def server_status_refresh_control(mo):
+    server_status_refresh = mo.ui.refresh(
+        options=["2s", "5s", "10s"],
+        default_interval="2s",
+        label="Refresh server status and logs",
+    )
+    server_status_refresh
+    return (server_status_refresh,)
+
+
+@app.cell(hide_code=True)
+def server_status_display(get_server_status, json, local_server, mo, server_status_refresh):
+    server_status_refresh.value
+    # React to button callbacks as well as periodic refreshes.
+    _panel_status = get_server_status()
+    _live_status = local_server.status()
+    _state = _live_status["state"]
+    _kind = "success" if _state == "ready" else "danger" if _state == "failed" else "info"
+    _messages = {
+        "stopped": "Server stopped. Press Start local server to launch it.",
+        "starting": "Starting server: installing dependencies, downloading weights, or loading the model. Progress appears below.",
+        "ready": "Server ready to accept requests.",
+        "failed": "Server exited. Inspect the startup log below for the cause.",
+    }
+    _details = {key: value for key, value in _live_status.items() if key not in {"log", "state"}}
+    _start_error = _panel_status.get("error")
+    mo.vstack([
+        mo.callout(_messages.get(_state, _state), kind=_kind),
+        *([mo.callout(mo.plain_text(_start_error), kind="danger")] if _start_error else []),
+        mo.plain_text(json.dumps(_details, indent=2)),
+        mo.md("### Startup log (latest 8 KB)"),
+        mo.plain_text(_live_status.get("log") or "No startup log yet."),
+    ])
+    return
+
+
 @app.cell
 def artifact_controls(
     DATASET_KEYS,
@@ -1287,8 +1324,8 @@ def prepare_source_action(
             source_report = mo.callout(
                 f"AdaSteer source ready at `{source_root}`.", kind="success"
             )
-        except Exception as exc:
-            source_report = mo.callout(f"AdaSteer source setup failed: {exc}", kind="danger")
+        except Exception as _exc:
+            source_report = mo.callout(f"AdaSteer source setup failed: {_exc}", kind="danger")
     else:
         source_report = mo.md("AdaSteer source setup is idle.")
     source_report
@@ -1319,8 +1356,8 @@ def preflight_action(
             preflight_data = prepare_run(
                 test_set=test_set.value,
                 selected_guardrails=[
-                    method for label, method in GUARDRAIL_OPTIONS.items()
-                    if label in guardrails.value
+                    _method for _label, _method in GUARDRAIL_OPTIONS.items()
+                    if _label in guardrails.value
                 ],
                 adasteer_path=adasteer_path.value,
                 piguard_path=piguard_path.value,
@@ -1329,7 +1366,7 @@ def preflight_action(
                 server_settings=server_settings.value,
                 request_timeout=positive_timeout(request_timeout.value),
             )
-            status = (
+            _status = (
                 get_server_status()
                 if "adasteer" in preflight_data["selected_guardrails"]
                 else {"state": "not required for gate-only outcomes"}
@@ -1344,7 +1381,7 @@ def preflight_action(
                 "responding_model": preflight_data["run_config"]["responding_model"],
                 "judge_model": preflight_data["run_config"]["judge_model"],
                 "judge_server_state": (
-                    status["state"]
+                    _status["state"]
                     if "adasteer" in preflight_data["selected_guardrails"]
                     else "not required for gate-only outcomes"
                 ),
@@ -1360,12 +1397,12 @@ def preflight_action(
                 "run_config": str(preflight_data["run_config_path"]),
                 "fingerprint": preflight_data["fingerprint"],
             }
-            view = mo.callout(json.dumps(report, indent=2), kind="success")
-        except Exception as exc:
-            view = mo.callout(f"Preflight failed: {exc}", kind="danger")
+            _view = mo.callout(json.dumps(report, indent=2), kind="success")
+        except Exception as _exc:
+            _view = mo.callout(f"Preflight failed: {_exc}", kind="danger")
     else:
-        view = mo.md("Preflight is idle.")
-    view
+        _view = mo.md("Preflight is idle.")
+    _view
     return (preflight_data,)
 
 
@@ -1399,8 +1436,8 @@ def run_action(
             run = prepare_run(
                 test_set=test_set.value,
                 selected_guardrails=[
-                    method for label, method in GUARDRAIL_OPTIONS.items()
-                    if label in guardrails.value
+                    _method for _label, _method in GUARDRAIL_OPTIONS.items()
+                    if _label in guardrails.value
                 ],
                 adasteer_path=adasteer_path.value,
                 piguard_path=piguard_path.value,
@@ -1422,14 +1459,14 @@ def run_action(
                 token=token,
             )
             kind = "success" if benchmark_result["complete"] else "warn"
-            status = mo.callout(
+            _status = mo.callout(
                 json.dumps({key: value for key, value in benchmark_result.items() if key not in {"rows", "grouped_rows", "summary"}}, indent=2),
                 kind=kind,
             )
             summary = mo.ui.table(benchmark_result["summary"])
             cases = mo.ui.table(benchmark_result["grouped_rows"])
-            view = mo.vstack([
-                status, mo.md("## Summary"), summary,
+            _view = mo.vstack([
+                _status, mo.md("## Summary"), summary,
                 mo.md("## Results by prompt"),
                 mo.md(
                     "Each prompt contains its guardrail results. `guardrail_seconds` excludes "
@@ -1439,18 +1476,18 @@ def run_action(
                 ),
                 cases,
             ])
-        except Exception as exc:
-            view = mo.callout(f"Benchmark stopped: {error_text(exc)}", kind="danger")
+        except Exception as _exc:
+            _view = mo.callout(f"Benchmark stopped: {error_text(_exc)}", kind="danger")
     else:
-        view = mo.md("Smoke and full-test runs are idle.")
-    view
+        _view = mo.md("Smoke and full-test runs are idle.")
+    _view
     return (benchmark_result,)
 
 
 @app.cell
 def case_failure_distribution(benchmark_result, mo):
     if benchmark_result is None:
-        view = mo.md("Run a smoke or full benchmark first.")
+        _view = mo.md("Run a smoke or full benchmark first.")
     else:
         selected = set(benchmark_result["selected_guardrails"])
         by_case = {}
@@ -1488,7 +1525,7 @@ def case_failure_distribution(benchmark_result, mo):
             mo.md("```text\n" + "\n".join(failed_case_ids) + "\n```")
             if failed_case_ids else mo.md("No cases failed every selected guardrail.")
         )
-        view = mo.vstack([
+        _view = mo.vstack([
             mo.md("## Failure count by case"),
             failure_table,
             mo.md(
@@ -1498,7 +1535,7 @@ def case_failure_distribution(benchmark_result, mo):
             ),
             failed_ids,
         ])
-    view
+    _view
     return
 
 
