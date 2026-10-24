@@ -43,6 +43,12 @@ def title(mo):
 
 @app.cell
 def imports():
+    import os
+
+    # This router uses PyTorch; skip optional TensorFlow/Keras integrations on Molab.
+    os.environ["USE_TF"] = "0"
+    os.environ["USE_TORCH"] = "1"
+
     import json
     from pathlib import Path
 
