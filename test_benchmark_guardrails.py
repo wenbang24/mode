@@ -102,7 +102,7 @@ class BenchmarkSplitTest(unittest.TestCase):
         prepare = next(node for node in helpers.body if isinstance(node, ast.FunctionDef) and node.name == "prepare_run")
         exec(compile(ast.Module(body=[prepare], type_ignores=[]), "benchmark_prepare", "exec"), self.namespace)
 
-    def prepare(self, selection="Aegis unseen 1,000", methods=None):
+    def prepare(self, selection="Aegis unseen 10,000", methods=None):
         return self.namespace["prepare_run"](
             test_set=selection, selected_guardrails=methods or ["adasteer", "piguard"],
             adasteer_path=self.bundle, piguard_path=self.bundle, guardagent_path="unused.py",
@@ -114,9 +114,9 @@ class BenchmarkSplitTest(unittest.TestCase):
         test = self.prepare("Aegis 2.0")
         self.assertEqual(unseen["dataset"], "aegis")
         self.assertEqual(unseen["data_split"], "unseen")
-        self.assertEqual(len(unseen["cases"]), 1000)
+        self.assertEqual(len(unseen["cases"]), 10000)
         self.assertEqual(len(test["cases"]), 1914)
-        self.assertEqual(unseen["test_path"].name, "aegis2_unseen_1000_seed42.parquet")
+        self.assertEqual(unseen["test_path"].name, "aegis2_unseen_10000_seed42.parquet")
         self.assertEqual(unseen["run_config"]["schema_version"], 4)
         self.assertNotEqual(unseen["fingerprint"], test["fingerprint"])
         self.assertNotEqual(unseen["test_sha256"], test["test_sha256"])
@@ -131,7 +131,7 @@ class BenchmarkSplitTest(unittest.TestCase):
             (self.workspace / filename).unlink()
             del self.rows[filename]
         run = self.prepare(methods=["piguard"])
-        self.assertEqual(len(run["cases"]), 1000)
+        self.assertEqual(len(run["cases"]), 10000)
         self.assertEqual(set(run["validated_tests"]), {"aegis_unseen"})
 
     def test_unseen_adasteer_run_without_canonical_parquets(self):
@@ -140,7 +140,7 @@ class BenchmarkSplitTest(unittest.TestCase):
             del self.rows[filename]
         self.metadata["datasets"]["test"]["sha256"] = "9facd918f6ee71bd97fc0703742eebe3d181600fc88a888390eb0b32fb734783"
         run = self.prepare()
-        self.assertEqual(len(run["cases"]), 1000)
+        self.assertEqual(len(run["cases"]), 10000)
         self.assertEqual(set(run["validated_tests"]), {"aegis_unseen"})
         self.metadata["datasets"]["test"]["sha256"] = "wrong"
         with self.assertRaisesRegex(ValueError, "canonical test set"):
@@ -153,7 +153,7 @@ class BenchmarkSplitTest(unittest.TestCase):
         self.assertEqual(set(run["validated_tests"]), {"aegis"})
 
     def test_unseen_rejects_overlap_with_reserved_test_prompts(self):
-        self.rows["aegis2_unseen_1000_seed42.parquet"][0]["prompt"] = self.rows["aegis2_test.parquet"][0]["prompt"]
+        self.rows["aegis2_unseen_10000_seed42.parquet"][0]["prompt"] = self.rows["aegis2_test.parquet"][0]["prompt"]
         with self.assertRaisesRegex(ValueError, "normalized prompts overlap"):
             self.prepare()
 

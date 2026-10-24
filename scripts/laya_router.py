@@ -190,7 +190,7 @@ def labeled_rows(cases, targets):
 
 
 def prepare_data(run_dir, train_parquet, test_parquet, output_root):
-    data = load_benchmark(run_dir, train_parquet, expected_rows=1000, split="unseen")
+    data = load_benchmark(run_dir, train_parquet, expected_rows=10000, split="unseen")
     test_cases = read_cases(test_parquet, expected_rows=1914)
     assert_disjoint(data.cases, test_cases)
     splits = split_cases(data.cases)

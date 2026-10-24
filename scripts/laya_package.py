@@ -9,9 +9,9 @@ from scripts.training_cases import read_cases
 
 def finetuner_files(workspace, run_directory):
     workspace, run_directory = Path(workspace), Path(run_directory)
-    unseen = workspace / "aegis2_unseen_1000_seed42.parquet"
+    unseen = workspace / "aegis2_unseen_10000_seed42.parquet"
     reserved = workspace / "aegis2_test.parquet"
-    data = load_benchmark(run_directory, unseen, expected_rows=1000, split="unseen")
+    data = load_benchmark(run_directory, unseen, expected_rows=10000, split="unseen")
     assert_disjoint(data.cases, read_cases(reserved, expected_rows=1914))
     files = {
         name: workspace / name for name in (

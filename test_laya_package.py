@@ -16,11 +16,11 @@ class FinetunerPackageTest(unittest.TestCase):
             root = Path(directory)
             (root / "scripts").mkdir()
             for name in ("train_laya_router.py", "scripts/laya_router.py", "scripts/training_cases.py",
-                         "aegis2_unseen_1000_seed42.parquet", "aegis2_test.parquet"):
+                         "aegis2_unseen_10000_seed42.parquet", "aegis2_test.parquet"):
                 (root / name).write_bytes(name.encode())
-            cases = make_cases(1000)
+            cases = make_cases(10000)
             run = root / "run"
-            rows = make_benchmark(run, cases, root / "aegis2_unseen_1000_seed42.parquet")
+            rows = make_benchmark(run, cases, root / "aegis2_unseen_10000_seed42.parquet")
             with patch.object(router, "read_cases", return_value=cases), patch.object(
                 package, "read_cases", return_value=make_cases(1914, "test")
             ):
@@ -33,10 +33,10 @@ class FinetunerPackageTest(unittest.TestCase):
                 # The extracted run remains valid with the new relative paths.
                 restored = router.load_benchmark(
                     root / "extracted/benchmarks/unseen",
-                    root / "extracted/aegis2_unseen_1000_seed42.parquet",
-                    expected_rows=1000, split="unseen",
+                    root / "extracted/aegis2_unseen_10000_seed42.parquet",
+                    expected_rows=10000, split="unseen",
                 )
-                self.assertEqual(len(restored.outcomes), 1000)
+                self.assertEqual(len(restored.outcomes), 10000)
                 write_results(run, rows[:-1])
                 with self.assertRaisesRegex(ValueError, "incomplete"):
                     package.build_finetuner_zip(root, run)

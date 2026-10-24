@@ -25,7 +25,7 @@ def title(mo):
     duplicates, and cross-split overlaps are removed with test > validation > train
     precedence.
 
-    Also selects 1,000 additional cases, excluding case IDs and normalized
+    Also selects 10,000 additional cases, excluding case IDs and normalized
     prompts from every existing Parquet in the workspace, including WildGuard.
     """)
     return
@@ -302,7 +302,7 @@ def select_unseen(
     # Depend on the saved splits so they are included in the exclusions.
     assert validated_rows
     _workspace = OUTPUT_PATHS["train"].parent
-    unseen_path = _workspace / "aegis2_unseen_1000_seed42.parquet"
+    unseen_path = _workspace / "aegis2_unseen_10000_seed42.parquet"
     _existing_paths = sorted(
         path for path in _workspace.rglob("*.parquet")
         if path.resolve() != unseen_path.resolve()
@@ -320,13 +320,13 @@ def select_unseen(
         and row["case_id"] not in _excluded_ids
     ]
     unseen_rows, unseen_label_counts, _ = stratified_sample(
-        _pool, 1_000, SEED, key=lambda row: row["prompt_harm_label"]
+        _pool, 10_000, SEED, key=lambda row: row["prompt_harm_label"]
     )
-    assert len(unseen_rows) == 1_000
+    assert len(unseen_rows) == 10_000
     assert not ({normalize_prompt(row["prompt"]) for row in unseen_rows} & _excluded_prompts)
     assert not ({row["case_id"] for row in unseen_rows} & _excluded_ids)
-    write_cases(unseen_path, unseen_rows, expected_rows=1_000)
-    assert read_cases(unseen_path, expected_rows=1_000) == unseen_rows
+    write_cases(unseen_path, unseen_rows, expected_rows=10_000)
+    assert read_cases(unseen_path, expected_rows=10_000) == unseen_rows
     unseen_report = {
         "output": str(unseen_path),
         "cases": len(unseen_rows),
@@ -340,7 +340,7 @@ def select_unseen(
 @app.cell
 def unseen_summary(mo, unseen_report):
     mo.vstack([
-        mo.md("## Additional 1,000 cases with no existing Parquet overlap"),
+        mo.md("## Additional 10,000 cases with no existing Parquet overlap"),
         mo.ui.table([unseen_report], selection=None),
     ])
     return

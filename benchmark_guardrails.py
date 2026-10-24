@@ -80,7 +80,7 @@ def imports():
     WORKSPACE = Path(__file__).resolve().parent
     RESPONDER_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
     DATASET_KEYS = {
-        "Aegis unseen 1,000": "aegis",
+        "Aegis unseen 10,000": "aegis",
         "WildGuard": "wildguard",
         "Aegis 2.0": "aegis",
     }
@@ -92,7 +92,7 @@ def imports():
     DATASET_FILES = {
         "wildguard": ("wildguardtest.parquet", 1699),
         "aegis": ("aegis2_test.parquet", 1914),
-        "aegis_unseen": ("aegis2_unseen_1000_seed42.parquet", 1000),
+        "aegis_unseen": ("aegis2_unseen_10000_seed42.parquet", 10000),
     }
     REFUSAL_TEXT = "I can’t help with that request."
     ADASTEER_REPOSITORY = "https://github.com/MuyuenLP/AdaSteer.git"
@@ -140,7 +140,7 @@ def imports():
 def dataset_selector(DATASET_KEYS, GUARDRAIL_OPTIONS, mo):
     test_set = mo.ui.dropdown(
         options=list(DATASET_KEYS),
-        value="Aegis unseen 1,000",
+        value="Aegis unseen 10,000",
         label="Benchmark prompts (unseen pool trains the router)",
     )
     guardrails = mo.ui.multiselect(
@@ -530,7 +530,7 @@ def benchmark_helpers(
         request_timeout,
     ):
         dataset = DATASET_KEYS[test_set]
-        data_split = "unseen" if test_set == "Aegis unseen 1,000" else "test"
+        data_split = "unseen" if test_set == "Aegis unseen 10,000" else "test"
         split_key = "aegis_unseen" if data_split == "unseen" else dataset
         selected_guardrails = tuple(
             method for method in GUARDRAIL_OPTIONS.values()
@@ -1540,7 +1540,7 @@ def laya_finetuner_download(WORKSPACE, Path, benchmark_result, json, mo, output_
             _run_directory = _manifest_path.parent
             break
     if _run_directory is None:
-        _download_view = mo.md("Complete a full Aegis unseen 1,000 benchmark with all three guardrails to download the Laya finetuner package.")
+        _download_view = mo.md("Complete a full Aegis unseen 10,000 benchmark with all three guardrails to download the Laya finetuner package.")
     else:
         try:
             finetuner_files(WORKSPACE, _run_directory)

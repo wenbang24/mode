@@ -21,7 +21,7 @@ def title(mo):
     # Train the MoDE router with ModernBERT
 
     Learn the **fastest successful expert** for a prompt: AdaSteer, PIGuard, or
-    GuardAgent. Benchmark all three on **Aegis unseen 1,000** in
+    GuardAgent. Benchmark all three on **Aegis unseen 10,000** in
     `benchmark_guardrails.py`, then provide that run's directory below.
     The original prompt is the only model input; benchmark success and timings
     supply its training label.
@@ -94,7 +94,7 @@ def input_controls(WORKSPACE, mo):
         value=str(WORKSPACE / "benchmarks/unseen") if (WORKSPACE / "benchmarks/unseen/run_config.json").is_file() else "",
         label="Unseen Aegis benchmark run directory (contains run_config.json)", full_width=True)
     train_parquet_control = mo.ui.text(
-        value=str(WORKSPACE / "aegis2_unseen_1000_seed42.parquet"), label="Original unseen prompts", full_width=True)
+        value=str(WORKSPACE / "aegis2_unseen_10000_seed42.parquet"), label="Original unseen prompts", full_width=True)
     test_parquet_control = mo.ui.text(
         value=str(WORKSPACE / "aegis2_test.parquet"), label="Reserved test prompts (Parquet only, for overlap checks)", full_width=True)
     output_control = mo.ui.text(
