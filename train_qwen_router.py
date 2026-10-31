@@ -22,7 +22,7 @@ def title(mo):
     # Train the MoDE router with Qwen2.5-3B
 
     Adapted from [SearchJev](https://arxiv.org/pdf/2610.05107), sections 3.1–3.3.
-    Score A/B/C next-token logits directly, with no generated JSON or new classifier head.
+    Score A/B/C/D next-token logits directly, with no generated JSON or new classifier head.
     This uses Qwen2.5-3B-Instruct in place of the paper's Qwen3.5 backbone.
 
     Learn the **correct route** for a prompt: AdaSteer, PIGuard, GuardAgent, or

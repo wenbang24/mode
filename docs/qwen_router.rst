@@ -21,13 +21,13 @@ is the initialization, with its native assistant prefix and existing LM head.
 There is no learned classifier head and no generated JSON.
 
 The input is the original prompt plus a fixed schema describing AdaSteer,
-PIGuard, and GuardAgent. Benchmark outcomes, harmfulness labels, and measured
-timings are supervision only. A/B/C must tokenize to distinct single tokens.
+PIGuard, GuardAgent, and human review. Benchmark outcomes, harmfulness labels, and measured
+timings are supervision only. A/B/C/D must tokenize to distinct single tokens.
 Only state tokens are truncated; the expert descriptions and assistant prefix
 are retained. Chat delimiters inside the state are escaped before tokenization.
 Training, calibration, and inference use the same serialization.
 
-The last input position supplies A/B/C logits. A softmax over these three
+The last input position supplies A/B/C/D logits. A softmax over these four
 logits, divided by the fitted positive temperature, returns expert choice
 probabilities. Left padding and attention-mask-derived positions ensure a
 padded batch produces the same decision positions as individual prompts.
