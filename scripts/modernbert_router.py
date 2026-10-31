@@ -12,14 +12,14 @@ import shutil
 import tempfile
 
 from scripts.laya_router import (
-    EXPERTS, OUTCOME_NOTE, assert_disjoint, check_matching_experts, load_benchmark,
+    EXPERTS, HUMAN, OUTCOME_NOTE, ROUTES, assert_disjoint, check_matching_experts, load_benchmark,
     predict_cases, prepare_data, resolve_device, sha256_file, summarize_policy, write_json,
 )
 
 
 BASE_MODEL = "answerdotai/ModernBERT-large"
 BASE_REVISION = "45bb4654a4d5aaff24dd11d4781fa46d39bf8c13"
-ID2LABEL = dict(enumerate(EXPERTS))
+ID2LABEL = dict(enumerate(ROUTES))
 LABEL2ID = {expert: index for index, expert in ID2LABEL.items()}
 DEFAULT_SETTINGS = {
     "epochs": 8, "micro_batch": 8, "grad_accum": 2, "learning_rate": 2e-5,
@@ -92,7 +92,7 @@ def inspect_training(data_dir, base_dir, settings):
         truncation[name] = {
             "cases": len(rows), "truncated": sum(length > settings["max_len"] for length in lengths),
             "tokens_dropped": sum(max(0, length - settings["max_len"]) for length in lengths),
-            "target_counts": {expert: sum(row["expected"]["expert"] == expert for row in rows) for expert in EXPERTS},
+            "target_counts": {route: sum(row["expected"]["expert"] == route for row in rows) for route in ROUTES},
         }
     updates = math.ceil(math.ceil(truncation["train"]["cases"] / settings["micro_batch"]) / settings["grad_accum"])
     return {"truncation": truncation, "effective_batch": settings["micro_batch"] * settings["grad_accum"],
@@ -135,7 +135,7 @@ def _fit(data_dir, base_dir, directory, settings, device):
         raise RuntimeError(f"Requested {device}, but Trainer selected {args.device}")
     tokenizer = AutoTokenizer.from_pretrained(base_dir, local_files_only=True)
     model = AutoModelForSequenceClassification.from_pretrained(
-        base_dir, local_files_only=True, num_labels=len(EXPERTS),
+        base_dir, local_files_only=True, num_labels=len(ROUTES),
         id2label=ID2LABEL, label2id=LABEL2ID, problem_type="single_label_classification",
         reference_compile=False, attn_implementation="sdpa",
     )
@@ -208,11 +208,11 @@ class ModernBERTRouter:
             dtype=torch.bfloat16 if self.precision["bf16"] else torch.float16,
         ):
             probabilities = self.model(**inputs).logits[0].float().softmax(-1).tolist()
-        if (len(probabilities) != len(EXPERTS) or any(not math.isfinite(p) or not 0 <= p <= 1 for p in probabilities)
+        if (len(probabilities) != len(ROUTES) or any(not math.isfinite(p) or not 0 <= p <= 1 for p in probabilities)
                 or not math.isclose(sum(probabilities), 1, abs_tol=0.001)):
             raise RuntimeError("Model returned invalid expert probabilities")
-        selected = max(range(len(EXPERTS)), key=probabilities.__getitem__)
-        return {"expert": EXPERTS[selected], "probabilities": dict(zip(EXPERTS, probabilities)),
+        selected = max(range(len(ROUTES)), key=probabilities.__getitem__)
+        return {"expert": ROUTES[selected], "probabilities": dict(zip(ROUTES, probabilities)),
                 "confidence": probabilities[selected], "truncated": length > self.max_len}
 
     def close(self):
@@ -232,8 +232,7 @@ def evaluate_checkpoint(cases, outcomes, targets, checkpoint_dir, device):
         predictions = predict_cases(router, cases)
     reports = summarize_policy("finetuned_modernbert", cases, outcomes, targets, predictions)
     for name in (*EXPERTS, "fastest_successful_oracle"):
-        choices = [{"case_id": case["case_id"], "expert": name if name in EXPERTS else (
-            targets[case["case_id"]] or min(EXPERTS, key=lambda expert: outcomes[case["case_id"]][expert]["guardrail_seconds"]))}
+        choices = [{"case_id": case["case_id"], "expert": name if name in EXPERTS else targets[case["case_id"]] or HUMAN}
                    for case in cases]
         reports.extend(summarize_policy(name, cases, outcomes, targets, choices))
     return {"summary": reports, "predictions": {"finetuned_modernbert": predictions}, "outcome_note": OUTCOME_NOTE}
@@ -343,7 +342,7 @@ def export_router(run_dir, output_root, device="auto"):
             prediction = router.predict(prompt)
         if (original["expert"] != prediction["expert"] or original["truncated"] != prediction["truncated"]
                 or any(not math.isclose(original["probabilities"][expert], prediction["probabilities"][expert],
-                                        rel_tol=1e-5, abs_tol=1e-6) for expert in EXPERTS)):
+                                        rel_tol=1e-5, abs_tol=1e-6) for expert in ROUTES)):
             raise RuntimeError("Exported checkpoint predictions differ after reload")
         write_json(staging / "reload_check.json", prediction)
         staging.rename(destination)

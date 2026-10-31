@@ -44,12 +44,14 @@ repository unseen pool has 10,000 prompts; Aegis test has 1,914.
 The existing seed-42, harmfulness-stratified 80/20 split supplies training and a
 held-out pool. Half the held-out pool becomes checkpoint selection, half becomes
 calibration (seed 43). IDs and normalized prompts are disjoint across all three
-and reserved test. All-failed prompts have no routing target; they remain in
-policy success reports. Target counts and excluded counts are saved per split.
+and reserved test. All-failed prompts target ``human`` review, a fourth route.
+Target counts, including all-failed counts, are saved per split.
 
-The fastest successful expert is a one-hot target, with deterministic expert
-order breaking latency ties. We do not invent uncertainty from a single timing
-measurement. The encoder also accepts explicit expert probability distributions
+The benchmark manifest's ``target_rule`` picks the one-hot target among successful
+experts: ``fastest_successful`` (default; deterministic expert order breaks latency
+ties) or ``most_confident_successful`` (gate confidence in its own decision, or the
+judge's token probability of AdaSteer success; latency breaks ties). We do not
+invent uncertainty from a single timing measurement. The encoder also accepts explicit expert probability distributions
 and positive source weights if future supervision provides them; existing
 benchmark-derived examples use one-hot labels and weight 1.
 
@@ -59,9 +61,10 @@ Training and calibration
 Defaults: three epochs, learning rate 5e-5, sequence budget 2,048, micro-batch 2,
 accumulation 8, rank-16/alpha-32 LoRA, dropout 0.05, AdamW, weight decay 0.01,
 cosine decay with 5% warmup, and gradient checkpointing. LoRA covers Qwen's
-attention and MLP projections. All six expert permutations are encoded for each
-training prompt, with targets remapped to the corresponding option positions.
-Selection and calibration use the canonical expert order used at inference.
+attention and MLP projections. All four cyclic rotations of the routes are encoded
+for each training prompt, so every route appears once in every option position,
+with targets remapped accordingly. Selection and calibration use the canonical
+route order used at inference.
 
 The per-example objective is weight * (cross-entropy + 0.5 * Brier), averaged
 within the micro-batch; gradient accumulation scaling is explicit. The lowest
@@ -69,7 +72,7 @@ selection-loss adapter is merged into the base weights. A bounded positive
 temperature grid minimizes NLL on calibration prompts only. The grid includes
 T=1, so fitting cannot worsen calibration-split NLL. This does not guarantee
 better calibration on unseen domains. NLL, Brier, 15-bin ECE, and routing
-accuracy are reported; all-failed cases are excluded from those target metrics.
+accuracy are reported over every case, with all-failed cases targeting human review.
 
 Inference and evaluation
 ------------------------
@@ -82,14 +85,15 @@ expert or another model. Callers must handle the flag before executing an
 expert. The default threshold of zero keeps compatibility with MoDE's existing
 forced-choice benchmark. No escalation benefit is claimed or measured.
 
-Choice confidence estimates agreement with the fastest-successful target,
+Choice confidence estimates agreement with the benchmark target,
 not the chosen expert's probability of success. Retain the existing outcome
 caveats: gate-expert outcomes use prompt-label assumptions, and recorded expert
 costs are not directly comparable end-to-end response costs.
 
 Final evaluation checks exact expert configurations and reserved-test identity.
-It compares the trained router, each fixed expert, and the fastest-successful
-oracle, reporting harmful/unharmful success, routing accuracy, selection counts,
+It compares the trained router, each fixed expert, and the target oracle
+(which sends all-failed cases to human review). Choosing human review counts as
+success only when every expert fails and costs no expert time; reporting harmful/unharmful success, routing accuracy, selection counts,
 truncation, router latency, and estimated combined cost. Calibration metrics
 are computed separately on labeled cases. Checkpoint-selection metrics remain
 selection-set results; reserved-test evaluation is the final quality check.

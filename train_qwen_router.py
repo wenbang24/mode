@@ -25,15 +25,16 @@ def title(mo):
     Score A/B/C next-token logits directly, with no generated JSON or new classifier head.
     This uses Qwen2.5-3B-Instruct in place of the paper's Qwen3.5 backbone.
 
-    Learn the **fastest successful expert** for a prompt: AdaSteer, PIGuard, or
-    GuardAgent. Benchmark all three on **Aegis unseen 10,000** in
+    Learn the **correct route** for a prompt: AdaSteer, PIGuard, GuardAgent, or
+    human review when every expert fails. The benchmark's `target_rule` picks among
+    successful experts (fastest by default, or most confident). Benchmark all three on **Aegis unseen 10,000** in
     `benchmark_guardrails.py`, then provide that run's directory below.
     The original prompt and fixed expert schema are the only model inputs; benchmark success and timings
     supply its training label.
 
     The unseen pool is split 80/10/10 for training, checkpoint selection, and
-    temperature calibration (seeds 42 and 43). Labels are the fastest successful
-    expert; all six option permutations are used during training.
+    temperature calibration (seeds 42 and 43). Labels follow the benchmark's
+    target rule; all four cyclic option rotations are used during training.
     **Aegis test (1,914 prompts)** stays separate for final evaluation.
     You can fine-tune before running its benchmark: leave the test benchmark
     directory blank until step 5. Only the reserved test Parquet is needed
@@ -258,7 +259,7 @@ def train_action(
                 mo.plain_text(json.dumps(trained_run["summary"]["calibration"], indent=2)),
                 mo.plain_text(json.dumps(trained_run["validation"]["routing_calibration"], indent=2)),
                 mo.md("Validation results above include the all-failed prompts. "
-                      "Training loss uses only examples with a routing target. "
+                      "All-failed prompts are trained and scored with the human-review target. "
                       "Confidence is temperature-scaled choice probability. Inspect selection counts for collapse and calibration metrics in the report."),
             ])
         except Exception as _exc:
