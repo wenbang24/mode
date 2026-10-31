@@ -16,7 +16,7 @@ from test_laya_router import make_benchmark, make_cases
 
 class SettingsTest(unittest.TestCase):
     def test_settings_and_label_order(self):
-        self.assertEqual(mr.LABEL2ID, {"adasteer": 0, "piguard": 1, "guardagent": 2})
+        self.assertEqual(mr.LABEL2ID, {"adasteer": 0, "piguard": 1, "guardagent": 2, "human": 3})
         self.assertEqual(mr.validate_settings({}), mr.DEFAULT_SETTINGS)
         for key, value in (("epochs", True), ("micro_batch", 0), ("grad_accum", 1.5),
                            ("learning_rate", 0), ("learning_rate", float("nan")),
@@ -122,7 +122,7 @@ class TinyModernBERTTest(unittest.TestCase):
             for prompt, truncated in (("hello", False), ("hello " * 20, True)):
                 result = router.predict(prompt)
                 self.assertEqual(result["truncated"], truncated)
-                self.assertEqual(set(result["probabilities"]), set(mr.EXPERTS))
+                self.assertEqual(set(result["probabilities"]), set(mr.ROUTES))
                 self.assertAlmostEqual(sum(result["probabilities"].values()), 1, places=6)
                 self.assertEqual(result["confidence"], result["probabilities"][result["expert"]])
             for invalid in (None, "", " ", 123):

@@ -67,6 +67,57 @@ class RouterDataTest(unittest.TestCase):
             outcome["succeeded"] = False
         self.assertIsNone(lr.fastest_successful(outcomes))
 
+    def test_judge_confidence_ranks_adasteer(self):
+        outcomes = {
+            "adasteer": {"succeeded": True, "guardrail_seconds": 1.3, "judge_confidence": 0.99},
+            "piguard": {"succeeded": True, "guardrail_seconds": 0.03, "guard_blocked": True,
+                        "guard_metadata": {"harmful_score": 0.9}},
+            "guardagent": {"succeeded": False, "guardrail_seconds": 0.0},
+        }
+        self.assertEqual(lr.most_confident_successful(outcomes), "adasteer")
+        outcomes["adasteer"]["judge_confidence"] = 0.5
+        self.assertEqual(lr.most_confident_successful(outcomes), "piguard")
+        outcomes["adasteer"]["judge_confidence"] = 1.5
+        self.assertIsNone(lr.decision_confidence(outcomes["adasteer"]))
+
+    def test_most_confident_successful_prefers_confident_gate_then_speed(self):
+        outcomes = {
+            "adasteer": {"succeeded": True, "guardrail_seconds": 1.3},
+            "piguard": {"succeeded": True, "guardrail_seconds": 0.03, "guard_blocked": False,
+                        "guard_metadata": {"harmful_score": 0.02}},
+            "guardagent": {"succeeded": True, "guardrail_seconds": 0.0, "guard_blocked": False,
+                           "guard_metadata": {"policy_score": 0.1}},
+        }
+        self.assertAlmostEqual(lr.decision_confidence(outcomes["piguard"]), 0.98)
+        self.assertEqual(lr.most_confident_successful(outcomes), "piguard")
+        outcomes["guardagent"]["guard_metadata"]["policy_score"] = 0.02
+        self.assertEqual(lr.most_confident_successful(outcomes), "guardagent")
+        outcomes["piguard"]["succeeded"] = outcomes["guardagent"]["succeeded"] = False
+        self.assertEqual(lr.most_confident_successful(outcomes), "adasteer")
+        outcomes["adasteer"]["succeeded"] = False
+        self.assertIsNone(lr.most_confident_successful(outcomes))
+
+    def test_manifest_target_rule_selects_supervision(self):
+        manifest = json.loads((self.run / "run_config.json").read_text())
+        manifest.pop("run_fingerprint")
+        manifest["target_rule"] = "most_confident_successful"
+        manifest["run_fingerprint"] = lr.fingerprint(manifest)
+        lr.write_json(self.run / "run_config.json", manifest)
+        for row in self.rows:
+            row["run_fingerprint"] = manifest["run_fingerprint"]
+            row["succeeded"] = True
+            if row["expert"] != "adasteer":
+                row["guard_blocked"] = False
+                row["guard_metadata"] = {"harmful_score" if row["expert"] == "piguard" else "policy_score":
+                                         0.1 if row["expert"] == "piguard" else 0.4}
+        write_results(self.run, self.rows)
+        self.assertEqual(set(self.load().targets.values()), {"piguard"})
+        manifest["target_rule"] = "unknown"
+        manifest["run_fingerprint"] = lr.fingerprint({k: v for k, v in manifest.items() if k != "run_fingerprint"})
+        lr.write_json(self.run / "run_config.json", manifest)
+        with self.assertRaisesRegex(ValueError, "target_rule"):
+            self.load()
+
     def test_unicode_line_separators_remain_inside_jsonl_prompts(self):
         self.cases[0]["prompt"] = "Prompt with\u2028Unicode\u0085separators"
         for row in self.rows:
@@ -82,7 +133,7 @@ class RouterDataTest(unittest.TestCase):
         revised = {**self.rows[0], "succeeded": False}
         write_results(self.run, [*self.rows, revised])
         lr.write_json(self.run / "prompt_results.json", [{"stale": True}])
-        self.assertIsNone(self.load().targets[self.cases[0]["case_id"]])
+        self.assertEqual(self.load().targets[self.cases[0]["case_id"]], lr.HUMAN)
         write_results(self.run, [*self.rows, {**revised, "error": "retry failed"}])
         with self.assertRaisesRegex(ValueError, "errored or unknown"):
             self.load()
@@ -156,7 +207,7 @@ class RouterDataTest(unittest.TestCase):
         self.assertEqual(splits["train"]["cases"], 16)
         self.assertEqual(splits["validation"]["cases"], 4)
         self.assertEqual(sum(info["all_failed"] for info in splits.values()), 1)
-        self.assertEqual(sum(info["labeled"] for info in splits.values()), 19)
+        self.assertEqual(sum(info["labeled"] for info in splits.values()), 20)
         self.assertTrue((directory / "train_cases.json").is_file())
 
 
@@ -188,20 +239,28 @@ class SplitAndEvaluationTest(unittest.TestCase):
         cases = make_cases(2)
         outcomes = {case["case_id"]: {expert: {"succeeded": index == 0, "guardrail_seconds": slot + 1}
                     for slot, expert in enumerate(lr.EXPERTS)} for index, case in enumerate(cases)}
-        targets = {case_id: lr.fastest_successful(values) for case_id, values in outcomes.items()}
+        targets = {case_id: lr.fastest_successful(values) or lr.HUMAN for case_id, values in outcomes.items()}
         predictions = [{"case_id": case["case_id"], "expert": "adasteer", "router_seconds": 0.1} for case in cases]
         report = lr.summarize_policy("trained", cases, outcomes, targets, predictions)[0]
         self.assertEqual(report["cases"], 2)
         self.assertEqual(report["all_failed"], 1)
-        self.assertEqual(report["routing_accuracy"], 1)
+        self.assertEqual(report["routing_accuracy"], 0.5)
         self.assertEqual(report["selected_expert_success"], 0.5)
         self.assertAlmostEqual(report["mean_estimated_cost_seconds"], 1.1)
+        escalated = [predictions[0], {**predictions[1], "expert": lr.HUMAN}]
+        report = lr.summarize_policy("trained", cases, outcomes, targets, escalated)[0]
+        self.assertEqual((report["routing_accuracy"], report["selected_expert_success"]), (1, 1))
+        self.assertEqual(report["human_escalations"], 1)
+        self.assertAlmostEqual(report["mean_estimated_cost_seconds"], 0.6)
+        wrongly_escalated = [{**predictions[0], "expert": lr.HUMAN}, predictions[1]]
+        report = lr.summarize_policy("trained", cases, outcomes, targets, wrongly_escalated)[0]
+        self.assertEqual(report["selected_expert_success"], 0)
         with self.assertRaisesRegex(ValueError, "every evaluation case"):
             lr.summarize_policy("trained", cases, outcomes, targets, predictions[:1])
 
     def test_router_reload_schema_probabilities_and_prompt_validation(self):
         answer = {"answers": {"expert": {"choice": "piguard", "probabilities": {
-            "adasteer": 0.1, "piguard": 0.7, "guardagent": 0.2}}}, "usage": {"truncated": True}}
+            "adasteer": 0.1, "piguard": 0.7, "guardagent": 0.2, "human": 0.0}}}, "usage": {"truncated": True}}
         agent = SimpleNamespace(predict=lambda *args, **kwargs: answer, __exit__=lambda *args: None)
         with tempfile.TemporaryDirectory() as temporary:
             lr.write_json(Path(temporary) / "questions.json", lr.QUESTIONS)
@@ -220,7 +279,7 @@ class SplitAndEvaluationTest(unittest.TestCase):
 
     def test_export_copies_provenance_verifies_reload_and_prevents_overwrite(self):
         answer = {"answers": {"expert": {"choice": "piguard", "probabilities": {
-            "adasteer": 0.1, "piguard": 0.7, "guardagent": 0.2}}}}
+            "adasteer": 0.1, "piguard": 0.7, "guardagent": 0.2, "human": 0.0}}}}
         agent = SimpleNamespace(predict=lambda *args, **kwargs: answer, __exit__=lambda *args: None)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

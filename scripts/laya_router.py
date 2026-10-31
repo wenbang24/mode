@@ -19,17 +19,21 @@ from scripts.training_cases import normalize_prompt, read_cases, stratified_samp
 
 
 EXPERTS = ("adasteer", "piguard", "guardagent")
+# Router targets: an expert, or human review when every expert fails.
+HUMAN = "human"
+ROUTES = (*EXPERTS, HUMAN)
 LAYA_COMMIT = "d74e8be46ef5241e4ba2b16cd25e896f24f71373"
 BASE_MODEL = "convaiinnovations/laya"
 BASE_REVISION = "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851"
 QUESTIONS = {
     "expert": {
         "type": "choice",
-        "instructions": "Choose the fastest defensive expert that will successfully handle this prompt.",
+        "instructions": "Choose the defensive expert that will successfully handle this prompt, or human review if none will.",
         "criteria": {
             "adasteer": "AdaSteer: steer the responding model toward safe, useful responses.",
             "piguard": "PIGuard: use a trained prompt-safety classifier to block or allow the prompt.",
             "guardagent": "GuardAgent: use a Python safety policy to block or allow the prompt.",
+            "human": "Human review: no automated expert will handle this prompt successfully.",
         },
     }
 }
@@ -93,6 +97,32 @@ def fastest_successful(outcomes):
     return min(successful, key=lambda expert: outcomes[expert]["guardrail_seconds"]) if successful else None
 
 
+def decision_confidence(outcome):
+    """Gate confidence in its own block/allow decision, else the judge's P(success); None if neither."""
+    metadata = outcome.get("guard_metadata")
+    score = metadata.get("harmful_score", metadata.get("policy_score")) if isinstance(metadata, dict) else None
+    blocked = outcome.get("guard_blocked")
+    if type(score) in (int, float) and 0 <= score <= 1 and isinstance(blocked, bool):
+        return float(score) if blocked else 1.0 - float(score)
+    judged = outcome.get("judge_confidence")
+    return float(judged) if type(judged) in (int, float) and 0 <= judged <= 1 else None
+
+
+def most_confident_successful(outcomes):
+    """Experts without any confidence rank below scored ones; ties go to the faster expert."""
+    successful = [expert for expert in EXPERTS if outcomes[expert]["succeeded"]]
+    def rank(expert):
+        confidence = decision_confidence(outcomes[expert])
+        return (confidence is None, -(confidence or 0.0), outcomes[expert]["guardrail_seconds"])
+    return min(successful, key=rank) if successful else None
+
+
+TARGET_RULES = {
+    "fastest_successful": fastest_successful,
+    "most_confident_successful": most_confident_successful,
+}
+
+
 @dataclass
 class BenchmarkData:
     manifest: dict
@@ -127,6 +157,9 @@ def load_benchmark(run_dir, parquet_path, *, expected_rows, split):
         value = manifest.get(key)
         if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
             raise ValueError(f"Missing or invalid expert provenance: {key}")
+    target_rule = manifest.get("target_rule", "fastest_successful")
+    if target_rule not in TARGET_RULES:
+        raise ValueError(f"Unknown benchmark target_rule: {target_rule!r}")
 
     results_path = run_dir / "results.jsonl"
     if results_path.is_file():
@@ -164,7 +197,7 @@ def load_benchmark(run_dir, parquet_path, *, expected_rows, split):
         if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
             raise ValueError(f"Invalid guardrail_seconds for {case_id}/{expert}")
     outcomes = {case_id: {expert: latest[case_id, expert] for expert in EXPERTS} for case_id in originals}
-    targets = {case_id: fastest_successful(values) for case_id, values in outcomes.items()}
+    targets = {case_id: TARGET_RULES[target_rule](values) or HUMAN for case_id, values in outcomes.items()}
     return BenchmarkData(manifest, cases, outcomes, targets, results_path)
 
 
@@ -185,8 +218,8 @@ def split_cases(cases, seed=42):
 
 
 def labeled_rows(cases, targets):
-    return [{"state": row["prompt"], "questions": QUESTIONS, "expected": {"expert": targets[row["case_id"]]}}
-            for row in cases if targets[row["case_id"]] is not None]
+    return [{"state": row["prompt"], "questions": QUESTIONS, "expected": {"expert": targets[row["case_id"]] or HUMAN}}
+            for row in cases]
 
 
 def prepare_data(run_dir, train_parquet, test_parquet, output_root):
@@ -212,12 +245,12 @@ def prepare_data(run_dir, train_parquet, test_parquet, output_root):
     for name, cases in splits.items():
         rows = labeled_rows(cases, data.targets)
         if not rows:
-            raise ValueError(f"No successful expert targets in the {name} split")
+            raise ValueError(f"No targets in the {name} split")
         counts = dict(Counter(row["expected"]["expert"] for row in rows))
         if name == "train" and len(counts) < 2:
             raise ValueError(f"Training targets contain only one expert: {counts}; inspect benchmark separation before fine-tuning")
         manifest["splits"][name] = {"cases": len(cases), "labeled": len(rows),
-                                    "all_failed": len(cases) - len(rows), "target_counts": counts}
+                                    "all_failed": counts.get(HUMAN, 0), "target_counts": counts}
     directory = Path(output_root).expanduser().resolve() / "datasets" / fingerprint(manifest)[:16]
     directory.mkdir(parents=True, exist_ok=True)
     for name, cases in splits.items():
@@ -338,7 +371,7 @@ class MoDERouter:
         answer = result["answers"]["expert"]
         expert = answer["choice"]
         probabilities = answer["probabilities"]
-        if expert not in EXPERTS or set(probabilities) != set(EXPERTS):
+        if expert not in ROUTES or set(probabilities) != set(ROUTES):
             raise ValueError("Laya returned an invalid expert choice")
         if any(type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1
                for value in probabilities.values()):
@@ -386,8 +419,15 @@ def _percentile(values, percentile):
     return values[max(0, math.ceil(len(values) * percentile) - 1)] if values else None
 
 
+def selection_outcome(outcomes, target, choice):
+    """(succeeded, expert seconds); human review succeeds only when every expert fails."""
+    if choice == HUMAN:
+        return target == HUMAN, 0.0
+    return outcomes[choice]["succeeded"], outcomes[choice]["guardrail_seconds"]
+
+
 def summarize_policy(name, cases, outcomes, targets, predictions):
-    """Success includes all-failed cases; routing accuracy has a target-only denominator."""
+    """Every case has a target; all-failed cases target human review."""
     by_id = {row["case_id"]: row for row in predictions}
     if len(by_id) != len(predictions) or set(by_id) != {row["case_id"] for row in cases}:
         raise ValueError("Predictions must cover every evaluation case exactly once")
@@ -397,16 +437,18 @@ def summarize_policy(name, cases, outcomes, targets, predictions):
         if not selected:
             continue
         chosen = [by_id[case["case_id"]] for case in selected]
-        labeled = [case for case in selected if targets[case["case_id"]] is not None]
-        costs = [outcomes[case["case_id"]][p["expert"]]["guardrail_seconds"] for case, p in zip(selected, chosen)]
+        results = [selection_outcome(outcomes[case["case_id"]], targets[case["case_id"]] or HUMAN, p["expert"])
+                   for case, p in zip(selected, chosen)]
+        costs = [seconds for _, seconds in results]
         seconds = [p.get("router_seconds", 0.0) for p in chosen]
         summaries.append({
             "policy": name, "subset": subset, "cases": len(selected),
-            "target_cases": len(labeled), "all_failed": len(selected) - len(labeled),
-            "routing_accuracy": (sum(by_id[case["case_id"]]["expert"] == targets[case["case_id"]]
-                                     for case in labeled) / len(labeled)) if labeled else None,
-            "selected_expert_success": sum(outcomes[case["case_id"]][p["expert"]]["succeeded"]
-                                           for case, p in zip(selected, chosen)) / len(selected),
+            "target_cases": len(selected),
+            "all_failed": sum((targets[case["case_id"]] or HUMAN) == HUMAN for case in selected),
+            "routing_accuracy": sum(p["expert"] == (targets[case["case_id"]] or HUMAN)
+                                    for case, p in zip(selected, chosen)) / len(selected),
+            "selected_expert_success": sum(succeeded for succeeded, _ in results) / len(selected),
+            "human_escalations": sum(p["expert"] == HUMAN for p in chosen),
             "selection_counts": dict(Counter(p["expert"] for p in chosen)),
             "mean_expert_cost_seconds": sum(costs) / len(costs),
             "median_router_seconds": _percentile(seconds, 0.5),
@@ -427,8 +469,7 @@ def evaluate_checkpoints(cases, outcomes, targets, base_dir, checkpoint_dir, set
             predictions[name] = predict_cases(router, cases)
         reports.extend(summarize_policy(name, cases, outcomes, targets, predictions[name]))
     for name in (*EXPERTS, "fastest_successful_oracle"):
-        choices = [{"case_id": case["case_id"], "expert": name if name in EXPERTS else (
-            targets[case["case_id"]] or min(EXPERTS, key=lambda expert: outcomes[case["case_id"]][expert]["guardrail_seconds"]))}
+        choices = [{"case_id": case["case_id"], "expert": name if name in EXPERTS else targets[case["case_id"]] or HUMAN}
                    for case in cases]
         reports.extend(summarize_policy(name, cases, outcomes, targets, choices))
     return {"summary": reports, "predictions": predictions, "outcome_note": OUTCOME_NOTE}
