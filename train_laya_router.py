@@ -20,8 +20,9 @@ def title(mo):
     mo.md(r"""
     # Train the MoDE router with Laya
 
-    Learn the **fastest successful expert** for a prompt: AdaSteer, PIGuard, or
-    GuardAgent. Benchmark all three on **Aegis unseen 10,000** in
+    Learn the **correct route** for a prompt: AdaSteer, PIGuard, GuardAgent, or
+    human review when every expert fails. The benchmark's `target_rule` picks among
+    successful experts (fastest by default, or most confident). Benchmark all three on **Aegis unseen 10,000** in
     `benchmark_guardrails.py`, then provide that run's directory below.
     The original prompt is the only model input; benchmark success and timings
     supply its training label.
@@ -244,7 +245,7 @@ def train_action(
                 mo.plain_text(json.dumps(trained_run["inspection"], indent=2)),
                 mo.ui.table(trained_run["validation"]["summary"], selection=None),
                 mo.md("Validation results above include the all-failed prompts. "
-                      "Laya's own training report evaluates only examples with a routing target. "
+                      "All-failed prompts are trained and scored with the human-review target. "
                       "Calibration and collapse warnings appear in the training console."),
             ])
         except Exception as _exc:

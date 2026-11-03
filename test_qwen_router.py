@@ -22,8 +22,10 @@ class DataContractTest(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 qr.validate_settings({key: value})
         row = {"expected": {"expert": "piguard"}}
-        self.assertEqual(qr.target_distribution(row), [0, 1, 0])
-        soft = dict(zip(qr.EXPERTS, [0.1, 0.7, 0.2]))
+        self.assertEqual(qr.target_distribution(row), [0, 1, 0, 0])
+        self.assertEqual(qr.target_distribution({"expected": {"expert": "human"}}), [0, 0, 0, 1])
+        self.assertEqual(qr.rotations(("a", "b", "c")), [("a", "b", "c"), ("b", "c", "a"), ("c", "a", "b")])
+        soft = dict(zip(qr.ROUTES, [0.1, 0.6, 0.2, 0.1]))
         self.assertEqual(qr.target_distribution({**row, "probabilities": soft}), list(soft.values()))
         for target in ({}, {**soft, "extra": 0}, {**soft, "piguard": float("nan")}, {**soft, "piguard": 0.1}):
             with self.assertRaises(ValueError):
@@ -77,7 +79,7 @@ class TinyQwenTest(unittest.TestCase):
         cls.root = Path(cls.temporary.name)
         cls.base = cls.root / "base"
         vocab = {token: index for index, token in enumerate(
-            ["[PAD]", "[UNK]", "A", "B", "C", "hello", "world", "train", "test", "prompt"]
+            ["[PAD]", "[UNK]", "A", "B", "C", "D", "hello", "world", "train", "test", "prompt"]
             + [str(i) for i in range(30)])}
         backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
         backend.pre_tokenizer = Whitespace()
@@ -121,8 +123,8 @@ class TinyQwenTest(unittest.TestCase):
     def test_option_permutations_and_schema_preserving_truncation(self):
         row = {"state": "hello " * 1000, "expected": {"expert": "piguard"}, "weight": 0.5}
         encoded = qr.encode_rows([row], self.tokenizer, 256, augment=True)
-        self.assertEqual(len(encoded), 6)
-        self.assertEqual([sum(item["labels"][i] for item in encoded) for i in range(3)], [2, 2, 2])
+        self.assertEqual(len(encoded), 4)
+        self.assertEqual([sum(item["labels"][i] for item in encoded) for i in range(4)], [1, 1, 1, 1])
         self.assertTrue(all(len(item["input_ids"]) == 256 for item in encoded))
         for item in encoded:
             self.assertEqual(item["input_ids"][-2:], self.tokenizer.encode("assistant:", add_special_tokens=False))
