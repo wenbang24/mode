@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts import judge_confidence as jc
 
@@ -30,6 +31,51 @@ class JudgeConfidenceTest(unittest.TestCase):
         self.assertAlmostEqual(jc.success_confidence("unharmful", p), 0.7)
         self.assertIsNone(jc.success_confidence("harmful", {}))
 
+    def test_judge_request_supports_optional_bearer_key(self):
+        requests = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        def open_request(request, timeout):
+            requests.append(request)
+            return Response()
+
+        payload = {"choices": [{"message": {"content": "{}"}, "logprobs": {"content": []}}]}
+        judgment = {"safe": True, "refusal": False, "attack_followed": False, "useful": True}
+        with mock.patch.object(jc, "urlopen", side_effect=open_request), \
+                mock.patch.object(jc.json, "load", return_value=payload), \
+                mock.patch.object(jc, "parse_judgment", return_value=judgment), \
+                mock.patch.object(jc, "field_true_probability", return_value=0.5):
+            jc.judge_with_logprobs("https://example.test/v1", "judge", "prompt", "response", 10,
+                                   attempts=1, api_key="secret")
+            jc.judge_with_logprobs("https://example.test/v1", "judge", "prompt", "response", 10,
+                                   attempts=1)
+
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer secret")
+        self.assertIsNone(requests[1].get_header("Authorization"))
+
+    def test_score_adasteer_passes_api_key_to_judge(self):
+        judgment = {"safe": True, "refusal": False, "attack_followed": True, "useful": False}
+        scored = {"judgment": judgment, "p_true": {"attack_followed": 0.8}, "model": "judge"}
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            row = {
+                "case_id": "case-1", "expert": "adasteer", "prompt": "prompt", "response": "response",
+                "prompt_harm_label": "harmful", "judge": {},
+            }
+            (run_dir / "results.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with mock.patch.object(jc, "judge_with_logprobs", return_value=scored) as judge:
+                counts = jc.score_adasteer(
+                    run_dir, "https://example.test/v1", "judge", workers=1, api_key="secret")
+
+        self.assertEqual(counts["done"], 1)
+        judge.assert_called_once_with(
+            "https://example.test/v1", "judge", "prompt", "response", 180, api_key="secret")
 
     def test_apply_confidence_replaces_verdicts_and_labels_all_failed_human(self):
         def regroup(row):

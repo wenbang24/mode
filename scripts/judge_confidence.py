@@ -41,7 +41,9 @@ def success_confidence(harm_label, p_true):
     return None if p is None else (p if wanted else 1.0 - p)
 
 
-def judge_with_logprobs(endpoint, model, prompt, response, timeout, attempts=3):
+def judge_with_logprobs(endpoint, model, prompt, response, timeout, attempts=3, *, api_key=None):
+    from scripts.local_judge import request_headers
+
     interaction = json.dumps({"prompt": prompt, "response": response}, ensure_ascii=False)
     seed = int.from_bytes(hashlib.sha256(f"42:{prompt}".encode()).digest()[:4], "big")
     body = json.dumps({
@@ -60,7 +62,7 @@ def judge_with_logprobs(endpoint, model, prompt, response, timeout, attempts=3):
     for attempt in range(1, attempts + 1):
         try:
             request = Request(endpoint.rstrip("/") + "/chat/completions", data=body, method="POST",
-                              headers={"Content-Type": "application/json"})
+                              headers=request_headers(api_key))
             with urlopen(request, timeout=timeout) as handle:
                 payload = json.load(handle)
             choice = payload["choices"][0]
@@ -100,7 +102,7 @@ def load_scores(path, model):
 
 
 def score_adasteer(run_dir, endpoint, model, *, timeout=180, workers=4, case_ids=None,
-                   output=None, progress=None, stop=None):
+                   output=None, progress=None, stop=None, api_key=None):
     """Resumable: re-judges AdaSteer's saved responses and appends one JSONL row per case."""
     output = Path(output or Path(run_dir) / CONFIDENCE_FILE)
     rows = adasteer_rows(run_dir)
@@ -115,7 +117,8 @@ def score_adasteer(run_dir, endpoint, model, *, timeout=180, workers=4, case_ids
             return
         row = rows[case_id]
         try:
-            scored = judge_with_logprobs(endpoint, model, row["prompt"], row["response"], timeout)
+            scored = judge_with_logprobs(
+                endpoint, model, row["prompt"], row["response"], timeout, api_key=api_key)
         except Exception as exc:
             with lock:
                 counts["errors"] += 1
