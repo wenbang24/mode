@@ -27,6 +27,7 @@ DEFAULT_SETTINGS = {
     "max_len": 2048, "weight_decay": 0.01, "warmup_ratio": 0.05,
     "gradient_checkpointing": True, "amp": True,
     "lora_rank": 16, "lora_alpha": 32, "brier_weight": 0.5,
+    "seed": 42,
 }
 
 
@@ -84,7 +85,7 @@ def download_base(cache_dir):
 
 def validate_settings(settings):
     settings = {**DEFAULT_SETTINGS, **settings}
-    for name in ("epochs", "micro_batch", "grad_accum", "max_len", "lora_rank", "lora_alpha"):
+    for name in ("epochs", "micro_batch", "grad_accum", "max_len", "lora_rank", "lora_alpha", "seed"):
         if type(settings[name]) is not int or settings[name] < 1:
             raise ValueError(f"{name} must be a positive integer")
     for name in ("learning_rate", "weight_decay", "warmup_ratio", "brier_weight"):
@@ -263,7 +264,7 @@ def _fit(data_dir, base_dir, directory, settings, device):
     from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, set_seed
 
     settings = validate_settings(settings)
-    set_seed(42)
+    set_seed(settings["seed"])
     tokenizer = AutoTokenizer.from_pretrained(base_dir, local_files_only=True, padding_side="left")
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -299,7 +300,8 @@ def _fit(data_dir, base_dir, directory, settings, device):
         per_device_train_batch_size=settings["micro_batch"], per_device_eval_batch_size=settings["micro_batch"],
         gradient_accumulation_steps=settings["grad_accum"], learning_rate=settings["learning_rate"],
         weight_decay=settings["weight_decay"], warmup_ratio=settings["warmup_ratio"],
-        lr_scheduler_type="cosine", optim="adamw_torch", seed=42, data_seed=42,
+        lr_scheduler_type="cosine", optim="adamw_torch",
+        seed=settings["seed"], data_seed=settings["seed"],
         eval_strategy="epoch", save_strategy="epoch", load_best_model_at_end=True,
         metric_for_best_model="eval_loss", greater_is_better=False, save_total_limit=2,
         gradient_checkpointing=settings["gradient_checkpointing"],
