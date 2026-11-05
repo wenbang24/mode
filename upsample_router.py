@@ -4,6 +4,7 @@
 #     "marimo==0.24.0",
 #     "accelerate>=1.2,<2",
 #     "fsspec>=2024.6",
+#     "gdrive-fsspec",
 #     "pyarrow>=18",
 #     "torch>=2.7",
 #     "peft>=0.17,<0.19",
@@ -80,13 +81,12 @@ def imports():
 
 @app.cell(hide_code=True)
 def drive_filesystem(mo):
-    # Paste the molab gdrive_fsspec cell here. Paths are relative to My Drive root;
-    # use fs.put_file, fs.get_file, fs.ls/fs.exists, and fs.makedirs.
-    fs = None
-    mo.callout(
-        "Drive is not connected. Paste the molab gdrive_fsspec cell here to enable restore and uploads.",
-        kind="warn",
-    )
+    from gdrive_fsspec import GoogleDriveFileSystem
+
+    # Paths are relative to the My Drive root.
+    fs = GoogleDriveFileSystem(use_listings_cache=False, skip_instance_cache=True,
+                               auth_kwargs={"use_local_webserver": False})
+    mo.output.clear_console()
     return (fs,)
 
 
