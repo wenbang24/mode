@@ -368,17 +368,47 @@ class DriveTest(unittest.TestCase):
             self.assertEqual(len(copies), 1)
             self.assertEqual(fs.contents[copies[0]["id"]], b"new")
 
-    def test_finish_step_removes_done_marker_when_upload_fails(self):
-        fs = _FakeMemoryFS()
-        fs.put_error = OSError("upload failed")
-        fs.store_before_error = False
+    def test_finish_step_keeps_done_marker_for_later_upload(self):
+        failed_fs = _FakeMemoryFS()
+        failed_fs.put_error = OSError("upload failed")
+        failed_fs.store_before_error = False
         with tempfile.TemporaryDirectory() as temporary:
             step_dir = Path(temporary) / "step"
             step_dir.mkdir()
+            (step_dir / "progress.jsonl").write_text('{"id": 1}\n', encoding="utf-8")
 
             with self.assertRaisesRegex(OSError, "upload failed"):
-                upsampling.finish_step(step_dir, {"complete": True}, fs, "remote/step")
-            self.assertFalse((step_dir / "done.json").exists())
+                upsampling.finish_step(step_dir, {"complete": True}, failed_fs, "remote/step")
+            self.assertTrue((step_dir / "done.json").is_file())
+
+            working_fs = _FakeMemoryFS()
+            upsampling.ensure_uploaded(working_fs, step_dir, "remote/step")
+
+            self.assertIn("remote/step/progress.jsonl", working_fs.files)
+            self.assertIn("remote/step/done.json", working_fs.files)
+            self.assertTrue(working_fs.put_calls[-1].endswith("/done.json"))
+
+    def test_run_experiment_reuploads_local_done_without_training(self):
+        from scripts import qwen_router
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_root = Path(temporary)
+            run_dir = output_root / "runs" / "B0-seed42"
+            run_dir.mkdir(parents=True)
+            (run_dir / "done.json").write_text("{}", encoding="utf-8")
+            (run_dir / "validation_report.json").write_text("{}", encoding="utf-8")
+            fs = _FakeMemoryFS()
+
+            with mock.patch.object(
+                    qwen_router, "train_router", side_effect=AssertionError("must not retrain")) as train:
+                result = upsampling.run_experiment(
+                    {}, "base", output_root, "B0-seed42", {}, fs=fs,
+                    drive_folder="remote/B0-seed42")
+
+            self.assertTrue(result["skipped"])
+            train.assert_not_called()
+            self.assertIn("remote/B0-seed42/done.json", fs.files)
+            self.assertTrue(fs.put_calls[-1].endswith("/done.json"))
 
     def test_done_marker_upload_order_and_restore_of_complete_or_partial_steps(self):
         if importlib.util.find_spec("fsspec"):
@@ -552,6 +582,7 @@ class _FakeMemoryFS:
         self.copies = []
         self.contents = {}
         self.next_file_id = 0
+        self.put_calls = []
         self.put_error = None
         self.store_before_error = True
 
@@ -559,6 +590,7 @@ class _FakeMemoryFS:
         self.directories.add(path.rstrip("/"))
 
     def put_file(self, source, destination):
+        self.put_calls.append(destination)
         if self.put_error is not None and not self.store_before_error:
             raise self.put_error
         content = Path(source).read_bytes()

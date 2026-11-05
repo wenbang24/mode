@@ -577,15 +577,18 @@ def drive_done(fs, remote_folder):
     return bool(fs is not None and fs.exists(_remote_join(remote_folder, "done.json")))
 
 
+def ensure_uploaded(fs, step_dir, drive_folder):
+    """Re-upload a locally finished step whose Drive copy is missing done.json."""
+    if (fs is not None and drive_folder and (Path(step_dir) / "done.json").is_file()
+            and not drive_done(fs, drive_folder)):
+        upload_tree(fs, step_dir, drive_folder)
+
+
 def finish_step(step_dir, metadata, fs=None, drive_folder=None):
     step_dir = Path(step_dir)
     write_json(step_dir / "done.json", metadata)
     if fs is not None and drive_folder:
-        try:
-            upload_tree(fs, step_dir, drive_folder)
-        except Exception:
-            (step_dir / "done.json").unlink(missing_ok=True)
-            raise
+        upload_tree(fs, step_dir, drive_folder)
     return step_dir
 
 
@@ -600,6 +603,7 @@ def run_folds(prepared, base_dir, output_root, settings, device="auto", *, fs=No
     root.mkdir(parents=True, exist_ok=True)
     done_path = root / "done.json"
     if done_path.is_file():
+        ensure_uploaded(fs, root, drive_root)
         return {"directory": str(root), "skipped": True}
     train_cases = json.loads((prep_dir / "train_cases.json").read_text(encoding="utf-8"))
     ids_by_prompt = {normalize_prompt(case["prompt"]): case["case_id"] for case in train_cases}
@@ -907,6 +911,7 @@ def run_experiment(prepared, base_dir, output_root, run_name, settings, device="
     marker = run_dir / "done.json"
     remote_complete = bool(drive_folder and drive_done(fs, drive_folder))
     if marker.is_file() or remote_complete:
+        ensure_uploaded(fs, run_dir, drive_folder)
         if test_run_dir and test_parquet and not (run_dir / "test_report.json").is_file():
             checkpoint = run_dir / "checkpoint"
             if not checkpoint.is_dir():
