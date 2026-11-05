@@ -446,13 +446,20 @@ def _excluded_path(relative):
 
 
 def _put_file(fs, local_path, remote_path):
-    if fs.exists(remote_path):
-        fs.rm_file(remote_path)
+    parent = remote_path.rsplit("/", 1)[0]
+
+    def copies():
+        return [entry for entry in fs.ls(parent, detail=True) if entry["name"] == remote_path]
+
+    old_ids = {entry["id"] for entry in copies()} if fs.exists(remote_path) else set()
     try:
         fs.put_file(str(local_path), remote_path)
     except KeyError:
-        if int(fs.info(remote_path)["size"]) != Path(local_path).stat().st_size:
+        size = Path(local_path).stat().st_size
+        if not any(entry["id"] not in old_ids and int(entry["size"]) == size for entry in copies()):
             raise
+    for file_id in old_ids:
+        fs.rm_file(remote_path, file_id=file_id)
 
 
 def upload_tree(fs, local_dir, remote_dir):
