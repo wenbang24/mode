@@ -445,6 +445,16 @@ def _excluded_path(relative):
     return any(part in {"checkpoint", "checkpoints", "epochs"} for part in Path(relative).parts)
 
 
+def _put_file(fs, local_path, remote_path):
+    if fs.exists(remote_path):
+        fs.rm_file(remote_path)
+    try:
+        fs.put_file(str(local_path), remote_path)
+    except KeyError:
+        if int(fs.info(remote_path)["size"]) != Path(local_path).stat().st_size:
+            raise
+
+
 def upload_tree(fs, local_dir, remote_dir):
     if fs is None:
         return False
@@ -461,7 +471,7 @@ def upload_tree(fs, local_dir, remote_dir):
         relative = path.relative_to(local_dir).as_posix()
         destination = _remote_join(remote_dir, relative)
         fs.makedirs(str(Path(destination).parent).replace("\\", "/"), exist_ok=True)
-        fs.put_file(str(path), destination)
+        _put_file(fs, path, destination)
     return True
 
 
@@ -471,7 +481,7 @@ def upload_progress_file(fs, local_path, local_root, remote_root):
     relative = Path(local_path).relative_to(local_root).as_posix()
     destination = _remote_join(remote_root, relative)
     fs.makedirs(str(Path(destination).parent).replace("\\", "/"), exist_ok=True)
-    fs.put_file(str(local_path), destination)
+    _put_file(fs, local_path, destination)
     return True
 
 
@@ -564,7 +574,11 @@ def finish_step(step_dir, metadata, fs=None, drive_folder=None):
     step_dir = Path(step_dir)
     write_json(step_dir / "done.json", metadata)
     if fs is not None and drive_folder:
-        upload_tree(fs, step_dir, drive_folder)
+        try:
+            upload_tree(fs, step_dir, drive_folder)
+        except Exception:
+            (step_dir / "done.json").unlink(missing_ok=True)
+            raise
     return step_dir
 
 
@@ -871,7 +885,7 @@ def upload_json_reports(fs, local_dir, remote_dir):
         relative = path.relative_to(local_dir).as_posix()
         destination = _remote_join(remote_dir, relative)
         fs.makedirs(str(Path(destination).parent).replace("\\", "/"), exist_ok=True)
-        fs.put_file(str(path), destination)
+        _put_file(fs, path, destination)
     return True
 
 
