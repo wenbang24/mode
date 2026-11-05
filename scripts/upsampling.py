@@ -597,6 +597,7 @@ def run_folds(prepared, base_dir, output_root, settings, device="auto", *, fs=No
     from scripts import qwen_router
     from scripts.laya_router import fingerprint
 
+    device = qwen_router.resolve_device(device)
     prep_dir = Path(prepared["directory"])
     prep_name = prep_dir.name
     root = Path(output_root).expanduser().resolve() / "upsampling" / prep_name / "folds"
