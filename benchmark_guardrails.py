@@ -81,6 +81,7 @@ def imports():
     RESPONDER_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
     DATASET_KEYS = {
         "Aegis unseen 10,000": "aegis",
+        "Aegis generated cases": "aegis",
         "WildGuard": "wildguard",
         "Aegis 2.0": "aegis",
     }
@@ -137,7 +138,7 @@ def imports():
 
 
 @app.cell
-def dataset_selector(DATASET_KEYS, GUARDRAIL_OPTIONS, mo):
+def dataset_selector(DATASET_KEYS, GUARDRAIL_OPTIONS, WORKSPACE, mo):
     test_set = mo.ui.dropdown(
         options=list(DATASET_KEYS),
         value="Aegis unseen 10,000",
@@ -148,8 +149,18 @@ def dataset_selector(DATASET_KEYS, GUARDRAIL_OPTIONS, mo):
         value=list(GUARDRAIL_OPTIONS),
         label="Guardrails to benchmark",
     )
-    mo.vstack([test_set, guardrails])
-    return guardrails, test_set
+    generated_parquet = mo.ui.text(
+        value=str(WORKSPACE / "generated.parquet"),
+        label="Generated cases Parquet (used only for Aegis generated cases)",
+        full_width=True,
+    )
+    target_rule = mo.ui.dropdown(
+        options=["fastest_successful", "most_confident_successful"],
+        value="fastest_successful",
+        label="Route target rule",
+    )
+    mo.vstack([test_set, generated_parquet, target_rule, guardrails])
+    return generated_parquet, guardrails, target_rule, test_set
 
 
 @app.cell(hide_code=True)
@@ -528,10 +539,15 @@ def benchmark_helpers(
         output_root,
         server_settings,
         request_timeout,
+        generated_path=None,
+        target_rule="fastest_successful",
     ):
         dataset = DATASET_KEYS[test_set]
-        data_split = "unseen" if test_set == "Aegis unseen 10,000" else "test"
-        split_key = "aegis_unseen" if data_split == "unseen" else dataset
+        if target_rule not in {"fastest_successful", "most_confident_successful"}:
+            raise ValueError(f"Unknown target rule: {target_rule!r}")
+        is_generated = test_set == "Aegis generated cases"
+        data_split = "generated" if is_generated else "unseen" if test_set == "Aegis unseen 10,000" else "test"
+        split_key = "aegis_generated" if is_generated else "aegis_unseen" if data_split == "unseen" else dataset
         selected_guardrails = tuple(
             method for method in GUARDRAIL_OPTIONS.values()
             if method in selected_guardrails
@@ -540,22 +556,42 @@ def benchmark_helpers(
             raise ValueError("Select at least one guardrail to benchmark")
         has_adasteer = "adasteer" in selected_guardrails
         validated_tests = {}
-        # Canonical prompts are optional for unseen runs; use their pinned hash if absent.
         canonical_path = WORKSPACE / DATASET_FILES[dataset][0]
-        required_splits = (
-            (split_key, dataset)
-            if has_adasteer and canonical_path.is_file() else (split_key,)
-        )
-        for name in dict.fromkeys(required_splits):
-            test_name, expected_count = DATASET_FILES[name]
-            path = WORKSPACE / test_name
-            rows = read_cases(path, expected_rows=expected_count)
-            validated_tests[name] = {
+        if is_generated:
+            if not generated_path or not Path(generated_path).expanduser().is_file():
+                raise ValueError("Choose the generated cases Parquet file")
+            path = Path(generated_path).expanduser().resolve()
+            rows = read_cases(path, expected_rows=None)
+            validated_tests[split_key] = {
                 "path": path,
                 "cases": rows,
                 "rows": len(rows),
                 "sha256": sha256_file(path),
             }
+            if has_adasteer and canonical_path.is_file():
+                canonical_rows = read_cases(canonical_path, expected_rows=DATASET_FILES[dataset][1])
+                validated_tests[dataset] = {
+                    "path": canonical_path,
+                    "cases": canonical_rows,
+                    "rows": len(canonical_rows),
+                    "sha256": sha256_file(canonical_path),
+                }
+        else:
+            # Canonical prompts are optional for unseen runs; use their pinned hash if absent.
+            required_splits = (
+                (split_key, dataset)
+                if has_adasteer and canonical_path.is_file() else (split_key,)
+            )
+            for name in dict.fromkeys(required_splits):
+                test_name, expected_count = DATASET_FILES[name]
+                path = WORKSPACE / test_name
+                rows = read_cases(path, expected_rows=expected_count)
+                validated_tests[name] = {
+                    "path": path,
+                    "cases": rows,
+                    "rows": len(rows),
+                    "sha256": sha256_file(path),
+                }
         test_path = validated_tests[split_key]["path"]
         cases = validated_tests[split_key]["cases"]
         test_hash = validated_tests[split_key]["sha256"]
@@ -632,6 +668,7 @@ def benchmark_helpers(
             "schema_version": 4,
             "dataset": dataset,
             "data_split": data_split,
+            "target_rule": target_rule,
             "data_file": test_path.name,
             "selected_guardrails": list(selected_guardrails),
             "test_sha256": test_hash,
@@ -1368,6 +1405,7 @@ def prepare_source_action(
 def preflight_action(
     GUARDRAIL_OPTIONS,
     adasteer_path,
+    generated_parquet,
     guardrails,
     guardagent_path,
     get_server_status,
@@ -1381,6 +1419,7 @@ def preflight_action(
     request_timeout,
     server_settings,
     test_set,
+    target_rule,
 ):
     preflight_data = None
     if preflight_button.value:
@@ -1397,6 +1436,8 @@ def preflight_action(
                 output_root=output_root.value,
                 server_settings=server_settings.value,
                 request_timeout=positive_timeout(request_timeout.value),
+                generated_path=generated_parquet.value,
+                target_rule=target_rule.value,
             )
             _status = (
                 get_server_status()
@@ -1448,6 +1489,7 @@ def run_action(
     guardrails,
     get_server_status,
     guardagent_path,
+    generated_parquet,
     json,
     local_server,
     mo,
@@ -1461,6 +1503,7 @@ def run_action(
     server_settings,
     smoke_button,
     test_set,
+    target_rule,
 ):
     benchmark_result = None
     if smoke_button.value or full_run_button.value:
@@ -1478,6 +1521,8 @@ def run_action(
                 output_root=output_root.value,
                 server_settings=server_settings.value,
                 request_timeout=positive_timeout(request_timeout.value),
+                generated_path=generated_parquet.value,
+                target_rule=target_rule.value,
             )
             if mode == "full" and "adasteer" in run["selected_guardrails"]:
                 state = get_server_status()

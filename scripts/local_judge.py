@@ -173,12 +173,12 @@ class LocalJudgeServer:
         return self.status()
 
 
-def server_panel(mo, server, tool_call_parser=None):
+def server_panel(mo, server, tool_call_parser=None, *, model=DEFAULT_LOCAL_MODEL, gpu_memory=0.5):
     """Callbacks own process actions; reactive notebook evaluation only reads state."""
     fields = {
-        "model": mo.ui.text(value=DEFAULT_LOCAL_MODEL, label="Local Hugging Face model ID or path"),
+        "model": mo.ui.text(value=model, label="Local Hugging Face model ID or path"),
         "port": mo.ui.number(start=1, stop=65535, value=8000, step=1, label="Port"),
-        "gpu_memory": mo.ui.number(start=0.05, stop=0.95, value=0.5, step=0.05, label="GPU memory fraction"),
+        "gpu_memory": mo.ui.number(start=0.05, stop=0.95, value=gpu_memory, step=0.05, label="GPU memory fraction"),
         "context_length": mo.ui.number(start=1, value=8192, step=1, label="Context length"),
     }
     if tool_call_parser is not None:

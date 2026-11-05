@@ -191,6 +191,31 @@ class RouterDataTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "schema 4"):
             self.load()
 
+    def test_generated_split_accepts_arbitrary_case_count_and_confidence_rule(self):
+        make_benchmark(self.run, self.cases, self.parquet, split="generated")
+        manifest = json.loads((self.run / "run_config.json").read_text())
+        manifest["target_rule"] = "most_confident_successful"
+        manifest.pop("run_fingerprint")
+        manifest["run_fingerprint"] = lr.fingerprint(manifest)
+        lr.write_json(self.run / "run_config.json", manifest)
+        rows = []
+        for case in self.cases:
+            for expert in lr.EXPERTS:
+                rows.append({
+                    **case,
+                    "dataset": "aegis",
+                    "expert": expert,
+                    "run_fingerprint": manifest["run_fingerprint"],
+                    "error": None,
+                    "succeeded": expert == "piguard",
+                    "guardrail_seconds": 1.0,
+                    "judge_confidence": 0.9 if expert == "piguard" else 0.1,
+                })
+        write_results(self.run, rows)
+        result = lr.load_benchmark(self.run, self.parquet, expected_rows=None, split="generated")
+        self.assertEqual(len(result.cases), len(self.cases))
+        self.assertEqual(set(result.targets.values()), {"piguard"})
+
     def test_preparation_preserves_all_failed_validation_and_only_prompt_inputs(self):
         self.rows[0]["succeeded"] = False
         write_results(self.run, self.rows)

@@ -18,7 +18,8 @@ class DataContractTest(unittest.TestCase):
     def test_settings_and_soft_target_validation(self):
         self.assertEqual(qr.validate_settings({}), qr.DEFAULT_SETTINGS)
         for key, value in (("lora_rank", 0), ("lora_alpha", True), ("brier_weight", -1),
-                           ("learning_rate", float("nan")), ("max_len", 0), ("amp", "yes")):
+                           ("learning_rate", float("nan")), ("max_len", 0), ("amp", "yes"),
+                           ("seed", True), ("seed", 1.5)):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 qr.validate_settings({key: value})
         row = {"expected": {"expert": "piguard"}}
@@ -124,6 +125,7 @@ class TinyQwenTest(unittest.TestCase):
         row = {"state": "hello " * 1000, "expected": {"expert": "piguard"}, "weight": 0.5}
         encoded = qr.encode_rows([row], self.tokenizer, 256, augment=True)
         self.assertEqual(len(encoded), 4)
+        self.assertEqual({item["weight"] for item in encoded}, {0.5})
         self.assertEqual([sum(item["labels"][i] for item in encoded) for i in range(4)], [1, 1, 1, 1])
         self.assertTrue(all(len(item["input_ids"]) == 256 for item in encoded))
         for item in encoded:

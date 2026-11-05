@@ -143,6 +143,8 @@ def load_benchmark(run_dir, parquet_path, *, expected_rows, split):
     if run_fingerprint != fingerprint(config):
         raise ValueError("Benchmark run_config.json fingerprint is invalid")
     version = manifest.get("schema_version")
+    if split not in {"test", "unseen", "generated"}:
+        raise ValueError(f"Unsupported Aegis benchmark split: {split!r}")
     if version not in (3, 4) or (version == 3 and split != "test"):
         raise ValueError("Unseen supervision requires benchmark schema 4; test results support schemas 3 and 4")
     if manifest.get("dataset") != "aegis" or manifest.get("data_split", "test") != split:
