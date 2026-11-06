@@ -445,6 +445,25 @@ def _excluded_path(relative):
     return any(part in {"checkpoint", "checkpoints", "epochs"} for part in Path(relative).parts)
 
 
+def _put_file(fs, local_path, remote_path):
+    parent = remote_path.rsplit("/", 1)[0]
+    size = Path(local_path).stat().st_size
+
+    def copies():
+        return [entry for entry in fs.ls(parent, detail=True) if entry["name"] == remote_path]
+
+    old_ids = {entry["id"] for entry in copies()} if fs.exists(remote_path) else set()
+    try:
+        # One final chunk: gdrive_fsspec 0.4.1 silently drops unaligned non-final chunks.
+        fs.put_file(str(local_path), remote_path, block_size=size + 1)
+    except KeyError:
+        pass  # gdrive_fsspec 0.4.1 raises after the upload lands when the listings cache is off
+    if not any(entry["id"] not in old_ids and int(entry["size"]) == size for entry in copies()):
+        raise OSError(f"Drive upload did not land: {remote_path}")
+    for file_id in old_ids:
+        fs.rm_file(remote_path, file_id=file_id)
+
+
 def upload_tree(fs, local_dir, remote_dir):
     if fs is None:
         return False
@@ -461,7 +480,7 @@ def upload_tree(fs, local_dir, remote_dir):
         relative = path.relative_to(local_dir).as_posix()
         destination = _remote_join(remote_dir, relative)
         fs.makedirs(str(Path(destination).parent).replace("\\", "/"), exist_ok=True)
-        fs.put_file(str(path), destination)
+        _put_file(fs, path, destination)
     return True
 
 
@@ -471,7 +490,7 @@ def upload_progress_file(fs, local_path, local_root, remote_root):
     relative = Path(local_path).relative_to(local_root).as_posix()
     destination = _remote_join(remote_root, relative)
     fs.makedirs(str(Path(destination).parent).replace("\\", "/"), exist_ok=True)
-    fs.put_file(str(local_path), destination)
+    _put_file(fs, local_path, destination)
     return True
 
 
@@ -560,6 +579,13 @@ def drive_done(fs, remote_folder):
     return bool(fs is not None and fs.exists(_remote_join(remote_folder, "done.json")))
 
 
+def ensure_uploaded(fs, step_dir, drive_folder):
+    """Re-upload a locally finished step whose Drive copy is missing done.json."""
+    if (fs is not None and drive_folder and (Path(step_dir) / "done.json").is_file()
+            and not drive_done(fs, drive_folder)):
+        upload_tree(fs, step_dir, drive_folder)
+
+
 def finish_step(step_dir, metadata, fs=None, drive_folder=None):
     step_dir = Path(step_dir)
     write_json(step_dir / "done.json", metadata)
@@ -573,12 +599,14 @@ def run_folds(prepared, base_dir, output_root, settings, device="auto", *, fs=No
     from scripts import qwen_router
     from scripts.laya_router import fingerprint
 
+    device = qwen_router.resolve_device(device)
     prep_dir = Path(prepared["directory"])
     prep_name = prep_dir.name
     root = Path(output_root).expanduser().resolve() / "upsampling" / prep_name / "folds"
     root.mkdir(parents=True, exist_ok=True)
     done_path = root / "done.json"
     if done_path.is_file():
+        ensure_uploaded(fs, root, drive_root)
         return {"directory": str(root), "skipped": True}
     train_cases = json.loads((prep_dir / "train_cases.json").read_text(encoding="utf-8"))
     ids_by_prompt = {normalize_prompt(case["prompt"]): case["case_id"] for case in train_cases}
@@ -871,7 +899,7 @@ def upload_json_reports(fs, local_dir, remote_dir):
         relative = path.relative_to(local_dir).as_posix()
         destination = _remote_join(remote_dir, relative)
         fs.makedirs(str(Path(destination).parent).replace("\\", "/"), exist_ok=True)
-        fs.put_file(str(path), destination)
+        _put_file(fs, path, destination)
     return True
 
 
@@ -886,6 +914,7 @@ def run_experiment(prepared, base_dir, output_root, run_name, settings, device="
     marker = run_dir / "done.json"
     remote_complete = bool(drive_folder and drive_done(fs, drive_folder))
     if marker.is_file() or remote_complete:
+        ensure_uploaded(fs, run_dir, drive_folder)
         if test_run_dir and test_parquet and not (run_dir / "test_report.json").is_file():
             checkpoint = run_dir / "checkpoint"
             if not checkpoint.is_dir():

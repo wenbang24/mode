@@ -207,6 +207,7 @@ def prepare_action(
             _drive_dir = f"MoDE/upsampling/{_prep_name}/prepare"
             _prepared_metadata = _step_dir / "prepared.json"
             if (_step_dir / "done.json").is_file() and _prepared_metadata.is_file():
+                upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
                 _stored = json.loads(_prepared_metadata.read_text())
                 _prepared_dir = Path(_stored["directory"])
                 if not _prepared_dir.is_dir():
@@ -274,6 +275,7 @@ def base_checkpoint_action(
             _metadata_path = _step_dir / "base.json"
             if (_step_dir / "done.json").is_file() and _metadata_path.is_file() and Path(
                     json.loads(_metadata_path.read_text())["directory"]).is_dir():
+                upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
                 downloaded_base = json.loads(_metadata_path.read_text())["directory"]
             else:
                 downloaded_base = qwen_router.download_base(Path(output_control.value) / "cache")
@@ -429,6 +431,7 @@ def categories_action(
             _step_dir = Path(output_control.value) / "upsampling" / _prep_name / "categories"
             _drive_dir = f"MoDE/upsampling/{_prep_name}/categories"
             if (_step_dir / "done.json").is_file():
+                upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
                 category_report = json.loads((_step_dir / "done.json").read_text())
             else:
                 if judge_config.get("error"):
@@ -515,6 +518,8 @@ def balance_action(
             _step_dir = Path(output_control.value) / "upsampling" / _prep_name / "balance"
             _balance_path = _step_dir / "balance.json"
             if (_step_dir / "done.json").is_file() and _balance_path.is_file():
+                upsampling.ensure_uploaded(
+                    fs, _step_dir, f"MoDE/upsampling/{_prep_name}/balance")
                 balance_report = json.loads(_balance_path.read_text())
             else:
                 _categories_dir = Path(output_control.value) / "upsampling" / _prep_name / "categories"
@@ -596,6 +601,7 @@ def generate_action(
             _step_dir = _root / "generate"
             _drive_dir = f"MoDE/upsampling/{_prep_name}/generate"
             if (_step_dir / "done.json").is_file():
+                upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
                 generated_rows = upsampling.read_jsonl(_step_dir / "deduped.jsonl")
             else:
                 _category_rows = upsampling.read_jsonl(_root / "categories/train_categories.jsonl")
@@ -703,6 +709,8 @@ def check_action(
                     "judge_passed": sum(row["passed"] for row in _checked),
                     "generated_parquet": str(checked_parquet),
                 }, fs, _drive_dir)
+            else:
+                upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
             _view = mo.vstack([
                 mo.callout(f"Generated benchmark input: {checked_parquet}", kind="success"),
                 mo.md("Run `benchmark_guardrails.py` manually on this parquet with **all three experts** and `target_rule=most_confident_successful`. Then paste the completed run directory in step 8."),
@@ -817,6 +825,7 @@ def import_action(
             _drive_dir = f"MoDE/upsampling/{_prep_name}/import"
             _generated_parquet = _root / "check/generated.parquet"
             if (_step_dir / "done.json").is_file():
+                upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
                 import_report = json.loads((_step_dir / "done.json").read_text())
             else:
                 _run_dir = Path(benchmark_run_control.value).expanduser().resolve()
@@ -1010,6 +1019,8 @@ def summary_action(
             _summary_dir = _root / "summary"
             _summary_path = _summary_dir / "summary.json"
             if (_summary_dir / "done.json").is_file() and _summary_path.is_file():
+                upsampling.ensure_uploaded(
+                    fs, _summary_dir, f"MoDE/upsampling/{_prep_name}/summary")
                 summary_report = json.loads(_summary_path.read_text())
             else:
                 _validation_entries = json.loads(

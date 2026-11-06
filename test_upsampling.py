@@ -1,5 +1,4 @@
 """Offline contract tests for router up-sampling helpers."""
-import importlib.util
 import io
 import json
 import math
@@ -291,13 +290,159 @@ class GenerationTest(unittest.TestCase):
 
 
 class DriveTest(unittest.TestCase):
-    def test_done_marker_upload_order_and_restore_of_complete_or_partial_steps(self):
-        if importlib.util.find_spec("fsspec"):
-            import fsspec
+    def test_upload_tree_uses_single_chunk_larger_than_file(self):
+        fs = _FakeMemoryFS()
+        with tempfile.TemporaryDirectory() as temporary:
+            upload_dir = Path(temporary) / "upload"
+            upload_dir.mkdir()
+            file_path = upload_dir / "result.json"
+            file_path.write_bytes(b"uploaded content")
 
-            fs = fsspec.filesystem("memory")
-        else:
+            self.assertTrue(upsampling.upload_tree(fs, upload_dir, "remote/step"))
+
+            self.assertEqual(fs.put_kwargs[-1]["block_size"], file_path.stat().st_size + 1)
+
+    def test_upload_tree_keyerror_after_store_keeps_only_new_copy(self):
+        fs = _FakeMemoryFS()
+        with tempfile.TemporaryDirectory() as temporary:
+            local_dir = Path(temporary)
+            upload_dir = local_dir / "upload"
+            upload_dir.mkdir()
+            old_path = local_dir / "old.json"
+            old_path.write_bytes(b"old")
+            fs.put_file(old_path, "remote/step/result.json")
+            (upload_dir / "result.json").write_bytes(b"new")
+            fs.put_error = KeyError("directory cache")
+
+            self.assertTrue(upsampling.upload_tree(fs, upload_dir, "remote/step"))
+            copies = [entry for entry in fs.ls("remote/step", detail=True)
+                      if entry["name"] == "remote/step/result.json"]
+            self.assertEqual(len(copies), 1)
+            self.assertEqual(fs.contents[copies[0]["id"]], b"new")
+
+    def test_upload_tree_keyerror_without_store_keeps_old_copy_and_propagates(self):
+        fs = _FakeMemoryFS()
+        with tempfile.TemporaryDirectory() as temporary:
+            local_dir = Path(temporary)
+            upload_dir = local_dir / "upload"
+            upload_dir.mkdir()
+            old_path = local_dir / "old.json"
+            old_path.write_bytes(b"old")
+            fs.put_file(old_path, "remote/step/result.json")
+            (upload_dir / "result.json").write_bytes(b"new")
+            fs.put_error = KeyError("directory cache")
+            fs.store_before_error = False
+
+            with self.assertRaisesRegex(OSError, "Drive upload did not land"):
+                upsampling.upload_tree(fs, upload_dir, "remote/step")
+            copies = [entry for entry in fs.ls("remote/step", detail=True)
+                      if entry["name"] == "remote/step/result.json"]
+            self.assertEqual(len(copies), 1)
+            self.assertEqual(fs.contents[copies[0]["id"]], b"old")
+
+    def test_upload_tree_silent_loss_raises_and_preserves_old_copy(self):
+        fs = _FakeMemoryFS()
+        with tempfile.TemporaryDirectory() as temporary:
+            local_dir = Path(temporary)
+            upload_dir = local_dir / "upload"
+            upload_dir.mkdir()
+            old_path = local_dir / "old.json"
+            old_path.write_bytes(b"old")
+            fs.put_file(old_path, "remote/step/result.json")
+            (upload_dir / "result.json").write_bytes(b"new")
+            fs.silent_loss = True
+
+            with self.assertRaisesRegex(OSError, "Drive upload did not land"):
+                upsampling.upload_tree(fs, upload_dir, "remote/step")
+
+            copies = [entry for entry in fs.ls("remote/step", detail=True)
+                      if entry["name"] == "remote/step/result.json"]
+            self.assertEqual(len(copies), 1)
+            self.assertEqual(fs.contents[copies[0]["id"]], b"old")
+
+    def test_upload_tree_oserror_preserves_old_copy(self):
+        fs = _FakeMemoryFS()
+        with tempfile.TemporaryDirectory() as temporary:
+            local_dir = Path(temporary)
+            upload_dir = local_dir / "upload"
+            upload_dir.mkdir()
+            old_path = local_dir / "old.json"
+            old_path.write_bytes(b"old")
+            fs.put_file(old_path, "remote/step/result.json")
+            (upload_dir / "result.json").write_bytes(b"new")
+            fs.put_error = OSError("upload failed")
+            fs.store_before_error = False
+
+            with self.assertRaisesRegex(OSError, "upload failed"):
+                upsampling.upload_tree(fs, upload_dir, "remote/step")
+
+            copies = [entry for entry in fs.ls("remote/step", detail=True)
+                      if entry["name"] == "remote/step/result.json"]
+            self.assertEqual(len(copies), 1)
+            self.assertEqual(fs.contents[copies[0]["id"]], b"old")
+
+    def test_upload_tree_success_replaces_remote_copy(self):
+        fs = _FakeMemoryFS()
+        with tempfile.TemporaryDirectory() as temporary:
+            local_dir = Path(temporary)
+            upload_dir = local_dir / "upload"
+            upload_dir.mkdir()
+            old_path = local_dir / "old.json"
+            old_path.write_bytes(b"old")
+            fs.put_file(old_path, "remote/step/result.json")
+            (upload_dir / "result.json").write_bytes(b"new")
+
+            upsampling.upload_tree(fs, upload_dir, "remote/step")
+
+            copies = [entry for entry in fs.ls("remote/step", detail=True)
+                      if entry["name"] == "remote/step/result.json"]
+            self.assertEqual(len(copies), 1)
+            self.assertEqual(fs.contents[copies[0]["id"]], b"new")
+
+    def test_finish_step_keeps_done_marker_for_later_upload(self):
+        failed_fs = _FakeMemoryFS()
+        failed_fs.put_error = OSError("upload failed")
+        failed_fs.store_before_error = False
+        with tempfile.TemporaryDirectory() as temporary:
+            step_dir = Path(temporary) / "step"
+            step_dir.mkdir()
+            (step_dir / "progress.jsonl").write_text('{"id": 1}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(OSError, "upload failed"):
+                upsampling.finish_step(step_dir, {"complete": True}, failed_fs, "remote/step")
+            self.assertTrue((step_dir / "done.json").is_file())
+
+            working_fs = _FakeMemoryFS()
+            upsampling.ensure_uploaded(working_fs, step_dir, "remote/step")
+
+            self.assertIn("remote/step/progress.jsonl", working_fs.files)
+            self.assertIn("remote/step/done.json", working_fs.files)
+            self.assertTrue(working_fs.put_calls[-1].endswith("/done.json"))
+
+    def test_run_experiment_reuploads_local_done_without_training(self):
+        from scripts import qwen_router
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output_root = Path(temporary)
+            run_dir = output_root / "runs" / "B0-seed42"
+            run_dir.mkdir(parents=True)
+            (run_dir / "done.json").write_text("{}", encoding="utf-8")
+            (run_dir / "validation_report.json").write_text("{}", encoding="utf-8")
             fs = _FakeMemoryFS()
+
+            with mock.patch.object(
+                    qwen_router, "train_router", side_effect=AssertionError("must not retrain")) as train:
+                result = upsampling.run_experiment(
+                    {}, "base", output_root, "B0-seed42", {}, fs=fs,
+                    drive_folder="remote/B0-seed42")
+
+            self.assertTrue(result["skipped"])
+            train.assert_not_called()
+            self.assertIn("remote/B0-seed42/done.json", fs.files)
+            self.assertTrue(fs.put_calls[-1].endswith("/done.json"))
+
+    def test_done_marker_upload_order_and_restore_of_complete_or_partial_steps(self):
+        fs = _FakeMemoryFS()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             completed = root / "completed"
@@ -310,9 +455,9 @@ class DriveTest(unittest.TestCase):
             upload_order = []
             put_file = fs.put_file
 
-            def track_upload(source, destination):
+            def track_upload(source, destination, **kwargs):
                 upload_order.append(destination)
-                put_file(source, destination)
+                put_file(source, destination, **kwargs)
 
             fs.put_file = track_upload
             upsampling.finish_step(completed, {"complete": True}, fs, "MoDE/upsampling/prep/completed")
@@ -460,14 +605,52 @@ class _FakeMemoryFS:
     def __init__(self):
         self.files = {}
         self.directories = set()
+        self.copies = []
+        self.contents = {}
+        self.next_file_id = 0
+        self.put_calls = []
+        self.put_kwargs = []
+        self.put_error = None
+        self.store_before_error = True
+        self.silent_loss = False
 
     def makedirs(self, path, exist_ok=False):
         self.directories.add(path.rstrip("/"))
 
-    def put_file(self, source, destination):
-        self.files[destination] = Path(source).read_bytes()
+    def put_file(self, source, destination, **kwargs):
+        self.put_calls.append(destination)
+        self.put_kwargs.append(kwargs)
+        if self.silent_loss:
+            return
+        if self.put_error is not None and not self.store_before_error:
+            raise self.put_error
+        content = Path(source).read_bytes()
+        file_id = f"file-{self.next_file_id}"
+        self.next_file_id += 1
+        self.copies.append({"name": destination, "id": file_id, "size": len(content)})
+        self.contents[file_id] = content
+        self.files[destination] = content
         parent = destination.rsplit("/", 1)[0] if "/" in destination else ""
         self.makedirs(parent, exist_ok=True)
+        if self.put_error is not None:
+            raise self.put_error
+
+    def rm_file(self, path, file_id=None):
+        removed = [entry for entry in self.copies
+                   if entry["name"] == path and (file_id is None or entry["id"] == file_id)]
+        for entry in removed:
+            self.copies.remove(entry)
+            self.contents.pop(entry["id"], None)
+        remaining = [entry for entry in self.copies if entry["name"] == path]
+        if remaining:
+            self.files[path] = self.contents[remaining[-1]["id"]]
+        else:
+            self.files.pop(path, None)
+
+    def info(self, path):
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return {"size": len(self.files[path])}
 
     def get_file(self, source, destination):
         Path(destination).write_bytes(self.files[source])
@@ -487,7 +670,20 @@ class _FakeMemoryFS:
                 remainder = name[len(prefix):]
                 if remainder:
                     children.add(prefix + remainder.split("/", 1)[0])
-        return sorted(children)
+        if not detail:
+            return sorted(children)
+        result = []
+        for child in sorted(children):
+            if "/" in child[len(prefix):]:
+                result.append({"name": child, "type": "directory"})
+            elif child in self.files:
+                copies = [entry for entry in self.copies if entry["name"] == child]
+                result.extend(copies or [{
+                    "name": child, "id": f"direct:{child}", "size": len(self.files[child]),
+                }])
+            else:
+                result.append({"name": child, "type": "directory"})
+        return result
 
 
 if __name__ == "__main__":
