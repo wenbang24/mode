@@ -447,17 +447,19 @@ def _excluded_path(relative):
 
 def _put_file(fs, local_path, remote_path):
     parent = remote_path.rsplit("/", 1)[0]
+    size = Path(local_path).stat().st_size
 
     def copies():
         return [entry for entry in fs.ls(parent, detail=True) if entry["name"] == remote_path]
 
     old_ids = {entry["id"] for entry in copies()} if fs.exists(remote_path) else set()
     try:
-        fs.put_file(str(local_path), remote_path)
+        # One final chunk: gdrive_fsspec 0.4.1 silently drops unaligned non-final chunks.
+        fs.put_file(str(local_path), remote_path, block_size=size + 1)
     except KeyError:
-        size = Path(local_path).stat().st_size
-        if not any(entry["id"] not in old_ids and int(entry["size"]) == size for entry in copies()):
-            raise
+        pass  # gdrive_fsspec 0.4.1 raises after the upload lands when the listings cache is off
+    if not any(entry["id"] not in old_ids and int(entry["size"]) == size for entry in copies()):
+        raise OSError(f"Drive upload did not land: {remote_path}")
     for file_id in old_ids:
         fs.rm_file(remote_path, file_id=file_id)
 
