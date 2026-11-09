@@ -261,6 +261,12 @@ def choose_few_shot(rows, route, category, difficulty, request_index, maximum=5,
                  and row.get("difficulty") != difficulty and row not in selected]
         rng.shuffle(other)
         selected.extend(other[:maximum - len(selected)])
+    if selected and len(selected) < maximum:
+        label = Counter(row["prompt_harm_label"] for row in selected).most_common(1)[0][0]
+        padding = [row for row in rows if row.get("target") == route and row.get("category") != category
+                   and row["prompt_harm_label"] == label]
+        rng.shuffle(padding)
+        selected.extend(padding[:maximum - len(selected)])
     return selected
 
 
@@ -326,6 +332,7 @@ def generation_prompt(request, examples):
         row = examples_by_id[case_id]
         snippets.append({
             "harm_label": row["prompt_harm_label"],
+            "category": row.get("category"),
             "prompt": row["prompt"][:1500],
         })
     payload = {
