@@ -163,6 +163,7 @@ class PIGuardArtifact:
         device: str | None = None,
     ):
         import torch
+        import transformers
         from transformers import AutoModel, AutoTokenizer
 
         self.torch = torch
@@ -183,8 +184,17 @@ class PIGuardArtifact:
         self.pooling = self.metadata["pooling"]
         self.max_length = self.metadata["max_length"]
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        tokenizer_dir = self.bundle / "tokenizer"
+        tokenizer_config = tokenizer_dir / "tokenizer_config.json"
+        extra = (
+            json.loads(tokenizer_config.read_text(encoding="utf-8")).get("extra_special_tokens")
+            if tokenizer_config.is_file() else None
+        )
+        # transformers 5 saves extra_special_tokens as a list; 4.x needs them as additional_special_tokens.
+        legacy = isinstance(extra, list) and int(transformers.__version__.split(".")[0]) < 5
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.bundle / "tokenizer", local_files_only=True
+            tokenizer_dir, local_files_only=True,
+            **({"extra_special_tokens": {}, "additional_special_tokens": extra} if legacy else {})
         )
 
         model_kwargs: dict[str, Any] = {
