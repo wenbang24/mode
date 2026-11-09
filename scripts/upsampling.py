@@ -12,9 +12,12 @@ import random
 import re
 import shutil
 import tempfile
+import time
 
 from scripts.laya_router import HUMAN, ROUTES
 from scripts.training_cases import normalize_prompt, stratified_sample
+
+_last_progress_upload = {}
 
 DEFAULT_JSON_SYSTEM_PROMPT = "Return only the exact JSON object requested. Do not use markdown."
 CATEGORY_SYSTEM_PROMPT = (
@@ -484,13 +487,18 @@ def upload_tree(fs, local_dir, remote_dir):
     return True
 
 
-def upload_progress_file(fs, local_path, local_root, remote_root):
+def upload_progress_file(fs, local_path, local_root, remote_root, *, min_interval=300):
     if fs is None:
         return False
     relative = Path(local_path).relative_to(local_root).as_posix()
     destination = _remote_join(remote_root, relative)
+    # Drive uploads take ~7s per call; full uploads happen at step end.
+    last_upload = _last_progress_upload.get(destination)
+    if last_upload is not None and time.monotonic() - last_upload < min_interval:
+        return False
     fs.makedirs(str(Path(destination).parent).replace("\\", "/"), exist_ok=True)
     _put_file(fs, local_path, destination)
+    _last_progress_upload[destination] = time.monotonic()
     return True
 
 

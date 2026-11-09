@@ -399,6 +399,26 @@ class DriveTest(unittest.TestCase):
             self.assertEqual(len(copies), 1)
             self.assertEqual(fs.contents[copies[0]["id"]], b"new")
 
+    def test_upload_progress_file_throttles_per_destination(self):
+        upsampling._last_progress_upload.clear()
+        self.addCleanup(upsampling._last_progress_upload.clear)
+        fs = _FakeMemoryFS()
+        with tempfile.TemporaryDirectory() as temporary:
+            local_root = Path(temporary)
+            local_path = local_root / "progress.jsonl"
+            local_path.write_text('{"id": 1}\n', encoding="utf-8")
+            with mock.patch.object(upsampling.time, "monotonic", side_effect=[0, 10, 400, 400]):
+                self.assertTrue(upsampling.upload_progress_file(
+                    fs, local_path, local_root, "remote/step"))
+                self.assertFalse(upsampling.upload_progress_file(
+                    fs, local_path, local_root, "remote/step"))
+                self.assertEqual(fs.put_calls, ["remote/step/progress.jsonl"])
+                self.assertTrue(upsampling.upload_progress_file(
+                    fs, local_path, local_root, "remote/step"))
+
+            self.assertEqual(fs.put_calls, [
+                "remote/step/progress.jsonl", "remote/step/progress.jsonl"])
+
     def test_finish_step_keeps_done_marker_for_later_upload(self):
         failed_fs = _FakeMemoryFS()
         failed_fs.put_error = OSError("upload failed")
