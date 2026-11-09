@@ -119,6 +119,7 @@ class FoldAndDifficultyTest(unittest.TestCase):
             self.assertEqual(fit_calls, ["fold-0"])
             self.assertEqual(predicted_prompts, [f"prompt {row['case_id'].split('-')[1]}" for row in folds[0]])
             self.assertEqual(progress_snapshots[0], {row["case_id"] for row in folds[1]})
+            self.assertEqual(len(progress_snapshots), 1)
             final_rows = upsampling.read_jsonl(fold_root / "oof.jsonl")
             final_by_id = {row["case_id"]: row for row in final_rows}
             self.assertEqual(set(final_by_id), {case["case_id"] for case in cases})

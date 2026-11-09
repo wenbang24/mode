@@ -659,8 +659,6 @@ def run_folds(prepared, base_dir, output_root, settings, device="auto", *, fs=No
                 }
                 append_jsonl(oof_path, record)
                 oof[row["case_id"]] = record
-                if on_progress:
-                    on_progress(oof_path)
         shutil.rmtree(fold_dir / "checkpoint", ignore_errors=True)
         shutil.rmtree(fold_dir / "epochs", ignore_errors=True)
         write_json(fold_dir / "done.json", {"fold": fold_index, "cases": len(held_out)})
