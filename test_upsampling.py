@@ -267,6 +267,17 @@ class GenerationTest(unittest.TestCase):
             {"role": "user", "content": '{"prompt":"untrusted"}'},
         ])
 
+    def test_json_request_accepts_fenced_json(self):
+        def open_request(request, timeout):
+            return io.BytesIO(
+                b'{"choices":[{"message":{"content":"```json\\n{\\"prompt\\": \\"x\\"}\\n```"}}]}')
+
+        with mock.patch("urllib.request.urlopen", side_effect=open_request):
+            result = upsampling.request_json(
+                "https://example.test/v1", None, "model", '{"prompt":"input"}', 0, attempts=1)
+
+        self.assertEqual(result, {"prompt": "x"})
+
     def test_dedupe_checks_frozen_sets_and_prior_generated_prompts(self):
         frozen = [{"prompt": "Frozen   prompt"}]
         rows = [

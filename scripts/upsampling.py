@@ -700,7 +700,8 @@ def request_json(endpoint, api_key, model, prompt, temperature, timeout=180, att
                               headers=request_headers(api_key))
             with urlopen(request, timeout=timeout) as response:
                 content = json.load(response)["choices"][0]["message"]["content"]
-            parsed = json.loads(content)
+            # Qwen sometimes wraps its JSON in a ```json fence.
+            parsed = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip()))
             if not isinstance(parsed, dict):
                 raise ValueError("LLM response must be a JSON object")
             return parsed
