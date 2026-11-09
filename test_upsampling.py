@@ -289,6 +289,14 @@ class GenerationTest(unittest.TestCase):
             self.assertEqual(calls, [1, 2, 3])
             self.assertEqual(len(upsampling.read_jsonl(path)), 3)
 
+    def test_read_jsonl_preserves_unicode_line_separator_characters(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "progress.jsonl"
+            row = {"value": "before\u2028middle\x85after"}
+            upsampling.append_jsonl(path, row)
+
+            self.assertEqual(upsampling.read_jsonl(path), [row])
+
 
 class DriveTest(unittest.TestCase):
     def test_upload_tree_uses_single_chunk_larger_than_file(self):
