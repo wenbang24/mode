@@ -631,10 +631,13 @@ def generate_action(
 
                 def call_generation(prompt):
                     for _ in range(3):
-                        response = upsampling.request_json(
-                            judge_config["endpoint"], judge_config["api_key"], judge_config["model"],
-                            prompt, 0.9, timeout=judge_config["timeout"], attempts=1,
-                            system_prompt=upsampling.GENERATION_SYSTEM_PROMPT)
+                        try:
+                            response = upsampling.request_json(
+                                judge_config["endpoint"], judge_config["api_key"], judge_config["model"],
+                                prompt, 0.9, timeout=judge_config["timeout"], attempts=1,
+                                system_prompt=upsampling.GENERATION_SYSTEM_PROMPT)
+                        except RuntimeError:
+                            continue
                         if set(response) == {"prompt"} and isinstance(response["prompt"], str):
                             return response
                     return {"prompt": ""}
