@@ -861,7 +861,7 @@ def prepare_variant(prepared, destination, train_rows, train_cases, targets, var
         "all_failed": target_counts.get(HUMAN, 0),
         "target_counts": dict(target_counts),
     }
-    for name in ("validation.jsonl", "calibration.jsonl", "validation_cases.json"):
+    for name in ("validation.jsonl", "calibration.jsonl", "validation_cases.json", "calibration_cases.json"):
         shutil.copy2(source / name, destination / name)
     (destination / "train.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in train_rows), encoding="utf-8")
@@ -869,7 +869,10 @@ def prepare_variant(prepared, destination, train_rows, train_cases, targets, var
     manifest.pop("file_sha256", None)
     manifest["file_sha256"] = {
         name: sha256_file(destination / name)
-        for name in ("train.jsonl", "calibration.jsonl", "validation.jsonl", "validation_cases.json", "train_cases.json")
+        for name in (
+            "train.jsonl", "calibration.jsonl", "validation.jsonl", "validation_cases.json",
+            "calibration_cases.json", "train_cases.json",
+        )
     }
     laya_write_json(destination / "manifest.json", manifest)
     return {"directory": str(destination), "manifest": manifest, "fingerprint": fingerprint(manifest)}
