@@ -530,6 +530,35 @@ class PreparedRestoreTest(unittest.TestCase):
             self.assertTrue((canonical / "train.jsonl").is_file())
             self.assertEqual(prepared["manifest"], {"schema_version": 1})
 
+    def test_variant_copies_calibration_cases_and_records_its_hash(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "prepared"
+            source.mkdir()
+            calibration_cases = b'[{"case":{"case_id":"calibration-case"}}]'
+            for name, content in {
+                "validation.jsonl": b'{"state":"validation"}\n',
+                "calibration.jsonl": b'{"state":"calibration"}\n',
+                "validation_cases.json": b'[{"case":{"case_id":"validation-case"}}]',
+                "calibration_cases.json": calibration_cases,
+            }.items():
+                (source / name).write_bytes(content)
+            (source / "manifest.json").write_text(json.dumps({
+                "split_case_ids": {"train": []}, "targets": {}, "splits": {},
+            }), encoding="utf-8")
+            train_cases = [{"case_id": "train-case"}]
+            route = laya_router.ROUTES[0]
+
+            variant = upsampling.prepare_variant(
+                {"directory": str(source)}, root / "variant",
+                [{"expected": {"expert": route}}], train_cases,
+                {"train-case": route}, "B0",
+            )
+
+            destination = Path(variant["directory"])
+            self.assertEqual((destination / "calibration_cases.json").read_bytes(), calibration_cases)
+            self.assertIn("calibration_cases.json", variant["manifest"]["file_sha256"])
+
 
 class ExperimentResumeTest(unittest.TestCase):
     def test_completed_run_evaluates_missing_test_report_and_reuploads_reports(self):
