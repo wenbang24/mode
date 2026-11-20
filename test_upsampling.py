@@ -209,6 +209,67 @@ class CategoryAndBalanceTest(unittest.TestCase):
         self.assertEqual(balance["routes"][empty_route], {"count": 0, "target": 0, "deficit": 0})
 
 
+class BootstrapDiscoveryTest(unittest.TestCase):
+    def test_empty_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            self.assertEqual(upsampling.discover_bootstrap_cases(temporary), ([], {}, []))
+
+    def test_hash_pairing_deduplication_and_skipped_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "round1/check/generated.parquet"
+            current = root / "check/generated.parquet"
+            for path, content in [(first, b"first"), (current, b"current")]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            manifests = {
+                "round1/benchmark/valid": {"test_sha256": laya_router.sha256_file(current)},
+                "benchmark/valid": {"test_sha256": laya_router.sha256_file(first)},
+                "round3/benchmark/missing": {"test_sha256": "missing"},
+                "round3/benchmark/rule": {"target_rule": "fastest_successful"},
+                "round3/benchmark/experts": {"selected_guardrails": ["piguard"]},
+                "round3/benchmark/incomplete": {"test_sha256": laya_router.sha256_file(first)},
+            }
+            for relative, overrides in manifests.items():
+                directory = root / relative
+                directory.mkdir(parents=True)
+                (directory / "run_config.json").write_text(json.dumps({
+                    "target_rule": "most_confident_successful",
+                    "selected_guardrails": list(laya_router.EXPERTS), **overrides,
+                }))
+            invalid = root / "round3/benchmark/invalid"
+            invalid.mkdir(parents=True)
+            (invalid / "run_config.json").write_text("invalid json")
+            shared = {"case_id": "gen:shared", "prompt": "Shared prompt"}
+            unique = {"case_id": "gen:unique", "prompt": "Unique prompt"}
+
+            def load(run_dir, parquet, *, expected_rows, split):
+                self.assertIsNone(expected_rows)
+                self.assertEqual(split, "generated")
+                if run_dir.name == "incomplete":
+                    raise ValueError("Benchmark incomplete")
+                if run_dir == root / "benchmark/valid":
+                    self.assertEqual(parquet, first)
+                    return mock.Mock(cases=[shared], targets={"gen:shared": "human"})
+                self.assertEqual(parquet, current)
+                return mock.Mock(cases=[shared, unique], targets={
+                    "gen:shared": "human", "gen:unique": "piguard"})
+
+            with mock.patch.object(laya_router, "load_benchmark", side_effect=load) as loader:
+                cases, targets, report = upsampling.discover_bootstrap_cases(root)
+            self.assertEqual(loader.call_count, 3)
+            self.assertEqual(cases, [shared, unique])
+            self.assertEqual(targets, {"gen:shared": "human", "gen:unique": "piguard"})
+            self.assertEqual(sum(r["status"] == "used" for r in report), 2)
+            skipped = {Path(r["run_dir"]).name: r["reason"]
+                       for r in report if r["status"] == "skipped"}
+            self.assertEqual(skipped["missing"], "no matching parquet")
+            self.assertIn("wrong rule", skipped["rule"])
+            self.assertIn("wrong experts", skipped["experts"])
+            self.assertIn("load error: Benchmark incomplete", skipped["incomplete"])
+            self.assertIn("load error:", skipped["invalid"])
+
+
 class GenerationTest(unittest.TestCase):
     def test_allocation_and_few_shot_fallback_are_deterministic(self):
         routes = laya_router.ROUTES
@@ -268,6 +329,57 @@ class GenerationTest(unittest.TestCase):
         self.assertEqual(len(categories), 8)
         self.assertEqual(categories.count("benign"), 6)
         self.assertEqual(categories.count("alpha"), 2)
+
+    def test_bootstrap_examples_preserves_cases_and_adds_training_fields(self):
+        case = {
+            "case_id": "gen:abc", "prompt": "Generated prompt",
+            "prompt_harm_label": "harmful", "subcategory": "alpha",
+        }
+        original = dict(case)
+        self.assertEqual(upsampling.bootstrap_examples([case], {"gen:abc": "human"}), [{
+            **case, "target": "human", "category": "alpha",
+            "difficulty": "hard", "bootstrapped": True,
+        }])
+        self.assertEqual(case, original)
+        self.assertEqual(upsampling.bootstrap_examples([], {}), [])
+        with self.assertRaises(KeyError):
+            upsampling.bootstrap_examples([case], {})
+
+    def test_extra_examples_leave_allocation_unchanged_and_reach_generation(self):
+        rows = [
+            *make_rows("human", 3, category="benign", label="unharmful"),
+            *make_rows("human", 1, category="alpha", start=10),
+        ]
+        cases = [{
+            "case_id": f"gen:{index}", "prompt": f"Bootstrap prompt {index}",
+            "prompt_harm_label": "harmful", "subcategory": category,
+        } for index, category in enumerate(["alpha", "new-category", "alpha"])]
+        extra = upsampling.bootstrap_examples(
+            cases, {"gen:0": "human", "gen:1": "human", "gen:2": "piguard"})
+        balance = {"routes": {route: {"deficit": 0} for route in laya_router.ROUTES}}
+        balance["routes"]["human"]["deficit"] = 4
+        baseline = upsampling.allocate_requests(rows, balance, seed=17)
+        self.assertEqual(
+            baseline, upsampling.allocate_requests(rows, balance, seed=17, extra_examples=()))
+        requests = upsampling.allocate_requests(rows, balance, seed=17, extra_examples=extra)
+        self.assertEqual(
+            [(r["route_intended"], r["category"]) for r in requests],
+            [(r["route_intended"], r["category"]) for r in baseline])
+        for request in requests:
+            if request["category"] == "alpha":
+                self.assertIn("gen:0", request["example_case_ids"])
+            self.assertNotIn("gen:2", request["example_case_ids"])
+
+        request = next(r for r in requests if r["category"] == "alpha")
+        call_llm = mock.Mock(return_value={"prompt": "A distinct new generated prompt"})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            generated = upsampling.run_generation(
+                [request], rows + extra, root / "raw.jsonl", root / "deduped.jsonl",
+                [], call_llm, workers=1)
+        self.assertEqual(len(generated), 1)
+        payload = json.loads(call_llm.call_args.args[0])
+        self.assertIn("Bootstrap prompt 0", [row["prompt"] for row in payload["examples"]])
 
     def test_generation_prompt_serializes_few_shot_examples_as_data(self):
         example = {
