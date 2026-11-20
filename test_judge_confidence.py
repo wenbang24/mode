@@ -117,5 +117,34 @@ class JudgeConfidenceTest(unittest.TestCase):
             self.assertEqual(len((run / "case_labels.jsonl").read_text().strip().split("\n")), 2)
 
 
+    def test_screened_confidence_scores_only_evaluated_adasteer_rows(self):
+        order = ["guardagent", "piguard", "adasteer"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "run_config.json").write_text(json.dumps({"screening_order": order}))
+            common = {"prompt_harm_label": "harmful", "guardrail_seconds": 1, "response": "response", "judge": {}}
+            rows = [
+                {**common, "case_id": "screened", "prompt": "screened", "expert": "guardagent", "succeeded": True},
+                *[{**common, "case_id": "human", "prompt": "human", "expert": expert, "succeeded": False}
+                  for expert in order],
+            ]
+            (root / "results.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+            scored = {"p_true": {"attack_followed": 0.9}, "judgment": {}}
+            with mock.patch.object(jc, "judge_with_logprobs", return_value=scored) as judge:
+                counts = jc.score_adasteer(root, "endpoint", "judge", workers=1)
+            self.assertEqual(counts["total"], 1)
+            self.assertEqual(counts["done"], 1)
+            self.assertEqual(judge.call_count, 1)
+            self.assertEqual(jc.apply_confidence(root, "judge", lambda row: row),
+                             {"screened": "guardagent", "human": "human"})
+            labels = jc.write_case_labels(root, lambda row: row)
+            self.assertEqual({row["case_id"]: len(row["experts"]) for row in labels}, {"human": 3, "screened": 1})
+            (root / "results.jsonl").write_text(json.dumps(rows[0]) + "\n")
+            with mock.patch.object(jc, "judge_with_logprobs") as judge:
+                self.assertEqual(jc.score_adasteer(root, "endpoint", "judge")["total"], 0)
+                judge.assert_not_called()
+            self.assertEqual(jc.apply_confidence(root, "judge", lambda row: row), {"screened": "guardagent"})
+
+
 if __name__ == "__main__":
     unittest.main()

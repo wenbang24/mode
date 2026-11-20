@@ -159,8 +159,10 @@ def dataset_selector(DATASET_KEYS, GUARDRAIL_OPTIONS, WORKSPACE, mo):
         value="fastest_successful",
         label="Route target rule",
     )
-    mo.vstack([test_set, generated_parquet, target_rule, guardrails])
-    return generated_parquet, guardrails, target_rule, test_set
+    screening = mo.ui.checkbox(
+        value=False, label="Screen in order GuardAgent → PIGuard → AdaSteer")
+    mo.vstack([test_set, generated_parquet, target_rule, guardrails, screening])
+    return generated_parquet, guardrails, screening, target_rule, test_set
 
 
 @app.cell(hide_code=True)
@@ -541,6 +543,7 @@ def benchmark_helpers(
         request_timeout,
         generated_path=None,
         target_rule="fastest_successful",
+        screening=False,
     ):
         dataset = DATASET_KEYS[test_set]
         if target_rule not in {"fastest_successful", "most_confident_successful"}:
@@ -554,6 +557,8 @@ def benchmark_helpers(
         )
         if not selected_guardrails:
             raise ValueError("Select at least one guardrail to benchmark")
+        if screening and (not is_generated or set(selected_guardrails) != {"guardagent", "piguard", "adasteer"}):
+            raise ValueError("Screening requires generated cases and all three experts")
         has_adasteer = "adasteer" in selected_guardrails
         validated_tests = {}
         canonical_path = WORKSPACE / DATASET_FILES[dataset][0]
@@ -704,6 +709,8 @@ def benchmark_helpers(
             "piguard_block_threshold": 0.5,
             "refusal_text": REFUSAL_TEXT,
         }
+        if screening:
+            run_config["screening_order"] = ["guardagent", "piguard", "adasteer"]
         fingerprint = hashlib.sha256(
             json.dumps(run_config, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -891,12 +898,71 @@ def benchmark_helpers(
             group["results"].append({key: value for key, value in row.items() if key != "prompt"})
         return list(prompts.values())
 
-    def run_benchmark(run, *, mode, server, server_settings, token):
+    def run_screened_benchmark(run, *, mode, server, server_settings, token):
+        from scripts.laya_router import screening_cases
+
+        full = mode == "full"
+        if full:
+            ensure_run_config(run)
+        cases = run["cases"] if full else choose_smoke_cases(run["cases"])
+        order = run["run_config"]["screening_order"]
+        outcomes = {}
+        rows = []
+        stages = []
+        expected = 0
+        complete = True
+        for index, method in enumerate(order):
+            active = screening_cases(cases, outcomes, order[:index])
+            stage_rows = []
+            if active:
+                result = run_benchmark(
+                    {**run, "cases": active, "selected_guardrails": (method,)},
+                    mode=mode, server=server, server_settings=server_settings, token=token,
+                    _screening_stage=True)
+                stage_rows = result["rows"]
+                complete = result["complete"] and all(
+                    type(row.get("succeeded")) is bool for row in stage_rows)
+            expected += len(active)
+            for row in stage_rows:
+                outcomes.setdefault(row["case_id"], {})[method] = row
+            rows.extend(stage_rows)
+            stages.append({"expert": method, "eligible": len(active), "evaluated": len(stage_rows),
+                           "screened_out": len(cases) - len(active),
+                           "succeeded": sum(row.get("succeeded") is True for row in stage_rows)})
+            if not complete:
+                break
+        grouped = group_results_by_prompt(rows)
+        grouped_path = run["output_dir"] / "prompt_results.json" if full else None
+        if full:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=run["output_dir"], delete=False) as handle:
+                temporary = Path(handle.name)
+                json.dump(grouped, handle, ensure_ascii=False, allow_nan=False, indent=2)
+                handle.write("\n")
+            try:
+                temporary.replace(grouped_path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return {
+            "dataset": run["dataset"], "selected_guardrails": run["selected_guardrails"], "mode": mode,
+            "expected_results": expected, "recorded_results": len(rows), "complete": complete,
+            "screening_stages": stages,
+            "screened_case_ids": sorted(case_id for case_id, values in outcomes.items()
+                                        if len(values) < len(order) and any(row.get("succeeded") is True for row in values.values())),
+            "results_path": str(run["results_path"]) if full else None,
+            "grouped_results_path": str(grouped_path) if full else None,
+            "run_config_path": str(run["run_config_path"]) if full else None,
+            "rows": rows, "grouped_rows": grouped, "summary": summarize_results(rows),
+        }
+
+    def run_benchmark(run, *, mode, server, server_settings, token, _screening_stage=False):
+        if run["run_config"].get("screening_order") and not _screening_stage:
+            return run_screened_benchmark(
+                run, mode=mode, server=server, server_settings=server_settings, token=token)
         full = mode == "full"
         if full:
             ensure_run_config(run)
         all_cases = run["cases"]
-        cases = all_cases if full else choose_smoke_cases(all_cases)
+        cases = all_cases if full or _screening_stage else choose_smoke_cases(all_cases)
         fingerprint = run["fingerprint"]
         results_path = run["results_path"] if full else None
         gate_path = run["gate_path"] if full else None
@@ -1418,6 +1484,7 @@ def preflight_action(
     prepare_run,
     request_timeout,
     server_settings,
+    screening,
     test_set,
     target_rule,
 ):
@@ -1438,6 +1505,7 @@ def preflight_action(
                 request_timeout=positive_timeout(request_timeout.value),
                 generated_path=generated_parquet.value,
                 target_rule=target_rule.value,
+                screening=screening.value,
             )
             _status = (
                 get_server_status()
@@ -1501,6 +1569,7 @@ def run_action(
     request_timeout,
     run_benchmark,
     server_settings,
+    screening,
     smoke_button,
     test_set,
     target_rule,
@@ -1523,8 +1592,9 @@ def run_action(
                 request_timeout=positive_timeout(request_timeout.value),
                 generated_path=generated_parquet.value,
                 target_rule=target_rule.value,
+                screening=screening.value,
             )
-            if mode == "full" and "adasteer" in run["selected_guardrails"]:
+            if mode == "full" and "adasteer" in run["selected_guardrails"] and not screening.value:
                 state = get_server_status()
                 if state["state"] != "ready":
                     raise RuntimeError("Start the configured local vLLM judge before an AdaSteer full run")
@@ -1611,6 +1681,7 @@ def case_failure_distribution(benchmark_result, mo):
         _view = mo.md("Run a smoke or full benchmark first.")
     else:
         selected = set(benchmark_result["selected_guardrails"])
+        screened = set(benchmark_result.get("screened_case_ids", ()))
         by_case = {}
         all_case_ids = set()
         for row in benchmark_result["rows"]:
@@ -1651,8 +1722,9 @@ def case_failure_distribution(benchmark_result, mo):
             failure_table,
             mo.md(
                 f"Cases with complete outcomes: {len(case_fail_counts)}  \n"
-                f"Cases with incomplete outcomes: {len(all_case_ids) - len(case_fail_counts)}  \n"
-                f"Cases all selected guardrails failed on: {len(failed_case_ids)}"
+                f"Cases with incomplete outcomes: {len(all_case_ids - set(case_fail_counts) - screened)}  \n"
+                + (f"Cases screened out (excluded from failure counts): {len(screened)}  \n" if screened else "")
+                + f"Cases all selected guardrails failed on: {len(failed_case_ids)}"
             ),
             failed_ids,
         ])
