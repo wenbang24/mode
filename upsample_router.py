@@ -567,16 +567,20 @@ def balance_action(
 def generation_controls(mo):
     generate_button = mo.ui.run_button(label="6 · Generate route-targeted cases")
     check_button = mo.ui.run_button(label="7 · Judge harm labels and export generated.parquet")
+    bootstrap_control = mo.ui.checkbox(
+        label="Bootstrap few-shot examples from earlier rounds' measured cases", value=True)
     mo.vstack([
         mo.md("## Generate and judge"),
+        bootstrap_control,
         generate_button,
         check_button,
     ])
-    return check_button, generate_button
+    return bootstrap_control, check_button, generate_button
 
 
 @app.cell
 def generate_action(
+    bootstrap_control,
     current_prepared,
     fs,
     generate_button,
@@ -600,9 +604,13 @@ def generate_action(
             _root = Path(output_control.value) / "upsampling" / _prep_name
             _step_dir = _root / "generate"
             _drive_dir = f"MoDE/upsampling/{_prep_name}/generate"
+            _bootstrap_metadata = {}
             if (_step_dir / "done.json").is_file():
                 upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
                 generated_rows = upsampling.read_jsonl(_step_dir / "deduped.jsonl")
+                _done = json.loads((_step_dir / "done.json").read_text())
+                if "bootstrap_counts" in _done:
+                    _bootstrap_metadata = {"bootstrap_counts": _done["bootstrap_counts"]}
             else:
                 _category_rows = upsampling.read_jsonl(_root / "categories/train_categories.jsonl")
                 _difficulty_rows = upsampling.read_jsonl(_root / "folds/difficulty.jsonl")
@@ -621,8 +629,20 @@ def generate_action(
                     "kept_cases": [row for row in _rows
                                    if row["case_id"] in set(_balance_data["kept_train_case_ids"])],
                 }
-                _requests = upsampling.allocate_requests(_rows, _balance)
+                _extra_examples = []
+                _bootstrap_cases = []
+                if bootstrap_control.value:
+                    _bootstrap_cases, _bootstrap_targets, _bootstrap_report = upsampling.discover_bootstrap_cases(
+                        _root, reference_manifest=current_prepared["manifest"]["benchmark"])
+                    _extra_examples = upsampling.bootstrap_examples(_bootstrap_cases, _bootstrap_targets)
+                    _bootstrap_counts = {route: sum(row["target"] == route for row in _extra_examples)
+                                         for route in _balance["routes"]}
+                    _bootstrap_metadata = {
+                        "bootstrap_counts": _bootstrap_counts, "bootstrap_runs": _bootstrap_report,
+                    }
+                _requests = upsampling.allocate_requests(_rows, _balance, extra_examples=_extra_examples)
                 _frozen_rows = list(_train_cases)
+                _frozen_rows.extend(_bootstrap_cases)
                 _validation_entries = json.loads((Path(current_prepared["directory"]) / "validation_cases.json").read_text())
                 _frozen_rows.extend(entry["case"] for entry in _validation_entries)
                 _frozen_rows.extend(training_cases.read_cases(test_parquet_control.value, expected_rows=None))
@@ -646,12 +666,19 @@ def generate_action(
                     upsampling.upload_progress_file(fs, path, _step_dir, _drive_dir)
 
                 generated_rows = upsampling.run_generation(
-                    _requests, _rows, _step_dir / "generated_raw.jsonl", _step_dir / "deduped.jsonl",
+                    _requests, _rows + _extra_examples, _step_dir / "generated_raw.jsonl", _step_dir / "deduped.jsonl",
                     _frozen_rows, call_generation, workers=4, on_progress=_upload_generation_log)
                 upsampling.write_json(_step_dir / "requests.json", _requests)
+                if bootstrap_control.value:
+                    upsampling.write_json(_step_dir / "bootstrap.json", _bootstrap_metadata)
                 upsampling.finish_step(
-                    _step_dir, {"requested": len(_requests), "deduped": len(generated_rows)}, fs, _drive_dir)
-            _view = mo.callout(f"Generated unique prompts: {len(generated_rows)}", kind="success")
+                    _step_dir, {"requested": len(_requests), "deduped": len(generated_rows),
+                                **_bootstrap_metadata}, fs, _drive_dir)
+            _bootstrap_summary = ""
+            if _bootstrap_metadata:
+                _bootstrap_summary = "\n\nBootstrap examples available: " + ", ".join(
+                    f"{route}: {count}" for route, count in _bootstrap_metadata["bootstrap_counts"].items())
+            _view = mo.callout(f"Generated unique prompts: {len(generated_rows)}{_bootstrap_summary}", kind="success")
         except Exception as exc:
             _view = mo.callout(f"Generation failed: {exc}", kind="danger")
     else:
@@ -841,6 +868,7 @@ def import_action(
                     _run_dir, _generated_parquet, expected_rows=None, split="generated")
                 laya_router.check_matching_experts(
                     current_prepared["manifest"]["benchmark"], _benchmark.manifest)
+                upsampling.cache_benchmark(_run_dir, _root / "benchmark" / _run_dir.name)
                 if fs is not None:
                     _remote = f"MoDE/upsampling/{_prep_name}/benchmark/{_run_dir.name}"
                     upsampling.upload_json_reports(fs, _run_dir, _remote)

@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import time
 
+from scripts import laya_router
 from scripts.laya_router import HUMAN, ROUTES
 from scripts.training_cases import normalize_prompt, stratified_sample
 
@@ -270,7 +271,79 @@ def choose_few_shot(rows, route, category, difficulty, request_index, maximum=5,
     return selected
 
 
-def allocate_requests(rows, balance, seed=42):
+def cache_benchmark(run_dir, destination):
+    run_dir, destination = Path(run_dir).resolve(), Path(destination).resolve()
+    if run_dir == destination:
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    results = "results.jsonl" if (run_dir / "results.jsonl").is_file() else "prompt_results.json"
+    for name in ("run_config.json", results):
+        shutil.copy2(run_dir / name, destination / name)
+    if results == "prompt_results.json":
+        (destination / "results.jsonl").unlink(missing_ok=True)
+
+
+def discover_bootstrap_cases(root, reference_manifest=None):
+    root = Path(root)
+    parquets_by_hash = {}
+    for parquet in sorted(root.glob("**/check/generated.parquet")):
+        try:
+            parquets_by_hash.setdefault(laya_router.sha256_file(parquet), parquet)
+        except OSError:
+            continue
+    cases_by_id = {}
+    targets = {}
+    report = []
+    for config_path in sorted(root.glob("**/benchmark/*/run_config.json")):
+        run_dir = config_path.parent
+        entry = {"run_dir": str(run_dir), "status": "skipped"}
+        try:
+            manifest = json.loads(config_path.read_text(encoding="utf-8"))
+            if manifest.get("target_rule") != "most_confident_successful":
+                entry["reason"] = "wrong rule: expected most_confident_successful"
+            elif set(manifest.get("selected_guardrails", ())) != set(laya_router.EXPERTS):
+                entry["reason"] = "wrong experts: expected all three experts"
+            elif manifest.get("test_sha256") not in parquets_by_hash:
+                entry["reason"] = "no matching parquet"
+            else:
+                parquet = parquets_by_hash[manifest["test_sha256"]]
+                benchmark = laya_router.load_benchmark(
+                    run_dir, parquet, expected_rows=None, split="generated")
+                if reference_manifest is not None:
+                    try:
+                        laya_router.check_matching_experts(reference_manifest, benchmark.manifest)
+                    except ValueError as exc:
+                        entry["reason"] = f"incompatible experts: {exc}"
+                        report.append(entry)
+                        continue
+                run_targets = {case["case_id"]: benchmark.targets[case["case_id"]]
+                               for case in benchmark.cases}
+                added = 0
+                for case in benchmark.cases:
+                    case_id = case["case_id"]
+                    if case_id not in cases_by_id:
+                        cases_by_id[case_id] = case
+                        targets[case_id] = run_targets[case_id]
+                        added += 1
+                entry.update(status="used", parquet=str(parquet), cases_added=added)
+        except Exception as exc:
+            entry["reason"] = f"load error: {exc}"
+        report.append(entry)
+    return list(cases_by_id.values()), targets, report
+
+
+def bootstrap_examples(generated_cases, generated_targets):
+    return [{
+        **case,
+        "target": generated_targets[case["case_id"]],
+        "category": case["subcategory"],
+        "difficulty": "hard",
+        "bootstrapped": True,
+    } for case in generated_cases]
+
+
+def allocate_requests(rows, balance, seed=42, extra_examples=()):
+    example_rows = [*rows, *extra_examples]
     requests = []
     global_index = 0
     for route in ROUTES:
@@ -308,7 +381,7 @@ def allocate_requests(rows, balance, seed=42):
                 (value for value in ("hard", "easy") if value in available), None)
             if difficulty is None:
                 continue
-            examples = choose_few_shot(rows, route, category, difficulty, global_index, seed=seed)
+            examples = choose_few_shot(example_rows, route, category, difficulty, global_index, seed=seed)
             if not examples:
                 continue
             labels = Counter(row["prompt_harm_label"] for row in examples)
