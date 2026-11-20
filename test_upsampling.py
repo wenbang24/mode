@@ -210,6 +210,24 @@ class CategoryAndBalanceTest(unittest.TestCase):
 
 
 class BootstrapDiscoveryTest(unittest.TestCase):
+    def test_cache_external_benchmark_inputs_and_same_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "external"
+            destination = root / "prep/benchmark/external"
+            source.mkdir()
+            (source / "run_config.json").write_text("{}")
+            (source / "results.jsonl").write_text("authoritative results")
+            upsampling.cache_benchmark(source, destination)
+            self.assertEqual((destination / "run_config.json").read_text(), "{}")
+            self.assertEqual((destination / "results.jsonl").read_text(), "authoritative results")
+            upsampling.cache_benchmark(destination, destination)
+            (source / "results.jsonl").unlink()
+            (source / "prompt_results.json").write_text("[]")
+            upsampling.cache_benchmark(source, destination)
+            self.assertFalse((destination / "results.jsonl").exists())
+            self.assertEqual((destination / "prompt_results.json").read_text(), "[]")
+
     def test_empty_root(self):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertEqual(upsampling.discover_bootstrap_cases(temporary), ([], {}, []))

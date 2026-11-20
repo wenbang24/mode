@@ -271,6 +271,18 @@ def choose_few_shot(rows, route, category, difficulty, request_index, maximum=5,
     return selected
 
 
+def cache_benchmark(run_dir, destination):
+    run_dir, destination = Path(run_dir).resolve(), Path(destination).resolve()
+    if run_dir == destination:
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    results = "results.jsonl" if (run_dir / "results.jsonl").is_file() else "prompt_results.json"
+    for name in ("run_config.json", results):
+        shutil.copy2(run_dir / name, destination / name)
+    if results == "prompt_results.json":
+        (destination / "results.jsonl").unlink(missing_ok=True)
+
+
 def discover_bootstrap_cases(root):
     root = Path(root)
     parquets_by_hash = {}

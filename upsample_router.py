@@ -867,6 +867,7 @@ def import_action(
                     _run_dir, _generated_parquet, expected_rows=None, split="generated")
                 laya_router.check_matching_experts(
                     current_prepared["manifest"]["benchmark"], _benchmark.manifest)
+                upsampling.cache_benchmark(_run_dir, _root / "benchmark" / _run_dir.name)
                 if fs is not None:
                     _remote = f"MoDE/upsampling/{_prep_name}/benchmark/{_run_dir.name}"
                     upsampling.upload_json_reports(fs, _run_dir, _remote)
