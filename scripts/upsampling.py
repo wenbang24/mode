@@ -283,7 +283,7 @@ def cache_benchmark(run_dir, destination):
         (destination / "results.jsonl").unlink(missing_ok=True)
 
 
-def discover_bootstrap_cases(root):
+def discover_bootstrap_cases(root, reference_manifest=None):
     root = Path(root)
     parquets_by_hash = {}
     for parquet in sorted(root.glob("**/check/generated.parquet")):
@@ -309,6 +309,13 @@ def discover_bootstrap_cases(root):
                 parquet = parquets_by_hash[manifest["test_sha256"]]
                 benchmark = laya_router.load_benchmark(
                     run_dir, parquet, expected_rows=None, split="generated")
+                if reference_manifest is not None:
+                    try:
+                        laya_router.check_matching_experts(reference_manifest, benchmark.manifest)
+                    except ValueError as exc:
+                        entry["reason"] = f"incompatible experts: {exc}"
+                        report.append(entry)
+                        continue
                 run_targets = {case["case_id"]: benchmark.targets[case["case_id"]]
                                for case in benchmark.cases}
                 added = 0

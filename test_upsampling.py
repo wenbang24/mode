@@ -232,6 +232,41 @@ class BootstrapDiscoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertEqual(upsampling.discover_bootstrap_cases(temporary), ([], {}, []))
 
+    def test_reference_manifest_skips_incompatible_experts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parquet = root / "check/generated.parquet"
+            parquet.parent.mkdir()
+            parquet.write_bytes(b"generated")
+            reference = {key: "reference" for key in laya_router.ARTIFACT_KEYS + laya_router.BEHAVIOR_KEYS}
+            for name in ("compatible", "incompatible"):
+                directory = root / "benchmark" / name
+                directory.mkdir(parents=True)
+                (directory / "run_config.json").write_text(json.dumps({
+                    "target_rule": "most_confident_successful",
+                    "selected_guardrails": list(laya_router.EXPERTS),
+                    "test_sha256": laya_router.sha256_file(parquet),
+                }))
+
+            def load(run_dir, *args, **kwargs):
+                manifest = dict(reference)
+                if run_dir.name == "incompatible":
+                    manifest[laya_router.ARTIFACT_KEYS[0]] = "different"
+                case_id = f"gen:{run_dir.name}"
+                return mock.Mock(manifest=manifest, cases=[{"case_id": case_id}],
+                                 targets={case_id: "human"})
+
+            with mock.patch.object(laya_router, "load_benchmark", side_effect=load):
+                cases, targets, report = upsampling.discover_bootstrap_cases(root, reference)
+                unfiltered, _, _ = upsampling.discover_bootstrap_cases(root)
+            self.assertEqual(cases, [{"case_id": "gen:compatible"}])
+            self.assertEqual(targets, {"gen:compatible": "human"})
+            self.assertEqual(len(unfiltered), 2)
+            self.assertEqual(report[0]["status"], "used")
+            self.assertEqual(report[1]["status"], "skipped")
+            self.assertIn("incompatible experts:", report[1]["reason"])
+            self.assertIn(laya_router.ARTIFACT_KEYS[0], report[1]["reason"])
+
     def test_hash_pairing_deduplication_and_skipped_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

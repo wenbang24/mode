@@ -632,7 +632,8 @@ def generate_action(
                 _extra_examples = []
                 _bootstrap_cases = []
                 if bootstrap_control.value:
-                    _bootstrap_cases, _bootstrap_targets, _bootstrap_report = upsampling.discover_bootstrap_cases(_root)
+                    _bootstrap_cases, _bootstrap_targets, _bootstrap_report = upsampling.discover_bootstrap_cases(
+                        _root, reference_manifest=current_prepared["manifest"]["benchmark"])
                     _extra_examples = upsampling.bootstrap_examples(_bootstrap_cases, _bootstrap_targets)
                     _bootstrap_counts = {route: sum(row["target"] == route for row in _extra_examples)
                                          for route in _balance["routes"]}
