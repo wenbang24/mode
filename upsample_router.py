@@ -569,13 +569,16 @@ def generation_controls(mo):
     check_button = mo.ui.run_button(label="7 · Judge harm labels and export generated.parquet")
     bootstrap_control = mo.ui.checkbox(
         label="Bootstrap few-shot examples from earlier rounds' measured cases", value=True)
+    max_label_share_control = mo.ui.number(
+        start=0.5, stop=1.0, step=0.01, value=0.7, label="Maximum harm-label share per route")
     mo.vstack([
         mo.md("## Generate and judge"),
         bootstrap_control,
+        max_label_share_control,
         generate_button,
         check_button,
     ])
-    return bootstrap_control, check_button, generate_button
+    return bootstrap_control, check_button, generate_button, max_label_share_control
 
 
 @app.cell
@@ -694,6 +697,7 @@ def check_action(
     fs,
     judge_config,
     json,
+    max_label_share_control,
     mo,
     output_control,
     upsampling,
@@ -733,16 +737,22 @@ def check_action(
                 _checked = upsampling.run_check(
                     _candidates, _step_dir / "checked.jsonl", _judge_prompt, workers=4,
                     on_progress=_upload_check_log)
-                _cases = upsampling.write_generated_parquet(_checked, checked_parquet)
+                _cases, _export_report = upsampling.write_generated_parquet(
+                    _checked, checked_parquet, max_label_share=max_label_share_control.value, seed=42)
                 upsampling.finish_step(_step_dir, {
                     "cases": len(_cases),
                     "judge_passed": sum(row["passed"] for row in _checked),
+                    "max_label_share": max_label_share_control.value,
+                    "seed": 42,
+                    "export_report": _export_report,
                     "generated_parquet": str(checked_parquet),
                 }, fs, _drive_dir)
             else:
                 upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
+            _export_report = json.loads((_step_dir / "done.json").read_text()).get("export_report", {})
             _view = mo.vstack([
                 mo.callout(f"Generated benchmark input: {checked_parquet}", kind="success"),
+                mo.callout(f"Export report by intended route: {_export_report}", kind="success"),
                 mo.md("Run `benchmark_guardrails.py` manually on this parquet with **all three experts** and `target_rule=most_confident_successful`. Then paste the completed run directory in step 8."),
             ])
         except Exception as exc:
@@ -921,7 +931,8 @@ def import_action(
                 _requests = json.loads((_root / "generate/requests.json").read_text())
                 _losses = upsampling.count_stages(
                     _requests, _raw_rows, _deduped, _checked,
-                    _benchmark.cases, _benchmark.targets, _added)
+                    _benchmark.cases, _benchmark.targets, _added,
+                    kept_cases=training_cases.read_cases(_generated_parquet, expected_rows=None))
                 upsampling.write_json(_step_dir / "losses.json", _losses)
                 upsampling.write_json(_step_dir / "leftovers.json", _leftovers)
                 import_report = {

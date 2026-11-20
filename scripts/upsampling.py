@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -876,24 +877,60 @@ def run_check(rows, output_path, judge, workers=4, on_progress=None):
     return [done[row["request_id"]] for row in rows]
 
 
-def write_generated_parquet(checked_rows, path):
+def write_generated_parquet(checked_rows, path, max_label_share=0.7, seed=42):
     from scripts.training_cases import write_cases
 
-    passing = [row for row in checked_rows if row.get("passed") and row.get("prompt", "").strip()]
+    if not max_label_share >= 0.5:
+        raise ValueError("max_label_share must be at least 0.5")
+    by_route = defaultdict(list)
+    for index, row in enumerate(checked_rows):
+        if row.get("prompt", "").strip():
+            if type(row.get("judged_harmful")) is not bool:
+                raise ValueError("Checked rows must have a boolean judged_harmful verdict")
+            by_route[row["route_intended"]].append((index, row))
+    selected = []
+    report = {}
+    for route, rows in by_route.items():
+        by_label = {label: [(index, row) for index, row in rows
+                            if row["judged_harmful"] == harmful]
+                    for label, harmful in (("harmful", True), ("unharmful", False))}
+        limits = {label: len(items) for label, items in by_label.items()}
+        if max_label_share < 1:
+            share = Fraction(str(max_label_share))
+            minority = min(limits.values())
+            maximum = minority * share.numerator // (share.denominator - share.numerator)
+            limits = {label: min(count, maximum) for label, count in limits.items()}
+        kept = []
+        rng = random.Random(f"{seed}:{route}")
+        for label, items in by_label.items():
+            passed = [item for item in items if item[1].get("passed")]
+            relabeled = [item for item in items if not item[1].get("passed")]
+            limit = limits[label]
+            kept.extend(passed[:limit])
+            remaining = max(0, limit - len(passed))
+            kept.extend(rng.sample(relabeled, remaining) if remaining < len(relabeled) else relabeled)
+        selected.extend(kept)
+        report[route] = {
+            "passed": sum(bool(row.get("passed")) for _, row in rows),
+            "passed_kept": sum(bool(row.get("passed")) for _, row in kept),
+            "relabeled_kept": sum(not row.get("passed") for _, row in kept),
+            "dropped_by_cap": len(rows) - len(kept),
+            "label_counts": limits,
+        }
     cases = []
-    for source_index, row in enumerate(passing):
+    for source_index, (_, row) in enumerate(sorted(selected)):
         digest = hashlib.sha256(row["prompt"].encode("utf-8")).hexdigest()[:16]
         cases.append({
             "case_id": f"gen:{digest}",
             "source_dataset": "mode/upsampling",
             "source_index": source_index,
             "prompt": row["prompt"],
-            "prompt_harm_label": row["expected_label"],
+            "prompt_harm_label": "harmful" if row["judged_harmful"] else "unharmful",
             "adversarial": None,
             "subcategory": row["category"],
         })
     write_cases(path, cases, expected_rows=None)
-    return cases
+    return cases, report
 
 
 def build_g1_cases(balance, generated_cases, generated_targets, seed=42):
@@ -951,8 +988,9 @@ def prepare_variant(prepared, destination, train_rows, train_cases, targets, var
     return {"directory": str(destination), "manifest": manifest, "fingerprint": fingerprint(manifest)}
 
 
-def count_stages(requests, raw_rows, deduped, checked, benchmark_cases, benchmark_targets, added_cases, routes=ROUTES):
-    fields = ("requested", "raw", "deduped", "judge_passed", "benchmarked", "added")
+def count_stages(requests, raw_rows, deduped, checked, benchmark_cases, benchmark_targets, added_cases,
+                 routes=ROUTES, *, kept_cases=()):
+    fields = ("requested", "raw", "deduped", "judge_passed", "kept", "benchmarked", "added")
     counts = {route: {field: 0 for field in fields} for route in routes}
     for row in requests:
         counts[row["route_intended"]]["requested"] += 1
@@ -964,6 +1002,10 @@ def count_stages(requests, raw_rows, deduped, checked, benchmark_cases, benchmar
     for row in checked:
         if row.get("passed"):
             counts[row["route_intended"]]["judge_passed"] += 1
+    intended_routes = {f"gen:{hashlib.sha256(row['prompt'].encode('utf-8')).hexdigest()[:16]}":
+                       row["route_intended"] for row in checked}
+    for case in kept_cases:
+        counts[intended_routes[case["case_id"]]]["kept"] += 1
     for case in benchmark_cases:
         counts[benchmark_targets[case["case_id"]]]["benchmarked"] += 1
     for case in added_cases:

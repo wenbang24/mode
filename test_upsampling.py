@@ -970,5 +970,108 @@ class _FakeMemoryFS:
         return result
 
 
+class GeneratedExportTest(unittest.TestCase):
+    def checked(self, harmful, count, *, passed=False, route="human", start=0):
+        return [{"prompt": f"{route} {harmful} {passed} prompt {i}",
+                 "route_intended": route, "category": "cat-a", "judged_harmful": harmful,
+                 "expected_label": "harmful" if harmful == passed else "unharmful",
+                 "passed": passed} for i in range(start, start + count)]
+
+    def export(self, rows, **kwargs):
+        from scripts.training_cases import read_cases
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "generated.parquet"
+            cases, report = upsampling.write_generated_parquet(rows, path, **kwargs)
+            self.assertEqual(read_cases(path, expected_rows=None), cases)
+            return cases, report
+
+    def test_relabels_failures_and_preserves_passed_columns_and_ids(self):
+        import hashlib
+
+        rows = (self.checked(True, 1, passed=True) + self.checked(False, 1, passed=True)
+                + self.checked(True, 1) + self.checked(False, 1))
+        cases, report = self.export(rows)
+        for index, (row, case) in enumerate(zip(rows, cases)):
+            self.assertEqual(case, {
+                "case_id": "gen:" + hashlib.sha256(row["prompt"].encode()).hexdigest()[:16],
+                "source_dataset": "mode/upsampling", "source_index": index,
+                "prompt": row["prompt"], "prompt_harm_label": "harmful" if row["judged_harmful"] else "unharmful",
+                "adversarial": None, "subcategory": "cat-a"})
+        self.assertEqual(report["human"], {"passed": 2, "passed_kept": 2, "relabeled_kept": 2,
+                                          "dropped_by_cap": 0, "label_counts": {"harmful": 2, "unharmful": 2}})
+
+    def test_cap_both_sides_prioritizes_passes_and_is_largest(self):
+        for majority in (True, False):
+            with self.subTest(majority=majority):
+                rows = self.checked(majority, 8) + self.checked(majority, 2, passed=True) + self.checked(not majority, 3)
+                cases, report = self.export(rows)
+                self.assertEqual(len(cases), 10)
+                self.assertEqual(report["human"]["dropped_by_cap"], 3)
+                self.assertEqual(report["human"]["passed_kept"], 2)
+                self.assertTrue({row["prompt"] for row in rows if row["passed"]} <= {case["prompt"] for case in cases})
+                self.assertEqual(report["human"]["label_counts"]["harmful" if majority else "unharmful"], 7)
+
+    def test_cap_can_drop_passes_when_necessary(self):
+        cases, report = self.export(self.checked(True, 10, passed=True) + self.checked(False, 2))
+        self.assertEqual(len(cases), 6)
+        self.assertEqual(report["human"]["passed_kept"], 4)
+        self.assertEqual(report["human"]["dropped_by_cap"], 6)
+
+    def test_empty_one_label_and_no_cap(self):
+        self.assertEqual(self.export([]), ([], {}))
+        rows = self.checked(True, 5) + [{"prompt": "   "}]
+        self.assertEqual(self.export(rows)[0], [])
+        for share in (1.0, 1.1):
+            cases, report = self.export(rows, max_label_share=share)
+            self.assertEqual(len(cases), 5)
+            self.assertEqual(report["human"]["relabeled_kept"], 5)
+        cases, _ = self.export(self.checked(True, 4) + self.checked(False, 3), max_label_share=0.5)
+        self.assertEqual(len(cases), 6)
+
+    def test_invalid_share_and_verdict(self):
+        with self.assertRaisesRegex(ValueError, "at least 0.5"):
+            self.export([], max_label_share=0.49)
+        row = self.checked(True, 1)[0]
+        del row["judged_harmful"]
+        with self.assertRaisesRegex(ValueError, "boolean judged_harmful"):
+            self.export([row])
+
+    def test_seed_determinism_and_route_independence(self):
+        rows = self.checked(True, 20) + self.checked(False, 3)
+        first = self.export(rows, seed=42)
+        self.assertEqual(first, self.export(rows, seed=42))
+        self.assertNotEqual(first[0], self.export(rows, seed=43)[0])
+        other = self.checked(False, 20, route="piguard") + self.checked(True, 3, route="piguard")
+        combined, report = self.export(other + rows, seed=42)
+        self.assertEqual({case["prompt"] for case in first[0]},
+                         {case["prompt"] for case in combined if case["prompt"].startswith("human ")})
+        self.assertEqual(report["human"], first[1]["human"])
+        self.assertEqual(report["piguard"]["label_counts"], {"harmful": 3, "unharmful": 7})
+
+    def test_duplicate_validation_is_unchanged(self):
+        rows = self.checked(True, 1)
+        with self.assertRaisesRegex(ValueError, "duplicate case_id"):
+            self.export(rows + rows, max_label_share=1.0)
+        with self.assertRaisesRegex(ValueError, "duplicate normalized prompt"):
+            self.export(rows + [{**rows[0], "prompt": rows[0]["prompt"] + " "}], max_label_share=1.0)
+
+    def test_loss_stages_count_kept_not_passes(self):
+        rows = self.checked(True, 10, passed=True) + self.checked(False, 2)
+        cases, _ = self.export(rows)
+        targets = {case["case_id"]: "human" for case in cases}
+        counts = upsampling.count_stages([], [], [], rows, cases, targets, cases, kept_cases=cases)
+        self.assertEqual(counts["human"]["judge_passed"], 10)
+        self.assertEqual(counts["human"]["kept"], 6)
+        self.assertEqual(counts["human"]["benchmarked"], 6)
+        self.assertEqual(counts["human"]["added"], 6)
+        balance = {"kept_train_case_ids": [], "kept_cases": [],
+                   "routes": {route: {"target": 100} for route in laya_router.ROUTES}}
+        _, selected, selected_targets, leftovers = upsampling.build_g1_cases(balance, cases, targets)
+        self.assertEqual(len(selected), 6)
+        self.assertEqual(selected_targets, targets)
+        self.assertEqual(leftovers, [])
+
+
 if __name__ == "__main__":
     unittest.main()
