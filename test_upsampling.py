@@ -232,6 +232,28 @@ class BootstrapDiscoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             self.assertEqual(upsampling.discover_bootstrap_cases(temporary), ([], {}, {}, []))
 
+    def test_discovery_reports_and_marks_screened_cases_for_exclusion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parquet = root / "check/generated.parquet"
+            parquet.parent.mkdir()
+            parquet.write_bytes(b"cases")
+            run = root / "benchmark/screened"
+            run.mkdir(parents=True)
+            (run / "run_config.json").write_text(json.dumps({
+                "test_sha256": laya_router.sha256_file(parquet), "target_rule": "most_confident_successful",
+                "selected_guardrails": list(laya_router.EXPERTS)}))
+            case = {"case_id": "gen:screened", "prompt": "Screened", "subcategory": "category"}
+            measured = mock.Mock(cases=[case], targets={case["case_id"]: "guardagent"},
+                                 outcomes={case["case_id"]: {"guardagent": {"succeeded": True}}},
+                                 screened_case_ids={case["case_id"]})
+            with mock.patch.object(laya_router, "load_benchmark", return_value=measured):
+                cases, targets, outcomes, report = upsampling.discover_bootstrap_cases(root)
+            self.assertTrue(cases[0]["screened"])
+            self.assertEqual(report[0]["screened_skipped"], 1)
+            self.assertEqual(upsampling.bootstrap_examples(cases, targets), [])
+            self.assertEqual(upsampling.near_miss_examples(cases, targets, outcomes), [])
+
     def test_reference_manifest_skips_incompatible_experts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -254,7 +276,7 @@ class BootstrapDiscoveryTest(unittest.TestCase):
                     manifest[laya_router.ARTIFACT_KEYS[0]] = "different"
                 case_id = f"gen:{run_dir.name}"
                 return mock.Mock(manifest=manifest, cases=[{"case_id": case_id}],
-                                 targets={case_id: "human"}, outcomes={case_id: {}})
+                                 targets={case_id: "human"}, outcomes={case_id: {}}, screened_case_ids=set())
 
             with mock.patch.object(laya_router, "load_benchmark", side_effect=load):
                 cases, targets, outcomes, report = upsampling.discover_bootstrap_cases(root, reference)
@@ -305,11 +327,11 @@ class BootstrapDiscoveryTest(unittest.TestCase):
                 if run_dir == root / "benchmark/valid":
                     self.assertEqual(parquet, first)
                     return mock.Mock(cases=[shared], targets={"gen:shared": "human"},
-                                     outcomes={"gen:shared": {"first": True}})
+                                     outcomes={"gen:shared": {"first": True}}, screened_case_ids=set())
                 self.assertEqual(parquet, current)
                 return mock.Mock(cases=[shared, unique], targets={
                     "gen:shared": "human", "gen:unique": "piguard"}, outcomes={
-                    "gen:shared": {"later": True}, "gen:unique": {"unique": True}})
+                    "gen:shared": {"later": True}, "gen:unique": {"unique": True}}, screened_case_ids=set())
 
             with mock.patch.object(laya_router, "load_benchmark", side_effect=load) as loader:
                 cases, targets, outcomes, report = upsampling.discover_bootstrap_cases(root)
@@ -975,6 +997,19 @@ class _FakeMemoryFS:
 
 
 class MutationTest(unittest.TestCase):
+    def test_screened_cases_are_not_few_shots_near_misses_or_g1_additions(self):
+        cases, targets, outcomes = self.pool()
+        cases[1]["screened"] = True
+        outcomes[cases[4]["case_id"]].pop("guardagent")
+        self.assertNotIn(cases[1]["case_id"], {row["case_id"] for row in upsampling.bootstrap_examples(cases, targets)})
+        self.assertEqual(upsampling.near_miss_examples(cases, targets, outcomes), [])
+        balance = {"kept_train_case_ids": [], "kept_cases": [],
+                   "routes": {route: {"target": 100} for route in laya_router.ROUTES}}
+        _, added, _, leftovers = upsampling.build_g1_cases(
+            balance, cases, targets, screened_case_ids=[cases[4]["case_id"]])
+        self.assertEqual(set(leftovers), {cases[1]["case_id"], cases[4]["case_id"]})
+        self.assertEqual(len(added), 3)
+
     def pool(self):
         cases = [{"case_id": f"gen:{i}", "prompt": f"Source prompt {i}",
                   "subcategory": "source-category", "prompt_harm_label": "harmful"}

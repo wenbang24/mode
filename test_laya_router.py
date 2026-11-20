@@ -67,6 +67,85 @@ class RouterDataTest(unittest.TestCase):
             outcome["succeeded"] = False
         self.assertIsNone(lr.fastest_successful(outcomes))
 
+    def screen_manifest(self, order=None):
+        manifest = json.loads((self.run / "run_config.json").read_text())
+        manifest.pop("run_fingerprint")
+        manifest.update(data_split="generated", screening_order=order or ["guardagent", "piguard", "adasteer"])
+        manifest["run_fingerprint"] = lr.fingerprint(manifest)
+        lr.write_json(self.run / "run_config.json", manifest)
+        for row in self.rows:
+            row["run_fingerprint"] = manifest["run_fingerprint"]
+
+    def test_screened_gaps_targets_human_and_order(self):
+        self.screen_manifest()
+        rows = []
+        for index, case in enumerate(self.cases):
+            for expert in ("guardagent", "piguard", "adasteer"):
+                row = next(r for r in self.rows if r["case_id"] == case["case_id"] and r["expert"] == expert)
+                row["succeeded"] = index % 4 < 3 and expert == ("guardagent", "piguard", "adasteer")[index % 4]
+                rows.append(row)
+                if row["succeeded"]:
+                    break
+        write_results(self.run, rows)
+        loaded = self.load("generated")
+        self.assertEqual({case["case_id"] for case in loaded.cases if case.get("screened")}, loaded.screened_case_ids)
+        for index, case in enumerate(self.cases):
+            case_id = case["case_id"]
+            expected = ("guardagent", "piguard", "adasteer", "human")[index % 4]
+            self.assertEqual(loaded.targets[case_id], expected)
+            self.assertEqual(case_id in loaded.screened_case_ids, index % 4 < 2)
+            self.assertEqual(len(loaded.outcomes[case_id]), (1, 2, 3, 3)[index % 4])
+
+    def test_screened_invalid_gap_or_unknown_result_is_incomplete(self):
+        self.screen_manifest()
+        case_id = self.cases[0]["case_id"]
+        rows = [row for row in self.rows if not (row["case_id"] == case_id and row["expert"] == "guardagent")]
+        write_results(self.run, rows)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.load("generated")
+        rows = [row for row in self.rows if not (row["case_id"] == case_id and row["expert"] == "piguard")]
+        for row in rows:
+            if row["case_id"] == case_id:
+                row["succeeded"] = row["expert"] == "adasteer"
+        write_results(self.run, rows)
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.load("generated")
+        self.rows[0]["succeeded"] = None
+        write_results(self.run, self.rows)
+        with self.assertRaisesRegex(ValueError, "unknown outcome"):
+            self.load("generated")
+
+    def test_screened_order_and_fully_measured_rule(self):
+        self.screen_manifest(["piguard", "guardagent", "adasteer"])
+        for row in self.rows:
+            row["succeeded"] = True
+        write_results(self.run, [row for row in self.rows if row["expert"] != "adasteer"])
+        self.assertEqual(set(self.load("generated").targets.values()), {"piguard"})
+        write_results(self.run, self.rows)
+        loaded = self.load("generated")
+        self.assertEqual(set(loaded.targets.values()), {"adasteer"})
+        self.assertEqual(loaded.screened_case_ids, set())
+
+    def test_screening_not_an_expert_behavior_difference(self):
+        manifest = json.loads((self.run / "run_config.json").read_text())
+        lr.check_matching_experts(manifest, {**manifest, "screening_order": ["guardagent", "piguard", "adasteer"]})
+        self.assertNotIn("screening_order", lr.BEHAVIOR_KEYS)
+        self.assertEqual(self.load().screened_case_ids, set())
+
+    def test_stage_filter_requires_final_failures(self):
+        case = self.cases[0]
+        case_id = case["case_id"]
+        self.assertEqual(lr.screening_cases([case], {}, []), [case])
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            lr.screening_cases([case], {}, ["guardagent"])
+        for value in (None, False, True):
+            outcomes = {case_id: {"guardagent": {"succeeded": value}}}
+            if value is None:
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    lr.screening_cases([case], outcomes, ["guardagent"])
+            else:
+                self.assertEqual(lr.screening_cases([case], outcomes, ["guardagent"]), [] if value else [case])
+
     def test_judge_confidence_ranks_adasteer(self):
         outcomes = {
             "adasteer": {"succeeded": True, "guardrail_seconds": 1.3, "judge_confidence": 0.99},

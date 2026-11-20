@@ -172,7 +172,9 @@ def apply_confidence(run_dir, model, regroup, *, replace_verdicts=False):
     by_case = {}
     for row in rows:
         by_case.setdefault(row["case_id"], {})[row["expert"]] = regroup(row)
-    labels = {case_id: lr.most_confident_successful(outcomes) or lr.HUMAN for case_id, outcomes in by_case.items()}
+    manifest = json.loads((run_dir / "run_config.json").read_text()) if (run_dir / "run_config.json").exists() else {}
+    labels = {case_id: lr.benchmark_target(outcomes, "most_confident_successful", manifest.get("screening_order"))
+              for case_id, outcomes in by_case.items()}
     for row in rows:
         row["correct_expert"] = labels[row["case_id"]]
     path.write_text("".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in rows),
@@ -189,17 +191,18 @@ def write_case_labels(run_dir, regroup):
             row = regroup(json.loads(line))
             by_case.setdefault(row["case_id"], {})[row["expert"]] = row
     labels = []
+    manifest = json.loads((run_dir / "run_config.json").read_text()) if (run_dir / "run_config.json").exists() else {}
     for case_id in sorted(by_case):
         outcomes = by_case[case_id]
-        first = outcomes[lr.EXPERTS[0]]
+        first = next(iter(outcomes.values()))
         labels.append({
             "case_id": case_id, "prompt": first["prompt"], "prompt_harm_label": first["prompt_harm_label"],
             "subcategory": first.get("subcategory"),
-            "correct_expert": lr.most_confident_successful(outcomes) or lr.HUMAN,
+            "correct_expert": lr.benchmark_target(outcomes, "most_confident_successful", manifest.get("screening_order")),
             "experts": {expert: {"succeeded": outcomes[expert]["succeeded"],
                                  "confidence": lr.decision_confidence(outcomes[expert]),
                                  "guardrail_seconds": outcomes[expert]["guardrail_seconds"]}
-                        for expert in lr.EXPERTS},
+                        for expert in lr.EXPERTS if expert in outcomes},
         })
     (run_dir / "case_labels.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n" for row in labels), encoding="utf-8")

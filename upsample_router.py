@@ -778,7 +778,7 @@ def check_action(
             _view = mo.vstack([
                 mo.callout(f"Generated benchmark input: {checked_parquet}", kind="success"),
                 mo.callout(f"Export report by intended route: {_export_report}", kind="success"),
-                mo.md("Run `benchmark_guardrails.py` manually on this parquet with **all three experts** and `target_rule=most_confident_successful`. Then paste the completed run directory in step 8."),
+                mo.md("Run `benchmark_guardrails.py` manually on this parquet with **all three experts** and `target_rule=most_confident_successful`. Optional cascade screening runs GuardAgent → PIGuard → AdaSteer only while earlier experts fail; screened cases are excluded from few-shot examples and G1. Then paste the completed run directory in step 8."),
             ])
         except Exception as exc:
             _view = mo.callout(f"Generated-case check failed: {exc}", kind="danger")
@@ -841,7 +841,7 @@ def confidence_action(
             _view = mo.callout(json.dumps({
                 "scoring": _counts,
                 "cases_relabelled": len(_labels),
-                "next": "Continue to import only after all three expert results and confidence scoring are complete.",
+                "next": "Continue to import after the benchmark (full or screened) and confidence scoring for evaluated AdaSteer rows are complete.",
                 "drive_upload": fs is not None,
             }, indent=2), kind="success")
         except Exception as exc:
@@ -926,7 +926,8 @@ def import_action(
                                    if row["case_id"] in set(_balance_data["kept_train_case_ids"])],
                 }
                 _originals, _added, _g1_targets, _leftovers = upsampling.build_g1_cases(
-                    _balance, _benchmark.cases, _benchmark.targets, seed=42)
+                    _balance, _benchmark.cases, _benchmark.targets, seed=42,
+                    screened_case_ids=_benchmark.screened_case_ids)
                 _original_targets = {
                     case["case_id"]: current_prepared["manifest"]["targets"][case["case_id"]]
                     for case in _originals

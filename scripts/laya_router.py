@@ -6,7 +6,7 @@ can run without downloading Laya or loading any expert weights.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -123,6 +123,35 @@ TARGET_RULES = {
 }
 
 
+def benchmark_target(outcomes, target_rule, screening_order=None):
+    if screening_order and set(outcomes) != set(EXPERTS):
+        successful = False
+        for expert in screening_order:
+            row = outcomes.get(expert)
+            if row is None:
+                if not successful:
+                    raise ValueError("Benchmark incomplete: missing expert before a screening success")
+            elif row["succeeded"] and not successful:
+                successful = expert
+        return successful or HUMAN
+    return TARGET_RULES[target_rule](outcomes) or HUMAN
+
+
+def screening_cases(cases, outcomes, earlier_experts):
+    selected = []
+    for case in cases:
+        previous = outcomes.get(case["case_id"], {})
+        for expert in earlier_experts:
+            row = previous.get(expert)
+            if row is None or row.get("error") or type(row.get("succeeded")) is not bool:
+                raise ValueError("Screening stage incomplete: earlier outcomes must be final")
+            if row["succeeded"]:
+                break
+        else:
+            selected.append(case)
+    return selected
+
+
 @dataclass
 class BenchmarkData:
     manifest: dict
@@ -130,6 +159,7 @@ class BenchmarkData:
     outcomes: dict[str, dict[str, dict]]
     targets: dict[str, str | None]
     results_path: Path
+    screened_case_ids: set[str] = field(default_factory=set)
 
 
 def load_benchmark(run_dir, parquet_path, *, expected_rows, split):
@@ -162,6 +192,11 @@ def load_benchmark(run_dir, parquet_path, *, expected_rows, split):
     target_rule = manifest.get("target_rule", "fastest_successful")
     if target_rule not in TARGET_RULES:
         raise ValueError(f"Unknown benchmark target_rule: {target_rule!r}")
+    screening_order = manifest.get("screening_order")
+    if "screening_order" in manifest and (
+            split != "generated" or not isinstance(screening_order, list)
+            or len(screening_order) != 3 or set(screening_order) != set(EXPERTS)):
+        raise ValueError("Screening requires generated cases and all three experts in order")
 
     results_path = run_dir / "results.jsonl"
     if results_path.is_file():
@@ -190,7 +225,7 @@ def load_benchmark(run_dir, parquet_path, *, expected_rows, split):
             raise ValueError("Result dataset differs from its manifest")
         latest[case_id, expert] = record
     missing = len(cases) * len(EXPERTS) - len(latest)
-    if missing:
+    if missing and not screening_order:
         raise ValueError(f"Benchmark incomplete: {missing} case/expert results missing; run/resume all three experts")
     for (case_id, expert), record in latest.items():
         seconds = record.get("guardrail_seconds")
@@ -198,9 +233,13 @@ def load_benchmark(run_dir, parquet_path, *, expected_rows, split):
             raise ValueError(f"Benchmark has an errored or unknown outcome: {case_id}/{expert}; resume it first")
         if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
             raise ValueError(f"Invalid guardrail_seconds for {case_id}/{expert}")
-    outcomes = {case_id: {expert: latest[case_id, expert] for expert in EXPERTS} for case_id in originals}
-    targets = {case_id: TARGET_RULES[target_rule](values) or HUMAN for case_id, values in outcomes.items()}
-    return BenchmarkData(manifest, cases, outcomes, targets, results_path)
+    outcomes = {case_id: {expert: latest[case_id, expert] for expert in EXPERTS
+                         if (case_id, expert) in latest} for case_id in originals}
+    targets = {case_id: benchmark_target(values, target_rule, screening_order)
+               for case_id, values in outcomes.items()}
+    screened = {case_id for case_id, values in outcomes.items() if len(values) < len(EXPERTS)}
+    cases = [{**case, "screened": True} if case["case_id"] in screened else case for case in cases]
+    return BenchmarkData(manifest, cases, outcomes, targets, results_path, screened)
 
 
 def check_matching_experts(train_manifest, test_manifest):

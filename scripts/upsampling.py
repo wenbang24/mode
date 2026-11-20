@@ -329,15 +329,19 @@ def discover_bootstrap_cases(root, reference_manifest=None):
                                for case in benchmark.cases}
                 run_outcomes = {case["case_id"]: benchmark.outcomes[case["case_id"]]
                                 for case in benchmark.cases}
+                screened = benchmark.screened_case_ids
                 added = 0
                 for case in benchmark.cases:
                     case_id = case["case_id"]
                     if case_id not in cases_by_id:
                         cases_by_id[case_id] = case
+                        if case_id in screened:
+                            cases_by_id[case_id] = {**case, "screened": True}
                         targets[case_id] = run_targets[case_id]
                         outcomes[case_id] = run_outcomes[case_id]
                         added += 1
-                entry.update(status="used", parquet=str(parquet), cases_added=added)
+                entry.update(status="used", parquet=str(parquet), cases_added=added,
+                             screened_skipped=len(screened))
         except Exception as exc:
             entry["reason"] = f"load error: {exc}"
         report.append(entry)
@@ -351,12 +355,14 @@ def bootstrap_examples(generated_cases, generated_targets):
         "category": case["subcategory"],
         "difficulty": "hard",
         "bootstrapped": True,
-    } for case in generated_cases]
+    } for case in generated_cases if not case.get("screened")]
 
 
 def near_miss_examples(cases, targets, outcomes):
     selected = []
     for row in bootstrap_examples(cases, targets):
+        if set(outcomes[row["case_id"]]) != set(laya_router.EXPERTS):
+            continue
         succeeded = [expert for expert in laya_router.EXPERTS
                      if outcomes[row["case_id"]][expert]["succeeded"]]
         if len(succeeded) == 1:
@@ -981,15 +987,19 @@ def write_generated_parquet(checked_rows, path, max_label_share=0.7, seed=42):
     return cases, report
 
 
-def build_g1_cases(balance, generated_cases, generated_targets, seed=42):
+def build_g1_cases(balance, generated_cases, generated_targets, seed=42, screened_case_ids=()):
     kept_ids = set(balance["kept_train_case_ids"])
     original = [row for row in balance["kept_cases"] if row["case_id"] in kept_ids]
     by_route = defaultdict(list)
+    leftovers = []
+    screened = set(screened_case_ids)
     for case in generated_cases:
+        if case["case_id"] in screened or case.get("screened"):
+            leftovers.append(case)
+            continue
         route = generated_targets[case["case_id"]]
         by_route[route].append(case)
     selected = []
-    leftovers = []
     rng = random.Random(seed)
     for route in ROUTES:
         current = sum(row["target"] == route for row in original)

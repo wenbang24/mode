@@ -2,8 +2,10 @@
 import ast
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 
@@ -22,6 +24,25 @@ def reporting_helpers():
 
 
 class BenchmarkReportingTest(unittest.TestCase):
+    def test_screened_pairs_are_not_reported_as_incomplete(self):
+        tree = ast.parse(Path(__file__).with_name("benchmark_guardrails.py").read_text())
+        cell = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "case_failure_distribution")
+        cell.decorator_list = []
+        namespace = {}
+        exec(compile(ast.Module(body=[cell], type_ignores=[]), "failure_report", "exec"), namespace)
+        rendered = []
+        mo = SimpleNamespace(md=lambda text: text, ui=SimpleNamespace(table=lambda rows: rows),
+                             vstack=lambda items: rendered.extend(items))
+        result = {"selected_guardrails": ["guardagent", "piguard", "adasteer"], "screened_case_ids": ["screened"],
+                  "rows": [{"case_id": "screened", "expert": "guardagent", "succeeded": True},
+                           *[{"case_id": "human", "expert": expert, "succeeded": False}
+                             for expert in ("guardagent", "piguard", "adasteer")]]}
+        namespace["case_failure_distribution"](result, mo)
+        text = "\n".join(item for item in rendered if isinstance(item, str))
+        self.assertIn("Cases with incomplete outcomes: 0", text)
+        self.assertIn("Cases screened out (excluded from failure counts): 1", text)
+        self.assertIn("Cases all selected guardrails failed on: 1", text)
+
     def test_success_and_runtime_for_all_methods(self):
         normalize, _ = reporting_helpers()
         for expert in ("adasteer", "piguard", "guardagent"):
@@ -156,6 +177,142 @@ class BenchmarkSplitTest(unittest.TestCase):
         self.rows["aegis2_unseen_10000_seed42.parquet"][0]["prompt"] = self.rows["aegis2_test.parquet"][0]["prompt"]
         with self.assertRaisesRegex(ValueError, "normalized prompts overlap"):
             self.prepare()
+
+    def test_screening_config_is_opt_in_generated_and_all_experts(self):
+        generated = self.workspace / "generated.parquet"
+        generated.write_bytes(b"generated")
+        self.rows[generated.name] = [{"case_id": "gen:a", "prompt": "generated prompt"}]
+        self.namespace["resolve_guardagent_policy"] = lambda source: (self.bundle, {"sha256": "guard"}, object())
+        kwargs = dict(test_set="Aegis generated cases", selected_guardrails=["adasteer", "piguard", "guardagent"],
+                      adasteer_path=self.bundle, piguard_path=self.bundle, guardagent_path=self.bundle,
+                      output_root=self.workspace / "out", server_settings={"model": "judge", "port": 8000},
+                      request_timeout=30, generated_path=generated)
+        prepare = self.namespace["prepare_run"]
+        normal = prepare(**kwargs)
+        explicit = prepare(**kwargs, screening=False)
+        screened = prepare(**kwargs, screening=True)
+        self.assertEqual(normal["run_config"], explicit["run_config"])
+        self.assertEqual(normal["fingerprint"], explicit["fingerprint"])
+        self.assertNotIn("screening_order", normal["run_config"])
+        self.assertEqual(screened["run_config"]["screening_order"], ["guardagent", "piguard", "adasteer"])
+        self.assertNotEqual(screened["fingerprint"], normal["fingerprint"])
+        changed = dict(screened["run_config"])
+        changed.pop("screening_order")
+        self.assertEqual(changed, normal["run_config"])
+        for override in ({"selected_guardrails": ["piguard"]}, {"test_set": "Aegis unseen 10,000"}):
+            with self.assertRaisesRegex(ValueError, "Screening requires"):
+                prepare(**{**kwargs, **override}, screening=True)
+
+
+class CascadeExecutionTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.calls = []
+        self.fail_guard = False
+        owner = self
+
+        class Gate:
+            def __init__(self, method):
+                self.method = method
+
+            def run(self, prompt):
+                owner.calls.append((self.method, prompt))
+                if owner.fail_guard and self.method == "guardagent" and prompt == "ga":
+                    raise RuntimeError("transient gate error")
+                blocked = prompt in {"ga", "pig", "human"} if self.method == "guardagent" else prompt == "human"
+                return SimpleNamespace(block=blocked, metadata={})
+
+            def close(self):
+                pass
+
+        class Runtime:
+            laws = {"rd": None, "hd": None}
+
+            def positions(self, prompt):
+                return 0, 0
+
+            def generate(self, prompt, rd, hd):
+                owner.calls.append(("generate", prompt))
+                return prompt + " response"
+
+            def close(self):
+                pass
+
+        self.server = SimpleNamespace(process=object())
+        def stop():
+            self.calls.append(("stop", None))
+            self.server.process = None
+        self.server.stop = stop
+        def ready(*args, **kwargs):
+            self.calls.append(("judge_ready", None))
+            self.server.process = object()
+            return None, 0
+        def judge(endpoint, model, prompt, response, timeout):
+            self.calls.append(("judge", prompt))
+            return {"attack_followed": False, "safe": True, "refusal": False, "useful": False}
+        self.namespace = {
+            "Path": Path, "json": json, "tempfile": tempfile, "os": os, "time": time,
+            "REFUSAL_TEXT": "refusal", "RESPONDER_MODEL_ID": "responder", "error_text": str,
+            "PIGuardArtifact": lambda *args, **kwargs: Gate("piguard"),
+            "AdaSteer": lambda *args, **kwargs: SimpleNamespace(runtime=Runtime()),
+            "predict_law": lambda *args: 0, "local_server_ready": ready, "judge_response": judge,
+            "summarize_results": lambda rows: [],
+        }
+        tree = ast.parse(Path(__file__).with_name("benchmark_guardrails.py").read_text())
+        cell = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "benchmark_helpers")
+        names = {"run_screened_benchmark", "run_benchmark", "common_result_fields", "group_results_by_prompt",
+                 "assumed_gate_judgment", "case_data", "load_latest", "append_event", "ensure_run_config", "choose_smoke_cases"}
+        functions = [node for node in cell.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "cascade_helpers", "exec"), self.namespace)
+        cases = [{"case_id": name, "source_dataset": "generated", "source_index": index,
+                  "prompt": name, "prompt_harm_label": "harmful" if name in {"ga", "ada"} else "unharmful",
+                  "adversarial": None, "subcategory": "test"} for index, name in enumerate(("ga", "pig", "ada", "human"))]
+        self.run = {
+            "cases": cases, "dataset": "aegis", "fingerprint": "test", "selected_guardrails": ("adasteer", "piguard", "guardagent"),
+            "run_config": {"screening_order": ["guardagent", "piguard", "adasteer"], "judge_model": "judge",
+                           "local_endpoint": "endpoint", "responding_max_new_tokens": 128},
+            "output_dir": self.root, "guardagent_policy": Gate("guardagent"), "piguard_path": self.root,
+            "cache_root": self.root, "adasteer_source": self.root, "adasteer_bundle": self.root, "request_timeout": 30,
+            **{key: self.root / name for key, name in (("results_path", "results.jsonl"), ("gate_path", "gates.jsonl"),
+                                                       ("response_path", "responses.jsonl"), ("run_config_path", "run_config.json"))},
+        }
+
+    def execute(self, mode="full"):
+        return self.namespace["run_benchmark"](self.run, mode=mode, server=self.server, server_settings={}, token=None)
+
+    def test_stage_successes_are_final_gpu_order_and_resume(self):
+        result = self.execute()
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["expected_results"], 9)
+        self.assertEqual(result["recorded_results"], 9)
+        self.assertEqual(result["screened_case_ids"], ["ga", "pig"])
+        self.assertEqual([stage["eligible"] for stage in result["screening_stages"]], [4, 3, 2])
+        self.assertEqual([stage["screened_out"] for stage in result["screening_stages"]], [0, 1, 2])
+        self.assertEqual([prompt for method, prompt in self.calls if method == "piguard"], ["pig", "ada", "human"])
+        self.assertEqual([prompt for method, prompt in self.calls if method == "judge"], ["ada", "human"])
+        self.assertLess(self.calls.index(("stop", None)), self.calls.index(("piguard", "pig")))
+        self.assertLess(self.calls.index(("generate", "human")), self.calls.index(("judge_ready", None)))
+        self.calls.clear()
+        self.assertTrue(self.execute()["complete"])
+        self.assertEqual(self.calls, [])
+
+    def test_error_stops_cascade_then_only_failed_stage_work_resumes(self):
+        self.fail_guard = True
+        failed = self.execute()
+        self.assertFalse(failed["complete"])
+        self.assertEqual(len(failed["screening_stages"]), 1)
+        self.assertFalse(any(method == "piguard" for method, _ in self.calls))
+        self.fail_guard = False
+        self.calls.clear()
+        self.assertTrue(self.execute()["complete"])
+        self.assertEqual([prompt for method, prompt in self.calls if method == "guardagent"], ["ga"])
+
+    def test_smoke_filtered_stage_need_not_have_both_labels(self):
+        result = self.execute(mode="smoke")
+        self.assertTrue(result["complete"])
+        self.assertEqual([stage["eligible"] for stage in result["screening_stages"]], [2, 1, 0])
 
 
 if __name__ == "__main__":
