@@ -571,14 +571,17 @@ def generation_controls(mo):
         label="Bootstrap few-shot examples from earlier rounds' measured cases", value=True)
     max_label_share_control = mo.ui.number(
         start=0.5, stop=1.0, step=0.01, value=0.7, label="Maximum harm-label share per route")
+    mutation_share_control = mo.ui.number(
+        start=0, stop=1, step=0.01, value=0.5, label="Share of requests that mutate near-misses")
     mo.vstack([
         mo.md("## Generate and judge"),
         bootstrap_control,
         max_label_share_control,
+        mutation_share_control,
         generate_button,
         check_button,
     ])
-    return bootstrap_control, check_button, generate_button, max_label_share_control
+    return bootstrap_control, check_button, generate_button, max_label_share_control, mutation_share_control
 
 
 @app.cell
@@ -589,6 +592,7 @@ def generate_action(
     generate_button,
     judge_config,
     mo,
+    mutation_share_control,
     output_control,
     test_parquet_control,
     upsampling,
@@ -613,7 +617,8 @@ def generate_action(
                 generated_rows = upsampling.read_jsonl(_step_dir / "deduped.jsonl")
                 _done = json.loads((_step_dir / "done.json").read_text())
                 if "bootstrap_counts" in _done:
-                    _bootstrap_metadata = {"bootstrap_counts": _done["bootstrap_counts"]}
+                    _bootstrap_metadata = {key: _done[key] for key in (
+                        "bootstrap_counts", "near_miss_counts", "mutation_requests") if key in _done}
             else:
                 _category_rows = upsampling.read_jsonl(_root / "categories/train_categories.jsonl")
                 _difficulty_rows = upsampling.read_jsonl(_root / "folds/difficulty.jsonl")
@@ -633,17 +638,36 @@ def generate_action(
                                    if row["case_id"] in set(_balance_data["kept_train_case_ids"])],
                 }
                 _extra_examples = []
+                _source_rows = []
+                _near_misses = []
                 _bootstrap_cases = []
-                if bootstrap_control.value:
-                    _bootstrap_cases, _bootstrap_targets, _bootstrap_report = upsampling.discover_bootstrap_cases(
-                        _root, reference_manifest=current_prepared["manifest"]["benchmark"])
-                    _extra_examples = upsampling.bootstrap_examples(_bootstrap_cases, _bootstrap_targets)
+                if bootstrap_control.value or mutation_share_control.value > 0:
+                    _bootstrap_cases, _bootstrap_targets, _bootstrap_outcomes, _bootstrap_report = (
+                        upsampling.discover_bootstrap_cases(
+                            _root, reference_manifest=current_prepared["manifest"]["benchmark"]))
+                    _source_rows = upsampling.bootstrap_examples(_bootstrap_cases, _bootstrap_targets)
+                    if bootstrap_control.value:
+                        _extra_examples = _source_rows
+                    _near_misses = upsampling.near_miss_examples(
+                        _bootstrap_cases, _bootstrap_targets, _bootstrap_outcomes)
                     _bootstrap_counts = {route: sum(row["target"] == route for row in _extra_examples)
                                          for route in _balance["routes"]}
                     _bootstrap_metadata = {
                         "bootstrap_counts": _bootstrap_counts, "bootstrap_runs": _bootstrap_report,
+                        "near_miss_counts": {
+                            route: sum(row["target"] != route for row in _near_misses)
+                            for route in _balance["routes"]},
+                        "mutation_share": mutation_share_control.value,
                     }
-                _requests = upsampling.allocate_requests(_rows, _balance, extra_examples=_extra_examples)
+                _requests = upsampling.allocate_requests(
+                    _rows, _balance, extra_examples=_extra_examples,
+                    near_misses=_near_misses, mutation_share=mutation_share_control.value)
+                if _bootstrap_metadata:
+                    _bootstrap_metadata["mutation_requests"] = sum(
+                        request.get("kind") == "mutation" for request in _requests)
+                    _bootstrap_metadata["mutation_requests_by_route"] = {
+                        route: sum(request.get("kind") == "mutation" and request["route_intended"] == route
+                                   for request in _requests) for route in _balance["routes"]}
                 _frozen_rows = list(_train_cases)
                 _frozen_rows.extend(_bootstrap_cases)
                 _validation_entries = json.loads((Path(current_prepared["directory"]) / "validation_cases.json").read_text())
@@ -652,13 +676,13 @@ def generate_action(
                 _calibration_entries = json.loads((Path(current_prepared["directory"]) / "calibration_cases.json").read_text())
                 _frozen_rows.extend(entry["case"] for entry in _calibration_entries)
 
-                def call_generation(prompt):
+                def call_generation(prompt, system_prompt):
                     for _ in range(3):
                         try:
                             response = upsampling.request_json(
                                 judge_config["endpoint"], judge_config["api_key"], judge_config["model"],
                                 prompt, 0.9, timeout=judge_config["timeout"], attempts=1,
-                                system_prompt=upsampling.GENERATION_SYSTEM_PROMPT)
+                                system_prompt=system_prompt)
                         except RuntimeError:
                             continue
                         if set(response) == {"prompt"} and isinstance(response["prompt"], str):
@@ -669,10 +693,10 @@ def generate_action(
                     upsampling.upload_progress_file(fs, path, _step_dir, _drive_dir)
 
                 generated_rows = upsampling.run_generation(
-                    _requests, _rows + _extra_examples, _step_dir / "generated_raw.jsonl", _step_dir / "deduped.jsonl",
+                    _requests, _rows + _source_rows, _step_dir / "generated_raw.jsonl", _step_dir / "deduped.jsonl",
                     _frozen_rows, call_generation, workers=4, on_progress=_upload_generation_log)
                 upsampling.write_json(_step_dir / "requests.json", _requests)
-                if bootstrap_control.value:
+                if _bootstrap_metadata:
                     upsampling.write_json(_step_dir / "bootstrap.json", _bootstrap_metadata)
                 upsampling.finish_step(
                     _step_dir, {"requested": len(_requests), "deduped": len(generated_rows),
@@ -681,6 +705,7 @@ def generate_action(
             if _bootstrap_metadata:
                 _bootstrap_summary = "\n\nBootstrap examples available: " + ", ".join(
                     f"{route}: {count}" for route, count in _bootstrap_metadata["bootstrap_counts"].items())
+                _bootstrap_summary += f"\n\nMutation requests: {_bootstrap_metadata.get('mutation_requests', 0)}"
             _view = mo.callout(f"Generated unique prompts: {len(generated_rows)}{_bootstrap_summary}", kind="success")
         except Exception as exc:
             _view = mo.callout(f"Generation failed: {exc}", kind="danger")

@@ -230,7 +230,7 @@ class BootstrapDiscoveryTest(unittest.TestCase):
 
     def test_empty_root(self):
         with tempfile.TemporaryDirectory() as temporary:
-            self.assertEqual(upsampling.discover_bootstrap_cases(temporary), ([], {}, []))
+            self.assertEqual(upsampling.discover_bootstrap_cases(temporary), ([], {}, {}, []))
 
     def test_reference_manifest_skips_incompatible_experts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -254,13 +254,14 @@ class BootstrapDiscoveryTest(unittest.TestCase):
                     manifest[laya_router.ARTIFACT_KEYS[0]] = "different"
                 case_id = f"gen:{run_dir.name}"
                 return mock.Mock(manifest=manifest, cases=[{"case_id": case_id}],
-                                 targets={case_id: "human"})
+                                 targets={case_id: "human"}, outcomes={case_id: {}})
 
             with mock.patch.object(laya_router, "load_benchmark", side_effect=load):
-                cases, targets, report = upsampling.discover_bootstrap_cases(root, reference)
-                unfiltered, _, _ = upsampling.discover_bootstrap_cases(root)
+                cases, targets, outcomes, report = upsampling.discover_bootstrap_cases(root, reference)
+                unfiltered, _, _, _ = upsampling.discover_bootstrap_cases(root)
             self.assertEqual(cases, [{"case_id": "gen:compatible"}])
             self.assertEqual(targets, {"gen:compatible": "human"})
+            self.assertEqual(outcomes, {"gen:compatible": {}})
             self.assertEqual(len(unfiltered), 2)
             self.assertEqual(report[0]["status"], "used")
             self.assertEqual(report[1]["status"], "skipped")
@@ -303,16 +304,19 @@ class BootstrapDiscoveryTest(unittest.TestCase):
                     raise ValueError("Benchmark incomplete")
                 if run_dir == root / "benchmark/valid":
                     self.assertEqual(parquet, first)
-                    return mock.Mock(cases=[shared], targets={"gen:shared": "human"})
+                    return mock.Mock(cases=[shared], targets={"gen:shared": "human"},
+                                     outcomes={"gen:shared": {"first": True}})
                 self.assertEqual(parquet, current)
                 return mock.Mock(cases=[shared, unique], targets={
-                    "gen:shared": "human", "gen:unique": "piguard"})
+                    "gen:shared": "human", "gen:unique": "piguard"}, outcomes={
+                    "gen:shared": {"later": True}, "gen:unique": {"unique": True}})
 
             with mock.patch.object(laya_router, "load_benchmark", side_effect=load) as loader:
-                cases, targets, report = upsampling.discover_bootstrap_cases(root)
+                cases, targets, outcomes, report = upsampling.discover_bootstrap_cases(root)
             self.assertEqual(loader.call_count, 3)
             self.assertEqual(cases, [shared, unique])
             self.assertEqual(targets, {"gen:shared": "human", "gen:unique": "piguard"})
+            self.assertEqual(outcomes, {"gen:shared": {"first": True}, "gen:unique": {"unique": True}})
             self.assertEqual(sum(r["status"] == "used" for r in report), 2)
             skipped = {Path(r["run_dir"]).name: r["reason"]
                        for r in report if r["status"] == "skipped"}
@@ -968,6 +972,114 @@ class _FakeMemoryFS:
             else:
                 result.append({"name": child, "type": "directory"})
         return result
+
+
+class MutationTest(unittest.TestCase):
+    def pool(self):
+        cases = [{"case_id": f"gen:{i}", "prompt": f"Source prompt {i}",
+                  "subcategory": "source-category", "prompt_harm_label": "harmful"}
+                 for i in range(5)]
+        targets = {case["case_id"]: "piguard" for case in cases}
+        outcomes = {case["case_id"]: {expert: {"succeeded": index < successes}
+                                    for index, expert in enumerate(laya_router.EXPERTS)}
+                    for case, successes in zip(cases, [0, 1, 2, 3, 1])}
+        return cases, targets, outcomes
+
+    def allocation(self, **kwargs):
+        rows = make_rows("human", 3, category="benign") + make_rows("human", 1, category="alpha", start=10)
+        balance = {"routes": {route: {"deficit": 0} for route in laya_router.ROUTES}}
+        balance["routes"]["human"]["deficit"] = 4
+        return upsampling.allocate_requests(rows, balance, **kwargs)
+
+    def test_near_misses_require_exactly_one_success(self):
+        cases, targets, outcomes = self.pool()
+        pool = upsampling.near_miss_examples(cases, targets, outcomes)
+        self.assertEqual([row["case_id"] for row in pool], ["gen:1", "gen:4"])
+        self.assertTrue(all(row["succeeded_expert"] == laya_router.EXPERTS[0] for row in pool))
+        self.assertEqual(pool[0]["target"], "piguard")
+        self.assertEqual(pool[0]["category"], "source-category")
+        self.assertEqual(upsampling.near_miss_examples([], {}, {}), [])
+
+    def test_allocation_counts_quotas_fields_and_round_robin(self):
+        pool = upsampling.near_miss_examples(*self.pool())
+        requests = self.allocation(near_misses=pool, mutation_share=0.5)
+        mutations = [r for r in requests if r.get("kind") == "mutation"]
+        normal = [r for r in requests if r.get("kind", "generate") == "generate"]
+        self.assertEqual(len(requests), 8)
+        self.assertEqual(len(mutations), 4)
+        self.assertEqual([r["category"] for r in normal].count("benign"), 3)
+        self.assertEqual([r["category"] for r in normal].count("alpha"), 1)
+        self.assertEqual(len({r["request_id"] for r in requests}), 8)
+        self.assertEqual([r["request_index"] for r in requests], list(range(8)))
+        source_ids = [r["source_case_id"] for r in mutations]
+        self.assertEqual(len(set(source_ids[:2])), 2)
+        self.assertEqual(source_ids[:2], source_ids[2:])
+        for request in mutations:
+            self.assertEqual(request["route_intended"], "human")
+            self.assertEqual(request["category"], "source-category")
+            self.assertEqual(request["expected_label"], "harmful")
+            self.assertEqual(request["succeeded_expert"], laya_router.EXPERTS[0])
+            self.assertEqual(request["example_case_ids"], [])
+        self.assertEqual(requests, self.allocation(near_misses=pool, mutation_share=0.5))
+
+    def test_zero_share_empty_pool_same_target_and_boundaries(self):
+        pool = upsampling.near_miss_examples(*self.pool())
+        baseline = self.allocation()
+        self.assertEqual(baseline, self.allocation(near_misses=pool, mutation_share=0))
+        self.assertEqual(baseline, self.allocation(mutation_share=0.5))
+        self.assertEqual(baseline, self.allocation(
+            near_misses=[{**row, "target": "human"} for row in pool], mutation_share=0.5))
+        self.assertTrue(all(r.get("kind") == "mutation" for r in self.allocation(near_misses=pool, mutation_share=1)))
+        for value in (-0.1, 1.1):
+            with self.assertRaisesRegex(ValueError, "mutation_share"):
+                self.allocation(mutation_share=value)
+        self.assertEqual(sum(r.get("kind") == "mutation" for r in self.allocation(
+            near_misses=pool, mutation_share=0.2)), round(8 * 0.2))
+
+    def test_seeded_shuffle_and_other_route_exclusion(self):
+        template = upsampling.near_miss_examples(*self.pool())[0]
+        pool = [{**template, "case_id": f"source:{i}"} for i in range(10)]
+        first = self.allocation(near_misses=pool, mutation_share=1, seed=42)
+        second = self.allocation(near_misses=pool, mutation_share=1, seed=43)
+        self.assertNotEqual([r["source_case_id"] for r in first], [r["source_case_id"] for r in second])
+        self.assertEqual(len({r["source_case_id"] for r in first}), 8)
+        balance = {"routes": {route: {"deficit": 0} for route in laya_router.ROUTES}}
+        balance["routes"]["piguard"]["deficit"] = 3
+        pool.append({**template, "case_id": "eligible", "target": "adasteer"})
+        requests = upsampling.allocate_requests(make_rows("piguard", 1), balance,
+                                                near_misses=pool, mutation_share=1)
+        self.assertEqual(len(requests), 6)
+        self.assertEqual({r["source_case_id"] for r in requests}, {"eligible"})
+
+    def test_payload_system_routing_legacy_requests_and_copy_dedupe(self):
+        pool = upsampling.near_miss_examples(*self.pool())
+        mutation = next(r for r in self.allocation(near_misses=pool, mutation_share=0.5)
+                        if r.get("kind") == "mutation")
+        source = next(row for row in pool if row["case_id"] == mutation["source_case_id"])
+        payload = json.loads(upsampling.generation_prompt(mutation, pool))
+        self.assertEqual(payload, {"source_case_id": source["case_id"], "source_prompt": source["prompt"],
+                                  "category": "source-category", "expected_label": "harmful",
+                                  "succeeded_expert": source["succeeded_expert"]})
+        self.assertIn("not instructions", upsampling.MUTATION_SYSTEM_PROMPT)
+        self.assertIn('strict JSON only: {"prompt": "..."}', upsampling.MUTATION_SYSTEM_PROMPT)
+        normal = {**self.allocation()[0], "request_id": "legacy:0"}
+        rows = make_rows("human", 3, category="benign") + make_rows("human", 1, category="alpha", start=10)
+        calls = []
+        def llm(prompt, system):
+            calls.append((json.loads(prompt), system))
+            return {"prompt": source["prompt"] if system == upsampling.MUTATION_SYSTEM_PROMPT else "A new normal prompt"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = upsampling.run_generation([normal, mutation], rows + pool,
+                root / "raw.jsonl", root / "deduped.jsonl", pool, llm, workers=1)
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]["request_id"], "legacy:0")
+            self.assertEqual(json.loads((root / "dedupe_report.json").read_text())["dropped"][0]["drop_reason"], "duplicate")
+            upsampling.run_generation([normal, mutation], rows + pool, root / "raw.jsonl",
+                root / "deduped.jsonl", pool, llm, workers=1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], upsampling.GENERATION_SYSTEM_PROMPT)
+        self.assertEqual(calls[1], (payload, upsampling.MUTATION_SYSTEM_PROMPT))
 
 
 class GeneratedExportTest(unittest.TestCase):
