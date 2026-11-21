@@ -505,6 +505,17 @@ class G0UnionTest(unittest.TestCase):
             (root / "variants/G0/manifest.json").write_text("{}")
             self.assertEqual(upsampling.available_variants(root), ["G0"])
 
+    def test_run_names_separate_success_objective_and_cost_weight(self):
+        manifest = {"generated_union": {"generated_cases": 1}}
+        for variant in ("B0", "B1", "G0", "G1"):
+            legacy = upsampling.variant_run_name(variant, manifest, 42)
+            self.assertEqual(upsampling.variant_run_name(variant, manifest, 42, {"objective": "slcd", "cost_weight": 2.0}), legacy)
+            settings = {"objective": "expert_success", "cost_weight": 0.0}
+            success = upsampling.variant_run_name(variant, manifest, 42, settings)
+            self.assertEqual(success, legacy + "-expert_success-cw0.0")
+            self.assertNotEqual(upsampling.variant_run_name(variant, manifest, 42, {**settings, "cost_weight": 0.1}), success)
+            self.assertEqual(upsampling.variant_run_name(variant, manifest, 42, {**settings, "cost_weight": 0}), success)
+
     def test_g0_variant_records_sources_and_preserves_held_out_splits(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

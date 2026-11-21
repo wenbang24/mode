@@ -1083,7 +1083,7 @@ def experiment_action(
                     "manifest": json.loads((_variant_dir / "manifest.json").read_text()),
                 }
                 for _seed in (42, 43, 44):
-                    _name = upsampling.variant_run_name(_variant, _prepared["manifest"], _seed)
+                    _name = upsampling.variant_run_name(_variant, _prepared["manifest"], _seed, training_settings)
                     _result = upsampling.run_experiment(
                         _prepared, _base_directory, _root, _name,
                         {**training_settings, "epochs": 1, "seed": _seed},
@@ -1120,6 +1120,7 @@ def summary_action(
     mo,
     output_control,
     summary_button,
+    training_settings,
     test_benchmark_control,
     test_parquet_control,
     upsampling,
@@ -1135,7 +1136,9 @@ def summary_action(
                 raise ValueError("Prepare data first")
             _prep_name = Path(current_prepared["directory"]).name
             _root = Path(output_control.value) / "upsampling" / _prep_name
-            _summary_dir = _root / "summary"
+            _summary_name = ("summary" if training_settings["objective"] == "slcd"
+                             else upsampling.variant_run_name("summary", {}, 42, training_settings))
+            _summary_dir = _root / _summary_name
             _summary_path = _summary_dir / "summary.json"
             _variants = upsampling.available_variants(_root / "import")
             if not _variants:
@@ -1143,7 +1146,7 @@ def summary_action(
             _cached = json.loads(_summary_path.read_text()) if _summary_path.is_file() else {}
             if (_summary_dir / "done.json").is_file() and set(_cached) == set(_variants) and "G0" not in _variants:
                 upsampling.ensure_uploaded(
-                    fs, _summary_dir, f"MoDE/upsampling/{_prep_name}/summary")
+                    fs, _summary_dir, f"MoDE/upsampling/{_prep_name}/{_summary_name}")
                 summary_report = json.loads(_summary_path.read_text())
             else:
                 _validation_entries = json.loads(
@@ -1168,7 +1171,7 @@ def summary_action(
                     _validation_predictions = {}
                     _test_predictions = {}
                     for _seed in (42, 43, 44):
-                        _name = upsampling.variant_run_name(_variant, _variant_manifest, _seed)
+                        _name = upsampling.variant_run_name(_variant, _variant_manifest, _seed, training_settings)
                         _run_dir = _root / "runs" / _name
                         _validation_report = json.loads((_run_dir / "validation_report.json").read_text())
                         _validation_predictions[_seed] = {
@@ -1201,7 +1204,7 @@ def summary_action(
                 upsampling.write_json(_summary_path, summary_report)
                 upsampling.finish_step(
                     _summary_dir, {"variants": list(summary_report), "bootstrap_resamples": 1000},
-                    fs, f"MoDE/upsampling/{_prep_name}/summary")
+                    fs, f"MoDE/upsampling/{_prep_name}/{_summary_name}")
             _view = mo.vstack([
                 mo.callout("Summary saved and uploaded.", kind="success"),
                 mo.plain_text(json.dumps(summary_report, indent=2)),

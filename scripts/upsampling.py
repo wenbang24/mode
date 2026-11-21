@@ -1095,11 +1095,16 @@ def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, re
     return cases, targets, report
 
 
-def variant_run_name(variant, manifest, seed):
+def variant_run_name(variant, manifest, seed, settings=None):
+    settings = settings or {}
     if variant == "G0":
         union = {key: value for key, value in manifest.get("generated_union", {}).items() if key != "discovery"}
-        return f"G0-{laya_router.fingerprint({**manifest, 'generated_union': union})[:16]}-seed{seed}"
-    return f"{variant}-seed{seed}"
+        name = f"G0-{laya_router.fingerprint({**manifest, 'generated_union': union})[:16]}-seed{seed}"
+    else:
+        name = f"{variant}-seed{seed}"
+    if settings.get("objective", "slcd") != "slcd":
+        name += f"-{settings['objective']}-cw{float(settings.get('cost_weight', 0.0))}"
+    return name
 
 
 def available_variants(import_dir):
