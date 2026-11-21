@@ -1,4 +1,5 @@
 """Offline contract tests for router up-sampling helpers."""
+import ast
 import io
 import json
 import math
@@ -557,6 +558,83 @@ class G0UnionTest(unittest.TestCase):
 
 
 class GenerationTest(unittest.TestCase):
+    def test_notebook_records_difficulty_and_rejects_mismatched_resume(self):
+        module = ast.parse(Path("upsample_router.py").read_text())
+        action = next(node for node in module.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "generate_action")
+        action.decorator_list = []
+        namespace = {}
+        exec(compile(ast.Module(body=[action], type_ignores=[]), "upsample_router.py", "exec"), namespace)
+        for enabled in (True, False):
+            with self.subTest(use_difficulty=enabled), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                prepared = root / "prepared"
+                prepared.mkdir()
+                for name in ("train_cases.json", "validation_cases.json", "calibration_cases.json"):
+                    (prepared / name).write_text("[]")
+                step_root = root / "upsampling/prepared"
+                (step_root / "balance").mkdir(parents=True)
+                balance = {"routes": {route: {"deficit": 0} for route in laya_router.ROUTES},
+                           "kept_train_case_ids": []}
+                (step_root / "balance/balance.json").write_text(json.dumps(balance))
+                mo = SimpleNamespace(callout=mock.Mock(), md=mock.Mock())
+                arguments = dict(
+                    bootstrap_control=SimpleNamespace(value=False),
+                    use_difficulty_control=SimpleNamespace(value=enabled),
+                    current_prepared={"directory": str(prepared), "manifest": {"targets": {}}},
+                    fs=None, generate_button=SimpleNamespace(value=True), judge_config={}, mo=mo,
+                    mutation_share_control=SimpleNamespace(value=0), output_control=SimpleNamespace(value=str(root)),
+                    test_parquet_control=SimpleNamespace(value="test.parquet"),
+                    upsampling=upsampling, training_cases=SimpleNamespace(read_cases=lambda *a, **k: []),
+                    json=json, Path=Path)
+                with mock.patch.object(upsampling, "run_generation", return_value=[]):
+                    namespace["generate_action"](**arguments)
+                for name in ("bootstrap.json", "done.json"):
+                    self.assertIs(json.loads((step_root / "generate" / name).read_text())["use_difficulty"], enabled)
+                arguments["use_difficulty_control"].value = not enabled
+                with mock.patch.object(upsampling, "run_generation") as generate:
+                    namespace["generate_action"](**arguments)
+                    generate.assert_not_called()
+                self.assertIn("Use difficulty differs", mo.callout.call_args.args[0])
+
+    def test_difficulty_off_pools_examples_and_preserves_request_structure(self):
+        rows = [*make_rows("human", 4),
+                *make_rows("human", 4, difficulty="easy", start=10),
+                *make_rows("piguard", 2, start=20),
+                *make_rows("human", 2, category="other", start=30)]
+        selected = upsampling.choose_few_shot(
+            rows, "human", "cat-a", "hard", 0, maximum=8, use_difficulty=False)
+        self.assertCountEqual([row["case_id"] for row in selected], [row["case_id"] for row in rows[:8]])
+        self.assertEqual(selected, upsampling.choose_few_shot(
+            rows, "human", "cat-a", "easy", 0, maximum=8, use_difficulty=False))
+        balance = {"routes": {route: {"deficit": 2 if route == "human" else 0}
+                              for route in laya_router.ROUTES}}
+        baseline = upsampling.allocate_requests(rows, balance)
+        self.assertEqual(baseline, upsampling.allocate_requests(rows, balance, use_difficulty=True))
+        pooled = upsampling.allocate_requests(rows, balance, use_difficulty=False)
+        self.assertEqual(pooled, upsampling.allocate_requests(rows, balance, use_difficulty=False))
+        self.assertEqual([row["request_id"] for row in pooled], [row["request_id"] for row in baseline])
+        for original, request in zip(baseline, pooled):
+            self.assertEqual(set(original), set(request))
+            self.assertIsNone(request["difficulty"])
+            self.assertEqual(original["category"], request["category"])
+            self.assertEqual(original["request_index"], request["request_index"])
+
+    def test_difficulty_off_accepts_missing_labels_and_empty_pools(self):
+        rows = make_rows("human", 2)
+        for row in rows:
+            row.pop("difficulty")
+        balance = {"routes": {route: {"deficit": 1 if route == "human" else 0}
+                              for route in laya_router.ROUTES}}
+        self.assertEqual(len(upsampling.allocate_requests(rows, balance, use_difficulty=False)), 2)
+        self.assertEqual(upsampling.allocate_requests([], balance, use_difficulty=False), [])
+        self.assertEqual(upsampling.choose_few_shot(
+            [], "human", "cat-a", None, 0, use_difficulty=False), [])
+        self.assertEqual(upsampling.choose_few_shot(
+            rows, "guardagent", "cat-a", None, 0, use_difficulty=False), [])
+        with self.assertRaisesRegex(ValueError, "mutation_share"):
+            upsampling.allocate_requests(rows, balance, mutation_share=2, use_difficulty=False)
+
     def test_allocation_and_few_shot_fallback_are_deterministic(self):
         routes = laya_router.ROUTES
         rows = [

@@ -259,13 +259,14 @@ def balance_cases(rows, n=600, seed=42):
     }
 
 
-def choose_few_shot(rows, route, category, difficulty, request_index, maximum=5, seed=42):
+def choose_few_shot(rows, route, category, difficulty, request_index, maximum=5, seed=42,
+                    use_difficulty=True):
     matches = [row for row in rows if row.get("target") == route and row.get("category") == category
-               and row.get("difficulty") == difficulty]
+               and (not use_difficulty or row.get("difficulty") == difficulty)]
     rng = random.Random(seed + request_index)
     rng.shuffle(matches)
     selected = matches[:maximum]
-    if len(selected) < 3:
+    if use_difficulty and len(selected) < 3:
         other = [row for row in rows if row.get("target") == route and row.get("category") == category
                  and row.get("difficulty") != difficulty and row not in selected]
         rng.shuffle(other)
@@ -376,7 +377,8 @@ def near_miss_examples(cases, targets, outcomes):
     return selected
 
 
-def allocate_requests(rows, balance, seed=42, extra_examples=(), near_misses=(), mutation_share=0):
+def allocate_requests(rows, balance, seed=42, extra_examples=(), near_misses=(), mutation_share=0,
+                      use_difficulty=True):
     if not 0 <= mutation_share <= 1:
         raise ValueError("mutation_share must be between 0 and 1")
     example_rows = [*rows, *extra_examples]
@@ -414,13 +416,16 @@ def allocate_requests(rows, balance, seed=42, extra_examples=(), near_misses=(),
                 if quotas[category] > round_index:
                     category_sequence.append(category)
         for index, category in enumerate(category_sequence):
-            requested_difficulty = "hard" if index % 2 == 0 else "easy"
-            available = {row.get("difficulty") for row in by_category[category]}
-            difficulty = requested_difficulty if requested_difficulty in available else next(
-                (value for value in ("hard", "easy") if value in available), None)
-            if difficulty is None:
-                continue
-            examples = choose_few_shot(example_rows, route, category, difficulty, global_index, seed=seed)
+            difficulty = None
+            if use_difficulty:
+                requested_difficulty = "hard" if index % 2 == 0 else "easy"
+                available = {row.get("difficulty") for row in by_category[category]}
+                difficulty = requested_difficulty if requested_difficulty in available else next(
+                    (value for value in ("hard", "easy") if value in available), None)
+                if difficulty is None:
+                    continue
+            examples = choose_few_shot(example_rows, route, category, difficulty, global_index, seed=seed,
+                                       use_difficulty=use_difficulty)
             if not examples:
                 continue
             labels = Counter(row["prompt_harm_label"] for row in examples)
