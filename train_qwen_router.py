@@ -183,6 +183,8 @@ def training_controls(mo):
     rank_control = mo.ui.number(start=1, value=16, step=1, label="LoRA rank")
     alpha_control = mo.ui.number(start=1, value=32, step=1, label="LoRA alpha")
     brier_control = mo.ui.number(start=0, value=0.5, step=0.1, label="Brier loss weight")
+    objective_control = mo.ui.dropdown(options=["slcd", "expert_success"], value="slcd", label="Objective")
+    cost_control = mo.ui.number(start=0, value=0.0, step=0.01, label="Expert cost weight β (per second)")
     amp_control = mo.ui.switch(value=True, label="CUDA mixed precision")
     inspect_button = mo.ui.run_button(label="3 · Check tokens and optimizer budget")
     smoke_button = mo.ui.run_button(label="Run CUDA smoke test (20 examples)")
@@ -198,12 +200,14 @@ def training_controls(mo):
         mo.hstack([epochs_control, micro_batch_control, accumulation_control]),
         mo.hstack([learning_rate_control, max_len_control, device_control]),
         mo.hstack([rank_control, alpha_control, brier_control]), amp_control,
+        mo.hstack([objective_control, cost_control]),
         mo.hstack([inspect_button, smoke_button, train_button]),
     ])
     return (
         accumulation_control, amp_control, device_control, epochs_control,
         inspect_button, learning_rate_control, max_len_control,
         micro_batch_control, smoke_button, train_button, rank_control, alpha_control, brier_control,
+        objective_control, cost_control,
     )
 
 
@@ -211,6 +215,7 @@ def training_controls(mo):
 def training_settings(
     DEFAULT_SETTINGS, accumulation_control, amp_control, epochs_control, rank_control, alpha_control, brier_control,
     learning_rate_control, max_len_control, micro_batch_control,
+    objective_control, cost_control,
 ):
     settings = {
         **DEFAULT_SETTINGS,
@@ -219,6 +224,7 @@ def training_settings(
         "max_len": int(max_len_control.value), "amp": amp_control.value,
         "lora_rank": int(rank_control.value), "lora_alpha": int(alpha_control.value),
         "brier_weight": brier_control.value,
+        "objective": objective_control.value, "cost_weight": cost_control.value,
     }
     return (settings,)
 

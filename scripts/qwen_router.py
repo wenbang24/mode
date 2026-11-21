@@ -28,6 +28,7 @@ DEFAULT_SETTINGS = {
     "gradient_checkpointing": True, "amp": True,
     "lora_rank": 16, "lora_alpha": 32, "brier_weight": 0.5,
     "seed": 42,
+    "objective": "slcd", "cost_weight": 0.0,
 }
 
 
@@ -49,9 +50,10 @@ def prepare_data(run_dir, train_parquet, test_parquet, output_root):
     assert_disjoint(selection, calibration)
     manifest["router"] = "qwen_slcd"
     manifest["split_policy"] = "80% train / 10% selection / 10% calibration; seeds 42, 43"
-    payloads = {name: (original_dir / name).read_bytes() for name in ("train.jsonl", "train_cases.json")}
+    outcomes = {entry["case"]["case_id"]: entry["outcomes"] for entry in entries}
+    payloads = {name: (original_dir / name).read_bytes() for name in ("train.jsonl", "train_cases.json", "train_outcomes.json")}
     for name, subset in (("validation", selection), ("calibration", calibration)):
-        rows = labeled_rows(subset, manifest["targets"])
+        rows = labeled_rows(subset, manifest["targets"], outcomes)
         if not rows:
             raise ValueError(f"No targets in {name}; cannot select/calibrate")
         manifest["split_case_ids"][name] = [case["case_id"] for case in subset]
@@ -85,10 +87,12 @@ def download_base(cache_dir):
 
 def validate_settings(settings):
     settings = {**DEFAULT_SETTINGS, **settings}
+    if settings["objective"] not in ("slcd", "expert_success"):
+        raise ValueError("objective must be slcd or expert_success")
     for name in ("epochs", "micro_batch", "grad_accum", "max_len", "lora_rank", "lora_alpha", "seed"):
         if type(settings[name]) is not int or settings[name] < 1:
             raise ValueError(f"{name} must be a positive integer")
-    for name in ("learning_rate", "weight_decay", "warmup_ratio", "brier_weight"):
+    for name in ("learning_rate", "weight_decay", "warmup_ratio", "brier_weight", "cost_weight"):
         value = settings[name]
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
             raise ValueError(f"{name} must be finite and nonnegative")
@@ -168,17 +172,31 @@ def rotations(order):
     return [order[index:] + order[:index] for index in range(len(order))]
 
 
-def encode_rows(rows, tokenizer, max_len, *, augment=False):
+def success_targets(row):
+    successes = row.get("successes")
+    if successes is None:
+        if row["expected"]["expert"] != HUMAN:
+            raise ValueError("Missing expert successes; re-run preparation (no benchmarking needed)")
+        successes = dict.fromkeys(EXPERTS, False)
+    if (not isinstance(successes, dict) or set(successes) != set(EXPERTS)
+            or any(type(value) is not bool for value in successes.values())):
+        raise ValueError("successes must contain a boolean for each expert")
+    return {**successes, HUMAN: False}
+
+
+def encode_rows(rows, tokenizer, max_len, *, augment=False, objective="slcd"):
     encoded = []
     for row in rows:
-        target = dict(zip(ROUTES, target_distribution(row)))
+        target = success_targets(row) if objective == "expert_success" else dict(zip(ROUTES, target_distribution(row)))
         weight = row.get("weight", 1.0)
         if type(weight) not in (int, float) or not math.isfinite(weight) or weight <= 0:
             raise ValueError("Supervision weight must be finite and positive")
         # Cyclic rotations put every route in every option position once, without a mutable dataset RNG.
         for order in rotations(ROUTES) if augment else [ROUTES]:
             inputs, _ = encode_prompt(row["state"], tokenizer, max_len, order)
-            encoded.append({**inputs, "labels": [target[expert] for expert in order], "weight": weight})
+            encoded.append({**inputs, "labels": [target[expert] for expert in order], "weight": weight,
+                            **({"success_mask": [expert != HUMAN for expert in order]}
+                               if objective == "expert_success" else {})})
     return encoded
 
 
@@ -196,6 +214,9 @@ def inspect_training(data_dir, base_dir, settings):
     truncation = {}
     for name in ("train", "validation", "calibration"):
         rows = read_labeled(Path(data_dir) / f"{name}.jsonl")
+        if settings["objective"] == "expert_success":
+            for row in rows:
+                success_targets(row)
         flags = [encode_prompt(row["state"], tokenizer, settings["max_len"])[1] for row in rows]
         truncation[name] = {
             "cases": len(rows), "truncated": sum(flags),
@@ -220,6 +241,50 @@ def slcd_loss(logits, targets, weights, brier_weight=0.5):
     return (weights * loss).mean()
 
 
+def expert_success_loss(logits, targets, weights, mask):
+    from torch.nn.functional import binary_cross_entropy_with_logits
+
+    loss = binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    return (weights * (loss * mask).sum(-1)).mean()
+
+
+def success_metrics(logits, targets, temperature=1.0):
+    from torch.nn.functional import binary_cross_entropy_with_logits
+
+    logits, targets = logits.double() / temperature, targets.double()
+    probabilities = logits.sigmoid()
+    ece = 0.0
+    for index in range(15):
+        mask = (probabilities > index / 15) & (probabilities <= (index + 1) / 15)
+        if mask.any():
+            ece += float(mask.double().mean() * (probabilities[mask].mean() - targets[mask].mean()).abs())
+    return {"nll": float(binary_cross_entropy_with_logits(logits, targets)),
+            "brier": float((probabilities - targets).square().mean()), "ece_15_bins": ece,
+            "cases": len(targets)}
+
+
+def success_policy(probabilities, threshold, cost_weight, expert_seconds):
+    if all(probabilities[expert] < threshold for expert in EXPERTS):
+        return HUMAN
+    return max(EXPERTS, key=lambda expert: probabilities[expert] - cost_weight * expert_seconds[expert])
+
+
+def select_success_threshold(probabilities, outcomes, cost_weight, expert_seconds):
+    if not probabilities or len(probabilities) != len(outcomes):
+        raise ValueError("Threshold selection requires nonempty aligned selection outcomes")
+    candidates = {0.0, 1.0}
+    candidates.update(math.nextafter(max(row.values()), math.inf) for row in probabilities if max(row.values()) < 1)
+
+    def score(threshold):
+        results = []
+        for row, actual in zip(probabilities, outcomes):
+            choice = success_policy(row, threshold, cost_weight, expert_seconds)
+            results.append((not any(actual[e]["succeeded"] for e in EXPERTS), 0.0) if choice == HUMAN
+                           else (actual[choice]["succeeded"], actual[choice]["guardrail_seconds"]))
+        return (sum(result[0] for result in results), -sum(result[1] for result in results), -threshold)
+    return max(sorted(candidates), key=score)
+
+
 def probability_metrics(logits, targets, temperature=1.0):
     import torch
 
@@ -236,18 +301,19 @@ def probability_metrics(logits, targets, temperature=1.0):
             "ece_15_bins": ece, "accuracy": float(correct.double().mean()), "cases": len(targets)}
 
 
-def fit_temperature(logits, targets):
+def fit_temperature(logits, targets, *, objective="slcd"):
     import torch
 
     if not len(logits) or not torch.isfinite(logits).all():
         raise ValueError("Calibration requires nonempty finite logits")
     # Bounded positive grid includes T=1, so fitted calibration NLL cannot worsen.
     temperatures = torch.cat([torch.logspace(-2, 2, 401, dtype=torch.float64), torch.ones(1)])
-    losses = [probability_metrics(logits, targets, float(t))["nll"] for t in temperatures]
+    metrics = success_metrics if objective == "expert_success" else probability_metrics
+    losses = [metrics(logits, targets, float(t))["nll"] for t in temperatures]
     temperature = float(temperatures[min(range(len(losses)), key=losses.__getitem__)])
     return {"temperature": temperature, "method": "held-out NLL grid, T in [0.01, 100]",
-            "before": probability_metrics(logits, targets),
-            "after": probability_metrics(logits, targets, temperature)}
+            "before": metrics(logits, targets),
+            "after": metrics(logits, targets, temperature)}
 
 
 def _precision(device, amp):
@@ -286,13 +352,17 @@ def _fit(data_dir, base_dir, directory, settings, device):
                                return_tensors="pt")
         inputs["labels"] = torch.tensor([row["labels"] for row in features], dtype=torch.float32)
         inputs["weight"] = torch.tensor([row["weight"] for row in features], dtype=torch.float32)
+        if settings["objective"] == "expert_success":
+            inputs["success_mask"] = torch.tensor([row["success_mask"] for row in features])
         return inputs
 
     class DecisionTrainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             targets, weights = inputs.pop("labels"), inputs.pop("weight")
+            mask = inputs.pop("success_mask", None)
             logits = decision_logits(model, inputs, token_ids)
-            loss = slcd_loss(logits, targets, weights, settings["brier_weight"])
+            loss = (expert_success_loss(logits, targets, weights, mask) if settings["objective"] == "expert_success"
+                    else slcd_loss(logits, targets, weights, settings["brier_weight"]))
             return (loss, {"logits": logits}) if return_outputs else loss
 
     args = TrainingArguments(
@@ -314,8 +384,10 @@ def _fit(data_dir, base_dir, directory, settings, device):
         raise RuntimeError(f"Requested {device}, but Trainer selected {args.device}")
     trainer = DecisionTrainer(
         model=model, args=args, processing_class=tokenizer, data_collator=collate,
-        train_dataset=encode_rows(read_labeled(data_dir / "train.jsonl"), tokenizer, settings["max_len"], augment=True),
-        eval_dataset=encode_rows(read_labeled(data_dir / "validation.jsonl"), tokenizer, settings["max_len"]),
+        train_dataset=encode_rows(read_labeled(data_dir / "train.jsonl"), tokenizer, settings["max_len"], augment=True,
+                                  objective=settings["objective"]),
+        eval_dataset=encode_rows(read_labeled(data_dir / "validation.jsonl"), tokenizer, settings["max_len"],
+                                 objective=settings["objective"]),
     )
     # Our loss is a micro-batch mean; Trainer must apply accumulation scaling.
     trainer.model_accepts_loss_kwargs = False
@@ -330,6 +402,8 @@ def _fit(data_dir, base_dir, directory, settings, device):
         "schema_version": 1, "max_len": settings["max_len"], "amp": settings["amp"],
         "base_model": BASE_MODEL, "base_revision": BASE_REVISION, "experts": list(ROUTES),
         "labels": list(LABELS), "token_ids": token_ids, "temperature": 1.0,
+        "objective": settings["objective"], "threshold": 0.0, "cost_weight": settings["cost_weight"],
+        "expert_seconds": dict.fromkeys(EXPERTS, 0.0),
     }
     checkpoint = directory / "checkpoint"
     merged.save_pretrained(checkpoint)
@@ -345,9 +419,27 @@ def _fit(data_dir, base_dir, directory, settings, device):
     rows = read_labeled(data_dir / "calibration.jsonl")
     with QwenRouter(checkpoint, device) as router:
         logits = torch.stack([router.raw_logits(row["state"])[0].cpu() for row in rows])
-        targets = torch.tensor([target_distribution(row) for row in rows])
-        calibration = fit_temperature(logits, targets)
-        router.model.config.qwen_router["temperature"] = calibration["temperature"]
+        if settings["objective"] == "expert_success":
+            indices = [ROUTES.index(expert) for expert in EXPERTS]
+            logits = logits[:, indices]
+            targets = torch.tensor([[success_targets(row)[expert] for expert in EXPERTS] for row in rows])
+        else:
+            targets = torch.tensor([target_distribution(row) for row in rows])
+        calibration = fit_temperature(logits, targets, objective=settings["objective"])
+        metadata = router.model.config.qwen_router
+        metadata["temperature"] = calibration["temperature"]
+        if settings["objective"] == "expert_success":
+            entries = json.loads((data_dir / "validation_cases.json").read_text())
+            if not entries:
+                raise ValueError("Threshold selection requires nonempty validation_cases.json")
+            seconds = {expert: sum(entry["outcomes"][expert]["guardrail_seconds"] for entry in entries) / len(entries)
+                       for expert in EXPERTS}
+            probabilities = [dict(zip(EXPERTS, (router.raw_logits(entry["case"]["prompt"])[0][indices].cpu().double()
+                                               / calibration["temperature"]).sigmoid().tolist())) for entry in entries]
+            threshold = select_success_threshold(probabilities, [entry["outcomes"] for entry in entries],
+                                                 settings["cost_weight"], seconds)
+            metadata.update(threshold=threshold, expert_seconds=seconds)
+            calibration.update(threshold=threshold, expert_seconds=seconds, cost_weight=settings["cost_weight"])
         router.model.config.save_pretrained(checkpoint)
     summary["calibration"] = calibration
     write_json(directory / "calibration_report.json", calibration)
@@ -373,6 +465,19 @@ class QwenRouter:
             raise ValueError("Checkpoint does not contain the Qwen MoDE router schema")
         self.max_len = metadata.get("max_len")
         self.temperature = metadata.get("temperature")
+        self.objective = metadata.get("objective", "slcd")
+        validate_settings({"objective": self.objective, "cost_weight": metadata.get("cost_weight", 0.0)})
+        self.threshold = metadata.get("threshold", 0.0)
+        self.cost_weight = metadata.get("cost_weight", 0.0)
+        self.expert_seconds = metadata.get("expert_seconds", dict.fromkeys(EXPERTS, 0.0))
+        if self.objective == "expert_success":
+            if (type(self.threshold) not in (int, float) or not math.isfinite(self.threshold)
+                    or not 0 <= self.threshold <= 1):
+                raise ValueError("Checkpoint has an invalid threshold")
+            if (not isinstance(self.expert_seconds, dict) or set(self.expert_seconds) != set(EXPERTS)
+                    or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                           for value in self.expert_seconds.values())):
+                raise ValueError("Checkpoint has invalid expert seconds")
         if type(self.max_len) is not int or not 1 <= self.max_len <= config.max_position_embeddings:
             raise ValueError("Checkpoint has an invalid max_len")
         if (type(self.temperature) not in (int, float) or not math.isfinite(self.temperature)
@@ -409,6 +514,15 @@ class QwenRouter:
                 or not 0 <= confidence_threshold <= 1):
             raise ValueError("confidence_threshold must be between zero and one")
         logits, truncated = self.raw_logits(prompt)
+        if self.objective == "expert_success":
+            logits = logits.cpu()
+            successes = {expert: float((logits[ROUTES.index(expert)].double() / self.temperature).sigmoid()) for expert in EXPERTS}
+            probabilities = {**successes, HUMAN: math.prod(1 - value for value in successes.values())}
+            selected = success_policy(successes, self.threshold, self.cost_weight, self.expert_seconds)
+            confidence = probabilities[selected]
+            return {"expert": selected, "success_probabilities": successes, "probabilities": probabilities,
+                    "confidence": confidence, "truncated": truncated,
+                    "needs_review": selected == HUMAN or confidence < confidence_threshold}
         probabilities = (logits / self.temperature).softmax(-1).tolist()
         selected = max(range(len(ROUTES)), key=probabilities.__getitem__)
         return {"expert": ROUTES[selected], "probabilities": dict(zip(ROUTES, probabilities)),
@@ -430,6 +544,7 @@ class QwenRouter:
 def evaluate_checkpoint(cases, outcomes, targets, checkpoint_dir, device):
     with QwenRouter(checkpoint_dir, device) as router:
         predictions = predict_cases(router, cases)
+        objective = router.objective
     reports = summarize_policy("finetuned_qwen", cases, outcomes, targets, predictions)
     for name in (*EXPERTS, "fastest_successful_oracle"):
         choices = [{"case_id": case["case_id"], "expert": name if name in EXPERTS else targets[case["case_id"]] or HUMAN}
@@ -437,9 +552,14 @@ def evaluate_checkpoint(cases, outcomes, targets, checkpoint_dir, device):
         reports.extend(summarize_policy(name, cases, outcomes, targets, choices))
     import torch
 
-    logits = torch.tensor([[math.log(max(p["probabilities"][route], 1e-30)) for route in ROUTES] for p in predictions])
-    labels = torch.tensor([[float((targets[p["case_id"]] or HUMAN) == route) for route in ROUTES] for p in predictions])
-    calibration_metrics = probability_metrics(logits, labels)
+    if objective == "expert_success":
+        probabilities = torch.tensor([[p["probabilities"][expert] for expert in EXPERTS] for p in predictions], dtype=torch.float64)
+        labels = torch.tensor([[outcomes[p["case_id"]][expert]["succeeded"] for expert in EXPERTS] for p in predictions])
+        calibration_metrics = success_metrics(torch.logit(probabilities.clamp(1e-15, 1 - 1e-15)), labels)
+    else:
+        logits = torch.tensor([[math.log(max(p["probabilities"][route], 1e-30)) for route in ROUTES] for p in predictions])
+        labels = torch.tensor([[float((targets[p["case_id"]] or HUMAN) == route) for route in ROUTES] for p in predictions])
+        calibration_metrics = probability_metrics(logits, labels)
     return {"summary": reports, "predictions": {"finetuned_qwen": predictions},
             "routing_calibration": calibration_metrics, "outcome_note": OUTCOME_NOTE}
 
@@ -497,6 +617,13 @@ def cuda_smoke_test(prepared, base_dir, output_root, settings):
     data_dir.mkdir()
     for name, selected in (("train", rows[:12]), ("validation", rows[12:16]), ("calibration", rows[16:])):
         (data_dir / f"{name}.jsonl").write_text("".join(json.dumps(row) + "\n" for row in selected))
+    if settings["objective"] == "expert_success":
+        source = Path(prepared["directory"])
+        cases = json.loads((source / "train_cases.json").read_text())
+        outcomes = json.loads((source / "train_outcomes.json").read_text())
+        selected_prompts = {row["state"] for row in rows[12:16]}
+        write_json(data_dir / "validation_cases.json", [
+            {"case": case, "outcomes": outcomes[case["case_id"]]} for case in cases if case["prompt"] in selected_prompts])
     summary = _fit(data_dir, base_dir, directory, settings, "cuda")
     with QwenRouter(directory / "checkpoint", "cuda") as router:
         prediction = router.predict("Explain how rainbows form.")

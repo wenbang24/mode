@@ -258,8 +258,10 @@ def split_cases(cases, seed=42):
     return {"train": train, "validation": valid}
 
 
-def labeled_rows(cases, targets):
-    return [{"state": row["prompt"], "questions": QUESTIONS, "expected": {"expert": targets[row["case_id"]] or HUMAN}}
+def labeled_rows(cases, targets, outcomes=None):
+    return [{"state": row["prompt"], "questions": QUESTIONS, "expected": {"expert": targets[row["case_id"]] or HUMAN},
+             **({"successes": {expert: bool(outcomes[row["case_id"]][expert]["succeeded"]) for expert in EXPERTS}}
+                if outcomes is not None else {})}
             for row in cases]
 
 
@@ -284,7 +286,7 @@ def prepare_data(run_dir, train_parquet, test_parquet, output_root):
         "outcome_note": OUTCOME_NOTE,
     }
     for name, cases in splits.items():
-        rows = labeled_rows(cases, data.targets)
+        rows = labeled_rows(cases, data.targets, data.outcomes)
         if not rows:
             raise ValueError(f"No targets in the {name} split")
         counts = dict(Counter(row["expected"]["expert"] for row in rows))
@@ -295,7 +297,7 @@ def prepare_data(run_dir, train_parquet, test_parquet, output_root):
     directory = Path(output_root).expanduser().resolve() / "datasets" / fingerprint(manifest)[:16]
     directory.mkdir(parents=True, exist_ok=True)
     for name, cases in splits.items():
-        rows = labeled_rows(cases, data.targets)
+        rows = labeled_rows(cases, data.targets, data.outcomes)
         (directory / f"{name}.jsonl").write_text(
             "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
     # Save all cases/outcomes, including all-failed prompts, for honest validation.
@@ -304,8 +306,9 @@ def prepare_data(run_dir, train_parquet, test_parquet, output_root):
         for row in splits["validation"]
     ])
     write_json(directory / "train_cases.json", splits["train"])
+    write_json(directory / "train_outcomes.json", {row["case_id"]: data.outcomes[row["case_id"]] for row in splits["train"]})
     manifest["file_sha256"] = {name: sha256_file(directory / name)
-                               for name in ("train.jsonl", "validation.jsonl", "validation_cases.json", "train_cases.json")}
+                               for name in ("train.jsonl", "validation.jsonl", "validation_cases.json", "train_cases.json", "train_outcomes.json")}
     write_json(directory / "manifest.json", manifest)
     return {"directory": str(directory), "manifest": manifest}
 

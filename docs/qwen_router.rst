@@ -77,6 +77,34 @@ accuracy are reported over every case, with all-failed cases targeting human rev
 Inference and evaluation
 ------------------------
 
+Option 4 is available as ``objective="expert_success"`` (default: ``"slcd"``)
+in both training UIs. It sums three independent BCE-with-logits losses per row,
+then applies the row weight and micro-batch mean. Rotations map success targets
+by expert; the human option has no loss or gradient. Prepared rows carry a
+``successes`` boolean mapping; ``train_outcomes.json`` preserves original
+outcomes for G0 imports and is hashed in the manifest. Re-run preparation for
+old datasets (no new benchmarking); SLCD still accepts old rows. Missing success
+labels on human rows mean all three experts failed.
+
+A single temperature minimizes binary NLL over calibration experts. Then the
+selection split chooses a human threshold maximizing selected-expert success,
+breaking ties by lower mean expert cost. Human succeeds only when all experts
+fail. Otherwise inference maximizes calibrated success probability minus
+``cost_weight`` (β, nonnegative, default 0) times the expert's mean selection-set
+``guardrail_seconds``. All three probabilities strictly below the fitted
+threshold route to human. The checkpoint's ``qwen_router`` config stores
+``objective``, ``temperature``, ``threshold``, ``cost_weight``, and
+``expert_seconds``; missing objective means legacy SLCD behavior.
+
+For this objective, ``predict`` also returns ``success_probabilities``. Its
+``probabilities`` mapping contains independent expert probabilities and human
+probability equal to the product of expert failure probabilities; these four
+values need not sum to one. Confidence is the selected route's probability;
+human selections always set ``needs_review``. Evaluation reports binary NLL,
+mean binary Brier, and pooled 15-bin ECE against actual expert outcomes, rather
+than softmax target calibration. Policy summaries are unchanged. The following
+forced-choice confidence description applies to default SLCD only.
+
 ``QwenRouter(export_path).predict(prompt, confidence_threshold=0.8)`` returns
 ``expert``, ``probabilities``, ``confidence``, ``truncated``, and ``needs_review``.
 The threshold is a caller-selected policy, not a validated safety threshold.
