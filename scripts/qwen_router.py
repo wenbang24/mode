@@ -515,6 +515,7 @@ class QwenRouter:
             raise ValueError("confidence_threshold must be between zero and one")
         logits, truncated = self.raw_logits(prompt)
         if self.objective == "expert_success":
+            logits = logits.cpu()
             successes = {expert: float((logits[ROUTES.index(expert)].double() / self.temperature).sigmoid()) for expert in EXPERTS}
             probabilities = {**successes, HUMAN: math.prod(1 - value for value in successes.values())}
             selected = success_policy(successes, self.threshold, self.cost_weight, self.expert_seconds)
