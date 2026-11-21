@@ -291,7 +291,7 @@ def cache_benchmark(run_dir, destination):
         (destination / "results.jsonl").unlink(missing_ok=True)
 
 
-def discover_bootstrap_cases(root, reference_manifest=None):
+def discover_benchmark_runs(root, reference_manifest=None):
     root = Path(root)
     parquets_by_hash = {}
     for parquet in sorted(root.glob("**/check/generated.parquet")):
@@ -299,9 +299,7 @@ def discover_bootstrap_cases(root, reference_manifest=None):
             parquets_by_hash.setdefault(laya_router.sha256_file(parquet), parquet)
         except OSError:
             continue
-    cases_by_id = {}
-    targets = {}
-    outcomes = {}
+    runs = []
     report = []
     for config_path in sorted(root.glob("**/benchmark/*/run_config.json")):
         run_dir = config_path.parent
@@ -325,26 +323,34 @@ def discover_bootstrap_cases(root, reference_manifest=None):
                         entry["reason"] = f"incompatible experts: {exc}"
                         report.append(entry)
                         continue
-                run_targets = {case["case_id"]: benchmark.targets[case["case_id"]]
-                               for case in benchmark.cases}
-                run_outcomes = {case["case_id"]: benchmark.outcomes[case["case_id"]]
-                                for case in benchmark.cases}
-                screened = benchmark.screened_case_ids
-                added = 0
-                for case in benchmark.cases:
-                    case_id = case["case_id"]
-                    if case_id not in cases_by_id:
-                        cases_by_id[case_id] = case
-                        if case_id in screened:
-                            cases_by_id[case_id] = {**case, "screened": True}
-                        targets[case_id] = run_targets[case_id]
-                        outcomes[case_id] = run_outcomes[case_id]
-                        added += 1
-                entry.update(status="used", parquet=str(parquet), cases_added=added,
-                             screened_skipped=len(screened))
+                runs.append({"run_dir": str(run_dir), "parquet": str(parquet), "benchmark": benchmark})
+                entry.update(status="used", parquet=str(parquet),
+                             screened_skipped=len(benchmark.screened_case_ids))
         except Exception as exc:
             entry["reason"] = f"load error: {exc}"
         report.append(entry)
+    return runs, report
+
+
+def discover_bootstrap_cases(root, reference_manifest=None):
+    runs, report = discover_benchmark_runs(root, reference_manifest)
+    cases_by_id = {}
+    targets = {}
+    outcomes = {}
+    reports_by_run = {entry["run_dir"]: entry for entry in report}
+    for run in runs:
+        benchmark = run["benchmark"]
+        added = 0
+        for case in benchmark.cases:
+            case_id = case["case_id"]
+            screened = case_id in benchmark.screened_case_ids
+            previous = cases_by_id.get(case_id)
+            if previous is None or (previous.get("screened") and not screened):
+                cases_by_id[case_id] = {**case, "screened": True} if screened else case
+                targets[case_id] = benchmark.targets[case_id]
+                outcomes[case_id] = benchmark.outcomes[case_id]
+                added += previous is None
+        reports_by_run[run["run_dir"]]["cases_added"] = added
     return list(cases_by_id.values()), targets, outcomes, report
 
 
@@ -1013,7 +1019,88 @@ def build_g1_cases(balance, generated_cases, generated_targets, seed=42, screene
     return original, selected, target_map, [case["case_id"] for case in leftovers]
 
 
-def prepare_variant(prepared, destination, train_rows, train_cases, targets, variant):
+def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, reserved_cases):
+    """Union validated discover_benchmark_runs entries; reserve selection, calibration and test."""
+    original = list(original_train_cases)
+    reserved = list(reserved_cases)
+    laya_router.assert_disjoint(original, reserved)
+    cases = []
+    targets = {}
+    by_id = {}
+    by_prompt = {}
+
+    def add(case, target):
+        case_id = case["case_id"]
+        prompt = normalize_prompt(case["prompt"])
+        if target not in ROUTES:
+            raise ValueError(f"Invalid G0 target for {case_id}: {target}")
+        if case_id in by_id and by_id[case_id][0] != prompt:
+            raise ValueError(f"Different prompts for G0 case ID {case_id}")
+        previous = by_prompt.get(prompt)
+        if previous is not None and previous != target:
+            raise ValueError(f"Conflicting targets for G0 prompt/case {case_id}: {previous} != {target}")
+        duplicate = case_id in by_id or prompt in by_prompt
+        by_id[case_id] = (prompt, target)
+        by_prompt[prompt] = target
+        if duplicate:
+            return False
+        cases.append(case)
+        targets[case_id] = target
+        return True
+
+    for case in original:
+        if not add(case, original_targets[case["case_id"]]):
+            raise ValueError(f"Duplicate original G0 training case: {case['case_id']}")
+    sources = []
+    for run in sorted(benchmark_runs, key=lambda run: (
+        bool(run["benchmark"].manifest.get("screening_order")), run["run_dir"],
+    )):
+        benchmark = run["benchmark"]
+        added = Counter()
+        duplicates = 0
+        eligible = [case for case in benchmark.cases
+                    if case["case_id"] not in benchmark.screened_case_ids and not case.get("screened")
+                    and set(benchmark.outcomes[case["case_id"]]) == set(laya_router.EXPERTS)]
+        laya_router.assert_disjoint(eligible, reserved)
+        for case in eligible:
+            case_id = case["case_id"]
+            target = benchmark.targets[case_id]
+            if add(case, target):
+                added[target] += 1
+            else:
+                duplicates += 1
+        sources.append({
+            "run_id": Path(run["run_dir"]).name, "run_dir": run["run_dir"],
+            "parquet": run["parquet"],
+            "run_fingerprint": benchmark.manifest["run_fingerprint"],
+            "parquet_sha256": benchmark.manifest["test_sha256"],
+            "cases_added": sum(added.values()), "target_counts": dict(added),
+            "screened_skipped": len(benchmark.cases) - len(eligible), "duplicates_skipped": duplicates,
+        })
+    generated = cases[len(original):]
+    report = {
+        "source_run_ids": [source["run_id"] for source in sources if source["cases_added"]],
+        "sources": sources,
+        "original_cases": len(original), "generated_cases": len(generated),
+        "original_target_counts": dict(Counter(original_targets[case["case_id"]] for case in original)),
+        "generated_target_counts": dict(Counter(targets[case["case_id"]] for case in generated)),
+        "train_target_counts": dict(Counter(targets.values())),
+    }
+    return cases, targets, report
+
+
+def variant_run_name(variant, manifest, seed):
+    if variant == "G0":
+        return f"G0-{laya_router.fingerprint(manifest)[:16]}-seed{seed}"
+    return f"{variant}-seed{seed}"
+
+
+def available_variants(import_dir):
+    return [name for name in ("B0", "B1", "G0", "G1")
+            if (Path(import_dir) / "variants" / name / "manifest.json").is_file()]
+
+
+def prepare_variant(prepared, destination, train_rows, train_cases, targets, variant, *, source_report=None):
     from scripts.laya_router import fingerprint, sha256_file, write_json as laya_write_json
 
     source = Path(prepared["directory"])
@@ -1021,6 +1108,8 @@ def prepare_variant(prepared, destination, train_rows, train_cases, targets, var
     destination.mkdir(parents=True, exist_ok=True)
     manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
     manifest["variant"] = variant
+    if source_report is not None:
+        manifest["generated_union"] = source_report
     manifest["split_case_ids"]["train"] = [case["case_id"] for case in train_cases]
     manifest["targets"].update(targets)
     target_counts = Counter(row["expected"]["expert"] for row in train_rows)

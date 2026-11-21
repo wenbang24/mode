@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -347,6 +348,187 @@ class BootstrapDiscoveryTest(unittest.TestCase):
             self.assertIn("wrong experts", skipped["experts"])
             self.assertIn("load error: Benchmark incomplete", skipped["incomplete"])
             self.assertIn("load error:", skipped["invalid"])
+
+
+class G0UnionTest(unittest.TestCase):
+    def run_data(self, name, cases, targets=None, *, screened=(), screening_order=False):
+        targets = targets or {case["case_id"]: "human" for case in cases}
+        screened = set(screened)
+        benchmark = SimpleNamespace(
+            cases=cases, targets=targets, screened_case_ids=screened,
+            outcomes={case["case_id"]: {
+                expert: {"succeeded": expert == targets[case["case_id"]]}
+                for expert in (("guardagent",) if case["case_id"] in screened else laya_router.EXPERTS)
+            } for case in cases},
+            manifest={"run_fingerprint": name, "test_sha256": "parquet-hash",
+                      **({"screening_order": ["guardagent", "piguard", "adasteer"]} if screening_order else {})},
+        )
+        return {"run_dir": f"benchmark/{name}", "parquet": "round5/check/generated.parquet",
+                "benchmark": benchmark}
+
+    def test_empty_union_and_originals_only(self):
+        cases, targets, report = upsampling.build_g0_cases([], [], {}, reserved_cases=[])
+        self.assertEqual((cases, targets), ([], {}))
+        self.assertEqual(report["source_run_ids"], [])
+        original = make_rows("human", 1)
+        cases, targets, report = upsampling.build_g0_cases(
+            original, [], {original[0]["case_id"]: "human"}, reserved_cases=[])
+        self.assertEqual(cases, original)
+        self.assertEqual(report["generated_cases"], 0)
+
+    def test_no_quotas_and_preserves_originals(self):
+        original = [row for route in laya_router.ROUTES for row in make_rows(route, 3)]
+        generated = [{**row, "case_id": "gen:" + row["case_id"]}
+                     for route in laya_router.ROUTES for row in make_rows(route, 701, start=100)]
+        original_targets = {case["case_id"]: case["target"] for case in original}
+        generated_targets = {case["case_id"]: case["target"] for case in generated}
+        run = self.run_data("full", generated, generated_targets)
+        cases, targets, report = upsampling.build_g0_cases(
+            original, [run], original_targets, reserved_cases=[])
+        self.assertEqual(cases, original + generated)
+        self.assertEqual(targets, {**original_targets, **generated_targets})
+        self.assertEqual(report["train_target_counts"], {route: 704 for route in laya_router.ROUTES})
+        self.assertEqual(report["generated_target_counts"], {route: 701 for route in laya_router.ROUTES})
+        self.assertEqual(report["source_run_ids"], ["full"])
+
+    def test_unscreened_wins_regardless_of_input_and_path_order(self):
+        shared = {"case_id": "shared", "prompt": "Shared prompt"}
+        skipped = {"case_id": "skipped", "prompt": "Skipped prompt"}
+        old = self.run_data("a-screened", [shared, skipped], {"shared": "guardagent", "skipped": "guardagent"},
+                            screened=["shared", "skipped"], screening_order=True)
+        new = self.run_data("z-unscreened", [shared], {"shared": "piguard"})
+        for runs in ([old, new], [new, old]):
+            cases, targets, report = upsampling.build_g0_cases([], runs, {}, reserved_cases=[])
+            self.assertEqual(cases, [shared])
+            self.assertEqual(targets, {"shared": "piguard"})
+            self.assertEqual(report["source_run_ids"], ["z-unscreened"])
+            self.assertEqual(report["sources"][1]["screened_skipped"], 2)
+
+    def test_duplicate_ids_and_normalized_prompts_and_original_duplicates(self):
+        original = [{"case_id": "original", "prompt": "Original"}]
+        a = {"case_id": "a", "prompt": "A prompt"}
+        alias = {"case_id": "alias", "prompt": " A  PROMPT "}
+        original_alias = {"case_id": "original-alias", "prompt": " ORIGINAL "}
+        runs = [self.run_data("first", [a, original_alias]), self.run_data("second", [a, alias])]
+        cases, targets, report = upsampling.build_g0_cases(
+            original, runs, {"original": "human"}, reserved_cases=[])
+        self.assertEqual(cases, original + [a])
+        self.assertEqual(targets, {"original": "human", "a": "human"})
+        self.assertEqual(sum(s["duplicates_skipped"] for s in report["sources"]), 3)
+
+    def test_conflicting_targets_and_case_identity_fail(self):
+        a = {"case_id": "a", "prompt": "A prompt"}
+        for conflict in ({"case_id": "alias", "prompt": " A PROMPT "}, a):
+            runs = [self.run_data("a", [a]), self.run_data("b", [conflict], {conflict["case_id"]: "piguard"})]
+            with self.subTest(conflict=conflict), self.assertRaisesRegex(ValueError, "Conflicting targets"):
+                upsampling.build_g0_cases([], runs, {}, reserved_cases=[])
+        with self.assertRaisesRegex(ValueError, "Conflicting targets"):
+            upsampling.build_g0_cases([a], [self.run_data("b", [a], {"a": "piguard"})],
+                                     {"a": "human"}, reserved_cases=[])
+        with self.assertRaisesRegex(ValueError, "Different prompts"):
+            upsampling.build_g0_cases([], [self.run_data("a", [a]), self.run_data(
+                "b", [{"case_id": "a", "prompt": "Different"}])], {}, reserved_cases=[])
+
+    def test_reserved_test_selection_and_calibration_overlap_rejected(self):
+        reserved = [{"case_id": "test", "prompt": "Reserved test"},
+                    {"case_id": "selection", "prompt": "Selection"},
+                    {"case_id": "calibration", "prompt": "Calibration"}]
+        for case in reserved:
+            for overlap in (case, {"case_id": "alias", "prompt": " " + case["prompt"].upper() + " "}):
+                with self.subTest(overlap=overlap), self.assertRaisesRegex(ValueError, "overlap"):
+                    upsampling.build_g0_cases([], [self.run_data("a", [overlap])], {}, reserved_cases=reserved)
+        with self.assertRaisesRegex(ValueError, "overlap"):
+            upsampling.build_g0_cases([reserved[0]], [], {"test": "human"}, reserved_cases=reserved)
+
+    def test_fully_measured_rows_in_screened_run_and_unknown_coverage(self):
+        cases = [{"case_id": "full", "prompt": "Full"}, {"case_id": "partial", "prompt": "Partial"}]
+        run = self.run_data("screened", cases, screening_order=True)
+        run["benchmark"].outcomes["partial"].pop("adasteer")
+        union, _, report = upsampling.build_g0_cases([], [run], {}, reserved_cases=[])
+        self.assertEqual(union, [cases[0]])
+        self.assertEqual(report["sources"][0]["screened_skipped"], 1)
+
+    def test_discovery_pairs_archives_skips_incomplete_and_bootstrap_upgrades(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parquet = root / "round5/check/generated.parquet"
+            parquet.parent.mkdir(parents=True)
+            parquet.write_bytes(b"archive")
+            case = {"case_id": "shared", "prompt": "Shared"}
+            old = self.run_data("a-screened", [case], {"shared": "guardagent"},
+                                screened=["shared"], screening_order=True)["benchmark"]
+            new = self.run_data("z-unscreened", [case], {"shared": "piguard"})["benchmark"]
+            for name in ("a-screened", "z-unscreened", "partial"):
+                directory = root / "benchmark" / name
+                directory.mkdir(parents=True)
+                (directory / "run_config.json").write_text(json.dumps({
+                    "target_rule": "most_confident_successful", "selected_guardrails": list(laya_router.EXPERTS),
+                    "test_sha256": laya_router.sha256_file(parquet),
+                }))
+
+            def load(directory, paired_parquet, **kwargs):
+                self.assertEqual(paired_parquet, parquet)
+                if directory.name == "partial":
+                    raise ValueError("Benchmark incomplete")
+                return old if directory.name == "a-screened" else new
+
+            with mock.patch.object(laya_router, "load_benchmark", side_effect=load):
+                runs, report = upsampling.discover_benchmark_runs(root)
+                cases, targets, outcomes, _ = upsampling.discover_bootstrap_cases(root)
+            self.assertEqual(len(runs), 2)
+            self.assertEqual(cases, [case])
+            self.assertEqual(targets, {"shared": "piguard"})
+            self.assertEqual(outcomes, new.outcomes)
+            self.assertIn("incomplete", next(r for r in report if Path(r["run_dir"]).name == "partial")["reason"])
+
+    def test_g0_names_prevent_reusing_historical_or_changed_unions(self):
+        first = upsampling.variant_run_name("G0", {"generated_union": {"generated_cases": 1}}, 42)
+        second = upsampling.variant_run_name("G0", {"generated_union": {"generated_cases": 2}}, 42)
+        self.assertNotEqual(first, "G0-seed42")
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, upsampling.variant_run_name("G0", {"generated_union": {"generated_cases": 1}}, 42))
+        self.assertEqual(upsampling.variant_run_name("B0", {}, 42), "B0-seed42")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertEqual(upsampling.available_variants(root), [])
+            (root / "variants/G0").mkdir(parents=True)
+            (root / "variants/G0/manifest.json").write_text("{}")
+            self.assertEqual(upsampling.available_variants(root), ["G0"])
+
+    def test_g0_variant_records_sources_and_preserves_held_out_splits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "prepared"
+            source.mkdir()
+            held_out = {
+                "validation.jsonl": b'{"state":"selection"}\n',
+                "calibration.jsonl": b'{"state":"calibration"}\n',
+                "validation_cases.json": b'[{"case":{"case_id":"selection","prompt":"Selection"}}]',
+                "calibration_cases.json": b'[{"case":{"case_id":"calibration","prompt":"Calibration"}}]',
+            }
+            for name, content in held_out.items():
+                (source / name).write_bytes(content)
+            manifest = {"split_case_ids": {"train": [], "validation": ["selection"], "calibration": ["calibration"]},
+                        "splits": {"validation": {"cases": 1}, "calibration": {"cases": 1}},
+                        "targets": {"selection": "human", "calibration": "human"}, "test_sha256": "reserved-test"}
+            (source / "manifest.json").write_text(json.dumps(manifest))
+            case = {"case_id": "generated", "prompt": "Generated", "prompt_harm_label": "harmful"}
+            cases, targets, report = upsampling.build_g0_cases(
+                [], [self.run_data("818025565678e9e6", [case])], {}, reserved_cases=[])
+            variant = upsampling.prepare_variant(
+                {"directory": str(source)}, root / "G0", laya_router.labeled_rows(cases, targets),
+                cases, targets, "G0", source_report=report)
+            result = variant["manifest"]
+            self.assertEqual(result["generated_union"]["source_run_ids"], ["818025565678e9e6"])
+            self.assertEqual(result["generated_union"]["generated_target_counts"], {"human": 1})
+            self.assertEqual(result["splits"]["train"]["target_counts"], {"human": 1})
+            self.assertEqual(result["test_sha256"], "reserved-test")
+            for split in ("validation", "calibration"):
+                self.assertEqual(result["splits"][split], manifest["splits"][split])
+                self.assertEqual(result["split_case_ids"][split], manifest["split_case_ids"][split])
+            for name, content in held_out.items():
+                self.assertEqual((root / "G0" / name).read_bytes(), content)
+                self.assertEqual(result["file_sha256"][name], laya_router.sha256_file(source / name))
 
 
 class GenerationTest(unittest.TestCase):

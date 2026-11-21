@@ -23,7 +23,7 @@ def title(mo):
     mo.md(r"""
     # MoDE router up-sampling
 
-    Prepare a resumable, route-balanced training set and compare B0, B1, and G1.
+    Prepare resumable training sets and compare B0, B1, G0 (unbalanced union), and G1.
     Validation, calibration, and Aegis test membership are frozen. The generated
     cases are exported for a **separate** `benchmark_guardrails.py` run across all
     three experts, then imported here using `most_confident_successful` (all-failed
@@ -855,11 +855,14 @@ def confidence_action(
 @app.cell
 def import_controls(mo):
     import_button = mo.ui.run_button(label="8 · Import benchmark and build G1")
+    g0_import_button = mo.ui.run_button(label="8 · Build G0 from all discovered benchmark rounds")
     mo.vstack([
         mo.md("## Import measured routes"),
         import_button,
+        mo.md("G0 keeps every original training case plus all fully measured generated cases from compatible cached benchmarks, including archived rounds. No quotas. Rebuild after restoring new reports/parquets; selection, calibration and reserved test stay unchanged."),
+        g0_import_button,
     ])
-    return (import_button,)
+    return g0_import_button, import_button
 
 
 @app.cell
@@ -985,9 +988,48 @@ def import_action(
 
 
 @app.cell
+def g0_import_action(
+    current_prepared, fs, g0_import_button, json, laya_router, mo,
+    output_control, Path, test_parquet_control, training_cases, upsampling,
+):
+    if g0_import_button.value:
+        try:
+            if current_prepared is None:
+                raise ValueError("Prepare data first")
+            _prepared_dir = Path(current_prepared["directory"])
+            _root = Path(output_control.value) / "upsampling" / _prepared_dir.name
+            _runs, _discovery = upsampling.discover_benchmark_runs(
+                _root, current_prepared["manifest"]["benchmark"])
+            _originals = json.loads((_prepared_dir / "train_cases.json").read_text())
+            if laya_router.sha256_file(test_parquet_control.value) != current_prepared["manifest"]["test_sha256"]:
+                raise ValueError("Reserved test parquet differs from preparation")
+            _reserved = training_cases.read_cases(test_parquet_control.value, expected_rows=None)
+            for _split in ("validation", "calibration"):
+                _entries = json.loads((_prepared_dir / f"{_split}_cases.json").read_text())
+                _reserved.extend(_entry["case"] for _entry in _entries)
+            _cases, _targets, _report = upsampling.build_g0_cases(
+                _originals, _runs, current_prepared["manifest"]["targets"], reserved_cases=_reserved)
+            _report["discovery"] = _discovery
+            _destination = _root / "import/variants/G0"
+            upsampling.prepare_variant(
+                current_prepared, _destination, laya_router.labeled_rows(_cases, _targets),
+                _cases, _targets, "G0", source_report=_report)
+            upsampling.finish_step(
+                _destination, _report, fs,
+                f"MoDE/upsampling/{_prepared_dir.name}/import/variants/G0")
+            _view = mo.callout(json.dumps(_report, indent=2), kind="success")
+        except Exception as exc:
+            _view = mo.callout(f"G0 union import failed: {exc}", kind="danger")
+    else:
+        _view = mo.md("G0 union import is idle.")
+    _view
+    return
+
+
+@app.cell
 def experiment_controls(mo):
     test_benchmark_control = mo.ui.text(value="", label="Aegis test benchmark run directory (optional)", full_width=True)
-    train_button = mo.ui.run_button(label="9 · Train all remaining B0/B1/G1 seed runs")
+    train_button = mo.ui.run_button(label="9 · Train remaining imported B0/B1/G0/G1 seed runs")
     mo.vstack([
         mo.md("## Experiments"),
         test_benchmark_control,
@@ -1025,14 +1067,17 @@ def experiment_action(
             if not _base_directory:
                 raise ValueError("Download the base checkpoint first")
             _results = []
-            for _variant in ("B0", "B1", "G1"):
+            _variants = upsampling.available_variants(_root / "import")
+            if not _variants:
+                raise ValueError("Import at least one training variant first")
+            for _variant in _variants:
                 _variant_dir = _root / "import/variants" / _variant
                 _prepared = {
                     "directory": str(_variant_dir),
                     "manifest": json.loads((_variant_dir / "manifest.json").read_text()),
                 }
                 for _seed in (42, 43, 44):
-                    _name = f"{_variant}-seed{_seed}"
+                    _name = upsampling.variant_run_name(_variant, _prepared["manifest"], _seed)
                     _result = upsampling.run_experiment(
                         _prepared, _base_directory, _root, _name,
                         {**training_settings, "epochs": 1, "seed": _seed},
@@ -1086,7 +1131,11 @@ def summary_action(
             _root = Path(output_control.value) / "upsampling" / _prep_name
             _summary_dir = _root / "summary"
             _summary_path = _summary_dir / "summary.json"
-            if (_summary_dir / "done.json").is_file() and _summary_path.is_file():
+            _variants = upsampling.available_variants(_root / "import")
+            if not _variants:
+                raise ValueError("Import at least one training variant first")
+            _cached = json.loads(_summary_path.read_text()) if _summary_path.is_file() else {}
+            if (_summary_dir / "done.json").is_file() and set(_cached) == set(_variants) and "G0" not in _variants:
                 upsampling.ensure_uploaded(
                     fs, _summary_dir, f"MoDE/upsampling/{_prep_name}/summary")
                 summary_report = json.loads(_summary_path.read_text())
@@ -1107,11 +1156,14 @@ def summary_action(
                     _test_data = laya_router.load_benchmark(
                         test_benchmark_control.value.strip(), test_parquet_control.value,
                         expected_rows=1914, split="test")
-                for _variant in ("B0", "B1", "G1"):
+                for _variant in _variants:
+                    _variant_manifest = json.loads(
+                        (_root / "import/variants" / _variant / "manifest.json").read_text())
                     _validation_predictions = {}
                     _test_predictions = {}
                     for _seed in (42, 43, 44):
-                        _run_dir = _root / "runs" / f"{_variant}-seed{_seed}"
+                        _name = upsampling.variant_run_name(_variant, _variant_manifest, _seed)
+                        _run_dir = _root / "runs" / _name
                         _validation_report = json.loads((_run_dir / "validation_report.json").read_text())
                         _validation_predictions[_seed] = {
                             row["case_id"]: row
