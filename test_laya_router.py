@@ -305,7 +305,8 @@ class RouterDataTest(unittest.TestCase):
         directory = Path(prepared["directory"])
         for split in ("train", "validation"):
             rows = [json.loads(line) for line in (directory / f"{split}.jsonl").read_text().splitlines()]
-            self.assertTrue(all(set(row) == {"state", "questions", "expected"} for row in rows))
+            self.assertTrue(all(set(row) == {"state", "questions", "expected", "successes"} for row in rows))
+            self.assertTrue(all(set(row["successes"]) == set(lr.EXPERTS) for row in rows))
             self.assertTrue(all(isinstance(row["state"], str) for row in rows))
         splits = prepared["manifest"]["splits"]
         self.assertEqual(splits["train"]["cases"], 16)

@@ -811,6 +811,8 @@ def run_folds(prepared, base_dir, output_root, settings, device="auto", *, fs=No
         data_dir.mkdir(parents=True, exist_ok=True)
         for name in ("validation.jsonl", "calibration.jsonl"):
             shutil.copy2(prep_dir / name, data_dir / name)
+        if fit_settings["objective"] == "expert_success":
+            shutil.copy2(prep_dir / "validation_cases.json", data_dir / "validation_cases.json")
         training = fold_training_rows(fold_rows, fold_index)
         (data_dir / "train.jsonl").write_text(
             "".join(json.dumps({key: value for key, value in row.items() if key != "target"}, ensure_ascii=False) + "\n"
@@ -1019,8 +1021,8 @@ def build_g1_cases(balance, generated_cases, generated_targets, seed=42, screene
     return original, selected, target_map, [case["case_id"] for case in leftovers]
 
 
-def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, reserved_cases):
-    """Union validated discover_benchmark_runs entries; reserve selection, calibration and test."""
+def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, reserved_cases, outcomes=None):
+    """Union validated runs; extend supplied original outcomes with accepted generated outcomes."""
     original = list(original_train_cases)
     reserved = list(reserved_cases)
     laya_router.assert_disjoint(original, reserved)
@@ -1049,6 +1051,8 @@ def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, re
         return True
 
     for case in original:
+        if outcomes is not None and case["case_id"] not in outcomes:
+            raise ValueError("Missing original train outcomes; re-run preparation (no benchmarking needed)")
         if not add(case, original_targets[case["case_id"]]):
             raise ValueError(f"Duplicate original G0 training case: {case['case_id']}")
     sources = []
@@ -1066,6 +1070,8 @@ def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, re
             case_id = case["case_id"]
             target = benchmark.targets[case_id]
             if add(case, target):
+                if outcomes is not None:
+                    outcomes[case_id] = benchmark.outcomes[case_id]
                 added[target] += 1
             else:
                 duplicates += 1
@@ -1101,7 +1107,7 @@ def available_variants(import_dir):
             if (Path(import_dir) / "variants" / name / "manifest.json").is_file()]
 
 
-def prepare_variant(prepared, destination, train_rows, train_cases, targets, variant, *, source_report=None):
+def prepare_variant(prepared, destination, train_rows, train_cases, targets, variant, *, source_report=None, train_outcomes=None):
     from scripts.laya_router import fingerprint, sha256_file, write_json as laya_write_json
 
     source = Path(prepared["directory"])
@@ -1124,6 +1130,10 @@ def prepare_variant(prepared, destination, train_rows, train_cases, targets, var
     (destination / "train.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in train_rows), encoding="utf-8")
     laya_write_json(destination / "train_cases.json", train_cases)
+    if train_outcomes is not None:
+        laya_write_json(destination / "train_outcomes.json", train_outcomes)
+    elif (source / "train_outcomes.json").is_file():
+        shutil.copy2(source / "train_outcomes.json", destination / "train_outcomes.json")
     manifest.pop("file_sha256", None)
     manifest["file_sha256"] = {
         name: sha256_file(destination / name)
@@ -1132,6 +1142,8 @@ def prepare_variant(prepared, destination, train_rows, train_cases, targets, var
             "calibration_cases.json", "train_cases.json",
         )
     }
+    if (destination / "train_outcomes.json").is_file():
+        manifest["file_sha256"]["train_outcomes.json"] = sha256_file(destination / "train_outcomes.json")
     laya_write_json(destination / "manifest.json", manifest)
     return {"directory": str(destination), "manifest": manifest, "fingerprint": fingerprint(manifest)}
 

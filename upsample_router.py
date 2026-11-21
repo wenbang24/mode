@@ -116,6 +116,8 @@ def controls(DEFAULT_SETTINGS, WORKSPACE, mo):
     base_path_control = mo.ui.text(value="", label="Saved base checkpoint directory (optional)", full_width=True)
     device_control = mo.ui.dropdown(options=["auto", "cuda", "cpu"], value="auto", label="Training device")
     training_controls = mo.ui.dictionary({
+        "objective": mo.ui.dropdown(options=["slcd", "expert_success"], value=DEFAULT_SETTINGS["objective"], label="Objective"),
+        "cost_weight": mo.ui.number(start=0, value=DEFAULT_SETTINGS["cost_weight"], step=0.01, label="Expert cost weight β (per second)"),
         "micro_batch": mo.ui.number(start=1, value=DEFAULT_SETTINGS["micro_batch"], step=1, label="Micro-batch"),
         "grad_accum": mo.ui.number(start=1, value=DEFAULT_SETTINGS["grad_accum"], step=1, label="Gradient accumulation"),
         "learning_rate": mo.ui.number(start=0.000001, value=DEFAULT_SETTINGS["learning_rate"], step=0.000001, label="Learning rate"),
@@ -937,9 +939,10 @@ def import_action(
                 }
                 _g1_targets.update(_original_targets)
                 _g1_cases = _originals + _added
-                _g1_rows = laya_router.labeled_rows(_g1_cases, _g1_targets)
-
                 _source_train = upsampling.read_jsonl(Path(current_prepared["directory"]) / "train.jsonl")
+                _source_by_prompt = {row["state"]: row for row in _source_train}
+                _g1_rows = ([_source_by_prompt[case["prompt"]] for case in _originals]
+                            + laya_router.labeled_rows(_added, _g1_targets, _benchmark.outcomes))
                 _b0_cases = json.loads((Path(current_prepared["directory"]) / "train_cases.json").read_text())
                 _b0_targets = {case["case_id"]: current_prepared["manifest"]["targets"][case["case_id"]]
                                for case in _b0_cases}
@@ -1001,6 +1004,9 @@ def g0_import_action(
             _runs, _discovery = upsampling.discover_benchmark_runs(
                 _root, current_prepared["manifest"]["benchmark"])
             _originals = json.loads((_prepared_dir / "train_cases.json").read_text())
+            if not (_prepared_dir / "train_outcomes.json").is_file():
+                raise ValueError("Missing train outcomes; re-run preparation (no benchmarking needed)")
+            _outcomes = json.loads((_prepared_dir / "train_outcomes.json").read_text())
             if laya_router.sha256_file(test_parquet_control.value) != current_prepared["manifest"]["test_sha256"]:
                 raise ValueError("Reserved test parquet differs from preparation")
             _reserved = training_cases.read_cases(test_parquet_control.value, expected_rows=None)
@@ -1008,12 +1014,12 @@ def g0_import_action(
                 _entries = json.loads((_prepared_dir / f"{_split}_cases.json").read_text())
                 _reserved.extend(_entry["case"] for _entry in _entries)
             _cases, _targets, _report = upsampling.build_g0_cases(
-                _originals, _runs, current_prepared["manifest"]["targets"], reserved_cases=_reserved)
+                _originals, _runs, current_prepared["manifest"]["targets"], reserved_cases=_reserved, outcomes=_outcomes)
             _report["discovery"] = _discovery
             _destination = _root / "import/variants/G0"
             upsampling.prepare_variant(
-                current_prepared, _destination, laya_router.labeled_rows(_cases, _targets),
-                _cases, _targets, "G0", source_report=_report)
+                current_prepared, _destination, laya_router.labeled_rows(_cases, _targets, _outcomes),
+                _cases, _targets, "G0", source_report=_report, train_outcomes=_outcomes)
             upsampling.finish_step(
                 _destination, _report, fs,
                 f"MoDE/upsampling/{_prepared_dir.name}/import/variants/G0")

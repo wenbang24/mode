@@ -351,6 +351,16 @@ class BootstrapDiscoveryTest(unittest.TestCase):
 
 
 class G0UnionTest(unittest.TestCase):
+    def test_union_successes_include_original_and_generated(self):
+        original = {"case_id": "original", "prompt": "original prompt"}
+        generated = {"case_id": "generated", "prompt": "generated prompt"}
+        outcomes = {"original": {expert: {"succeeded": expert != "guardagent"} for expert in laya_router.EXPERTS}}
+        run = self.run_data("new", [generated], {"generated": "guardagent"})
+        cases, targets, _ = upsampling.build_g0_cases([original], [run], {"original": "adasteer"}, reserved_cases=[], outcomes=outcomes)
+        rows = laya_router.labeled_rows(cases, targets, outcomes)
+        self.assertEqual(rows[0]["successes"], {"adasteer": True, "piguard": True, "guardagent": False})
+        self.assertEqual(rows[1]["successes"], {"adasteer": False, "piguard": False, "guardagent": True})
+
     def run_data(self, name, cases, targets=None, *, screened=(), screening_order=False):
         targets = targets or {case["case_id"]: "human" for case in cases}
         screened = set(screened)
@@ -513,12 +523,16 @@ class G0UnionTest(unittest.TestCase):
                         "targets": {"selection": "human", "calibration": "human"}, "test_sha256": "reserved-test"}
             (source / "manifest.json").write_text(json.dumps(manifest))
             case = {"case_id": "generated", "prompt": "Generated", "prompt_harm_label": "harmful"}
+            outcomes = {}
             cases, targets, report = upsampling.build_g0_cases(
-                [], [self.run_data("818025565678e9e6", [case])], {}, reserved_cases=[])
+                [], [self.run_data("818025565678e9e6", [case])], {}, reserved_cases=[], outcomes=outcomes)
             variant = upsampling.prepare_variant(
-                {"directory": str(source)}, root / "G0", laya_router.labeled_rows(cases, targets),
-                cases, targets, "G0", source_report=report)
+                {"directory": str(source)}, root / "G0", laya_router.labeled_rows(cases, targets, outcomes),
+                cases, targets, "G0", source_report=report, train_outcomes=outcomes)
             result = variant["manifest"]
+            self.assertEqual(json.loads((root / "G0/train_outcomes.json").read_text()), outcomes)
+            self.assertEqual(result["file_sha256"]["train_outcomes.json"], laya_router.sha256_file(root / "G0/train_outcomes.json"))
+            self.assertEqual(upsampling.read_jsonl(root / "G0/train.jsonl")[0]["successes"], dict.fromkeys(laya_router.EXPERTS, False))
             self.assertEqual(result["generated_union"]["source_run_ids"], ["818025565678e9e6"])
             self.assertEqual(result["generated_union"]["generated_target_counts"], {"human": 1})
             self.assertEqual(result["splits"]["train"]["target_counts"], {"human": 1})
