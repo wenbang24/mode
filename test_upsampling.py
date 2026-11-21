@@ -1404,3 +1404,11 @@ class GeneratedExportTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_g0_run_name_ignores_discovery_report():
+    from scripts import upsampling
+    manifest = {"variant": "G0", "generated_union": {"sources": [{"run_id": "a"}], "discovery": [{"status": "used"}]}}
+    changed = {**manifest, "generated_union": {**manifest["generated_union"],
+                                               "discovery": [{"status": "used"}, {"status": "skipped"}]}}
+    assert upsampling.variant_run_name("G0", manifest, 42) == upsampling.variant_run_name("G0", changed, 42)

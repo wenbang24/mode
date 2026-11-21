@@ -1091,7 +1091,8 @@ def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, re
 
 def variant_run_name(variant, manifest, seed):
     if variant == "G0":
-        return f"G0-{laya_router.fingerprint(manifest)[:16]}-seed{seed}"
+        union = {key: value for key, value in manifest.get("generated_union", {}).items() if key != "discovery"}
+        return f"G0-{laya_router.fingerprint({**manifest, 'generated_union': union})[:16]}-seed{seed}"
     return f"{variant}-seed{seed}"
 
 
