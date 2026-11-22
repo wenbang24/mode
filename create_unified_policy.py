@@ -35,6 +35,7 @@ def imports():
 
     from scripts.local_judge import (
         LocalJudgeServer,
+        judge_key,
         normalize_endpoint,
         positive_timeout,
         server_panel,
@@ -58,6 +59,7 @@ def imports():
     output_root = workspace / "artifacts" / "unified_policy"
     return (
         dataset_files,
+        judge_key,
         local_server,
         mo,
         normalize_endpoint,
@@ -170,6 +172,28 @@ def training_controls(
         value="Boolean",
         label="Policy output",
     )
+    synthesis_model_control = mo.ui.dropdown(
+        options=["Local judge", "Cloud model"],
+        value="Local judge",
+        label="Model for combining and final synthesis",
+    )
+    cloud_api_base_control = mo.ui.text(
+        value="https://ai.hackclub.com/proxy/v1",
+        label="Cloud API base (key from JUDGE_API_KEY or HACKCLUB_API_KEY)",
+        full_width=True,
+    )
+    cloud_model_control = mo.ui.text(
+        value="openai/gpt-5.6-luna",
+        label="Cloud model",
+        full_width=True,
+    )
+    cloud_combine_levels_control = mo.ui.number(
+        start=0,
+        stop=20,
+        value=1,
+        step=1,
+        label="Top combining rounds on the cloud model (0 = synthesis only)",
+    )
     generate_button = mo.ui.button(
         label="Generate one policy",
         on_click=lambda _: build_request_set(build_request_get() + 1),
@@ -179,16 +203,27 @@ def training_controls(
             mo.md("## Build one policy"),
             mo.hstack([dataset_control, sample_count_control, sample_seed_control]),
             mo.hstack([batch_size_control, strategy_control, output_mode_control]),
+            mo.md(
+                "Batch summaries always use the local judge. With **Cloud model**, "
+                "the final synthesis (and its repair retry) and the top combining "
+                "rounds use the cloud model instead."
+            ),
+            mo.hstack([synthesis_model_control, cloud_combine_levels_control]),
+            mo.hstack([cloud_api_base_control, cloud_model_control]),
             generate_button,
         ]
     )
     return (
         batch_size_control,
+        cloud_api_base_control,
+        cloud_combine_levels_control,
+        cloud_model_control,
         dataset_control,
         sample_count_control,
         sample_seed_control,
         strategy_control,
         output_mode_control,
+        synthesis_model_control,
     )
 
 
@@ -247,7 +282,15 @@ def policy_engine():
     from urllib.error import HTTPError
     from urllib.request import Request, urlopen
 
-    def call_model(api_base, model, messages, timeout, max_tokens, on_response=None):
+    def call_model(
+        api_base,
+        model,
+        messages,
+        timeout,
+        max_tokens,
+        on_response=None,
+        api_key="",
+    ):
         from scripts.local_judge import request_headers
 
         payload = {
@@ -259,7 +302,7 @@ def policy_engine():
         request = Request(
             api_base.rstrip("/") + "/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=request_headers(""),
+            headers=request_headers(api_key),
             method="POST",
         )
         try:
@@ -268,7 +311,7 @@ def policy_engine():
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:800]
             raise RuntimeError(
-                f"Local model request failed ({exc.code}): {detail}"
+                f"Model request failed ({exc.code}): {detail}"
             ) from exc
 
         try:
@@ -276,7 +319,7 @@ def policy_engine():
             content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(
-                "Local model returned no chat completion content"
+                "Model returned no chat completion content"
             ) from exc
         if isinstance(content, list):
             content = "".join(
@@ -285,18 +328,18 @@ def policy_engine():
                 if isinstance(part, dict)
             )
         if not isinstance(content, str):
-            raise RuntimeError("Local model returned non-text completion content")
+            raise RuntimeError("Model returned non-text completion content")
 
         finish_reason = choice.get("finish_reason")
         if on_response is not None:
             on_response(content, finish_reason)
         if finish_reason == "length":
             raise RuntimeError(
-                f"Local model reached its {max_tokens:,}-token output limit; "
+                f"{model} reached its {max_tokens:,}-token output limit; "
                 "the partial response was saved before validation."
             )
         if not content.strip():
-            raise RuntimeError("Local model returned empty chat completion content")
+            raise RuntimeError("Model returned empty chat completion content")
         return content.strip()
 
     def extract_python_source(content):
@@ -362,7 +405,15 @@ def policy_engine():
         timeout,
         progress,
         candidate_sink=None,
+        synthesis=None,
     ):
+        """Build a policy; ``synthesis`` optionally routes combining and synthesis.
+
+        ``synthesis`` is ``{"api_base", "model", "api_key", "combine_levels"}``.
+        Batch summaries always use the local ``api_base``/``model``; the final
+        synthesis, its repair retry, and the top ``combine_levels`` combining
+        rounds use the synthesis model.
+        """
         if not rows:
             raise ValueError("Select at least one training case")
         if batch_size < 1:
@@ -387,6 +438,31 @@ def policy_engine():
             for start in range(0, len(rows), batch_size)
         ]
         calls = 0
+        local_target = {"api_base": api_base, "model": model, "api_key": ""}
+        synthesis_target = (
+            {key: synthesis[key] for key in ("api_base", "model", "api_key")}
+            if synthesis
+            else local_target
+        )
+        combine_levels = int(synthesis["combine_levels"]) if synthesis else 0
+        if combine_levels < 0:
+            raise ValueError("Cloud combining rounds must be zero or more")
+        calls_by_model = {}
+
+        def ask(target, messages, max_tokens, on_response=None):
+            nonlocal calls
+            content = call_model(
+                target["api_base"],
+                target["model"],
+                messages,
+                timeout,
+                max_tokens=max_tokens,
+                on_response=on_response,
+                api_key=target["api_key"],
+            )
+            calls += 1
+            calls_by_model[target["model"]] = calls_by_model.get(target["model"], 0) + 1
+            return content
 
         def save_model_response(content, finish_reason):
             if candidate_sink is not None:
@@ -438,22 +514,25 @@ def policy_engine():
                 progress(
                     f"Summarizing training batch {index:,}/{len(batches):,}"
                 )
-                summary = call_model(
-                    api_base,
-                    model,
+                summary = ask(
+                    local_target,
                     messages_for_examples(
                         batch,
                         "Return concise, reusable decision rules for these "
                         "examples. Describe allow and block distinctions. Do not "
                         "write code.",
                     ),
-                    timeout,
                     max_tokens=768,
                 )
                 summaries.append(summary)
-                calls += 1
 
             fan_in = max(2, batch_size)
+            total_rounds = 0
+            remaining = len(summaries)
+            while remaining > fan_in:
+                remaining = -(-remaining // fan_in)
+                total_rounds += 1
+            first_cloud_round = total_rounds - combine_levels + 1
             reduction_round = 0
             while len(summaries) > fan_in:
                 reduction_round += 1
@@ -464,17 +543,22 @@ def policy_engine():
                     summaries[start:start + fan_in]
                     for start in range(0, len(summaries), fan_in)
                 ]
+                round_target = (
+                    synthesis_target
+                    if reduction_round >= first_cloud_round
+                    else local_target
+                )
                 for index, group in enumerate(groups, 1):
                     if len(group) == 1:
                         reduced.append(group[0])
                         continue
                     progress(
-                        f"Combining policy notes, round {reduction_round}, "
-                        f"group {index:,}/{len(groups):,}"
+                        f"Combining policy notes, round {reduction_round}/"
+                        f"{total_rounds}, group {index:,}/{len(groups):,} "
+                        f"with {round_target['model']}"
                     )
-                    combined = call_model(
-                        api_base,
-                        model,
+                    combined = ask(
+                        round_target,
                         [
                             {
                                 "role": "system",
@@ -494,21 +578,21 @@ def policy_engine():
                                 ),
                             },
                         ],
-                        timeout,
                         max_tokens=768,
                     )
                     reduced.append(combined)
-                    calls += 1
                 if len(reduced) >= len(summaries):
                     raise RuntimeError(
                         "Policy-note reduction did not shrink the input"
                     )
                 summaries = reduced
 
-            progress("Synthesizing the single Python classifier")
-            source = call_model(
-                api_base,
-                model,
+            progress(
+                "Synthesizing the single Python classifier with "
+                f"{synthesis_target['model']}"
+            )
+            source = ask(
+                synthesis_target,
                 [
                     {
                         "role": "system",
@@ -534,11 +618,9 @@ def policy_engine():
                         ),
                     },
                 ],
-                timeout,
                 max_tokens=2048,
                 on_response=save_model_response,
             )
-            calls += 1
         elif strategy == "Iterative policy update":
             source = ""
             for index, batch in enumerate(batches, 1):
@@ -556,9 +638,8 @@ def policy_engine():
                         "keyword lists."
                     ),
                 }
-                source = call_model(
-                    api_base,
-                    model,
+                source = ask(
+                    local_target,
                     [
                         {
                             "role": "system",
@@ -583,13 +664,11 @@ def policy_engine():
                             ),
                         },
                     ],
-                    timeout,
                     max_tokens=2048,
                     on_response=save_model_response,
                 )
                 source = extract_python_source(source)
                 validate_policy_syntax(source, output_mode)
-                calls += 1
         else:
             raise ValueError(f"Unknown policy-building strategy: {strategy}")
 
@@ -602,9 +681,8 @@ def policy_engine():
             progress(
                 "Generated source failed validation; retrying once with the parser error"
             )
-            source = call_model(
-                api_base,
-                model,
+            source = ask(
+                synthesis_target,
                 [
                     {
                         "role": "system",
@@ -630,17 +708,16 @@ def policy_engine():
                         ),
                     },
                 ],
-                timeout,
                 max_tokens=2048,
                 on_response=save_model_response,
             )
-            calls += 1
             source = extract_python_source(source)
             validate_policy_syntax(source, output_mode)
 
         return source, {
             "training_batches": len(batches),
             "model_calls": calls,
+            "model_calls_by_model": calls_by_model,
         }
 
     def evaluate_classifier(source, rows, output_mode="Boolean"):
@@ -788,8 +865,12 @@ def generate_policy_action(
     build_state_set,
     build_status_get,
     build_status_set,
+    cloud_api_base_control,
+    cloud_combine_levels_control,
+    cloud_model_control,
     dataset_config,
     dataset_name,
+    judge_key,
     normalize_endpoint,
     output_mode_control,
     output_root,
@@ -801,6 +882,7 @@ def generate_policy_action(
     server_settings,
     strategy_control,
     local_server,
+    synthesis_model_control,
     write_json,
 ):
     _request_number = build_request_get()
@@ -822,6 +904,27 @@ def generate_policy_action(
             _batch_size = int(batch_size_control.value)
             _strategy = strategy_control.value
             _output_mode = output_mode_control.value
+            _synthesis = None
+            _synthesis_record = {"synthesis_model": _model}
+            if (
+                _strategy == "Batch summaries + final synthesis"
+                and synthesis_model_control.value == "Cloud model"
+            ):
+                _cloud_api_base = normalize_endpoint(cloud_api_base_control.value)
+                _cloud_model = cloud_model_control.value.strip()
+                if not _cloud_model:
+                    raise ValueError("Enter a cloud model name")
+                _synthesis = {
+                    "api_base": _cloud_api_base,
+                    "model": _cloud_model,
+                    "api_key": judge_key(_cloud_api_base, "HACKCLUB_API_KEY"),
+                    "combine_levels": int(cloud_combine_levels_control.value),
+                }
+                _synthesis_record = {
+                    "synthesis_model": _cloud_model,
+                    "synthesis_api_base": _cloud_api_base,
+                    "cloud_combine_levels": _synthesis["combine_levels"],
+                }
             _output_dir.mkdir(parents=True, exist_ok=True)
 
             def _record_generation(validated, error=None, stats=None):
@@ -833,6 +936,7 @@ def generate_policy_action(
                     "strategy": _strategy,
                     "output_mode": _output_mode,
                     "model": _model,
+                    **_synthesis_record,
                     "finish_reason": _candidate.get("finish_reason"),
                     "response_bytes": _candidate.get("response_bytes"),
                     "source_bytes": _candidate.get("source_bytes"),
@@ -872,6 +976,7 @@ def generate_policy_action(
                 _timeout,
                 lambda message: print(message, flush=True),
                 candidate_sink=_persist_candidate,
+                synthesis=_synthesis,
             )
             _policy_path.write_text(_source.rstrip() + "\n", encoding="utf-8")
             _record_generation(
@@ -879,6 +984,7 @@ def generate_policy_action(
                 stats={
                     "training_batches": _generation_stats["training_batches"],
                     "model_calls": _generation_stats["model_calls"],
+                    "model_calls_by_model": _generation_stats["model_calls_by_model"],
                 },
             )
             build_state_set(
@@ -892,6 +998,7 @@ def generate_policy_action(
                     "strategy": _strategy,
                     "output_mode": _output_mode,
                     "model": _model,
+                    **_synthesis_record,
                     "training_batches": _generation_stats["training_batches"],
                     "model_calls": _generation_stats["model_calls"],
                     "finish_reason": _candidate.get("finish_reason"),
@@ -926,6 +1033,7 @@ def generate_policy_action(
                         "strategy": _strategy,
                         "output_mode": _output_mode,
                         "model": _model,
+                        **_synthesis_record,
                         "finish_reason": _candidate["finish_reason"],
                         "policy_path": _candidate["policy_path"],
                         "policy_response_path": _candidate["response_path"],
@@ -951,14 +1059,14 @@ def generate_policy_action(
 
 @app.cell
 def build_status_view(build_status, mo):
-    status_kind = (
+    _status_kind = (
         "success"
         if build_status.startswith("Policy generated")
         else "danger"
         if build_status.startswith("Policy generation failed")
         else "info"
     )
-    mo.callout(build_status, kind=status_kind)
+    mo.callout(build_status, kind=_status_kind)
     return
 
 
@@ -978,7 +1086,9 @@ def review_policy(
             Built from **{build_state["sample_count"]:,} {build_state["dataset_name"]}**
             cases with the **{build_state["strategy"]}** strategy and batch size
             **{build_state["batch_size"]}** and **{output_mode}**
-            output. The test action uses the matching held-out test set.
+            output. Local model: **{build_state["model"]}**; final synthesis
+            model: **{build_state.get("synthesis_model", build_state["model"])}**.
+            The test action uses the matching held-out test set.
             """
         )
         source = build_state["source"]
@@ -1057,34 +1167,34 @@ def test_policy_action(
             test_status_set("The reviewed policy source is empty.")
         else:
             try:
-                dataset_config = dataset_files[build_state["dataset_name"]]
-                test_path = workspace / dataset_config["test"]
-                test_cases = read_cases(test_path, expected_rows=None)
-                source = reviewed_policy_control.value
-                metrics, case_results = evaluate_classifier(
-                    source,
-                    test_cases,
+                _dataset_config = dataset_files[build_state["dataset_name"]]
+                _test_path = workspace / _dataset_config["test"]
+                _test_cases = read_cases(_test_path, expected_rows=None)
+                _source = reviewed_policy_control.value
+                _metrics, _case_results = evaluate_classifier(
+                    _source,
+                    _test_cases,
                     build_state.get("output_mode", "Boolean"),
                 )
-                output_dir = output_root / build_state["dataset_slug"]
-                output_dir.mkdir(parents=True, exist_ok=True)
-                policy_path = output_dir / "policy.py"
-                policy_path.write_text(source.rstrip() + "\n", encoding="utf-8")
-                write_jsonl(output_dir / "evaluation.jsonl", case_results)
-                write_json(output_dir / "metrics.json", metrics)
+                _output_dir = output_root / build_state["dataset_slug"]
+                _output_dir.mkdir(parents=True, exist_ok=True)
+                _policy_path = _output_dir / "policy.py"
+                _policy_path.write_text(_source.rstrip() + "\n", encoding="utf-8")
+                write_jsonl(_output_dir / "evaluation.jsonl", _case_results)
+                write_json(_output_dir / "metrics.json", _metrics)
                 test_state_set(
                     {
                         "dataset_name": build_state["dataset_name"],
                         "output_mode": build_state.get("output_mode", "Boolean"),
-                        "test_path": str(test_path),
-                        "output_dir": str(output_dir),
-                        "metrics": metrics,
-                        "case_results": case_results,
+                        "test_path": str(_test_path),
+                        "output_dir": str(_output_dir),
+                        "metrics": _metrics,
+                        "case_results": _case_results,
                     }
                 )
                 test_status_set(
-                    f"Test completed on {len(test_cases):,} "
-                    f"{build_state['dataset_name']} cases. Results saved to {output_dir}."
+                    f"Test completed on {len(_test_cases):,} "
+                    f"{build_state['dataset_name']} cases. Results saved to {_output_dir}."
                 )
             except Exception as exc:
                 test_status_set(f"Test failed: {type(exc).__name__}: {exc}")
@@ -1105,9 +1215,7 @@ def evaluation_view(mo, reviewed_policy_control, test_state, test_status):
         else "info"
     )
     status_view = mo.callout(test_status, kind=status_kind)
-    if not test_state:
-        status_view
-        return
+    mo.stop(not test_state, status_view)
 
     metrics = test_state["metrics"]
     current_hash = hashlib.sha256(
