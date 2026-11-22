@@ -260,9 +260,13 @@ def balance_cases(rows, n=600, seed=42):
 
 
 def choose_few_shot(rows, route, category, difficulty, request_index, maximum=5, seed=42,
-                    use_difficulty=True):
+                    use_difficulty=True, expected_label=None):
+    if expected_label is not None:
+        if expected_label not in ("harmful", "unharmful"):
+            raise ValueError("Unknown requested harm label")
     matches = [row for row in rows if row.get("target") == route and row.get("category") == category
-               and (not use_difficulty or row.get("difficulty") == difficulty)]
+               and (not use_difficulty or row.get("difficulty") == difficulty)
+               and (expected_label is None or row["prompt_harm_label"] == expected_label)]
     rng = random.Random(seed + request_index)
     rng.shuffle(matches)
     selected = matches[:maximum]
@@ -272,7 +276,7 @@ def choose_few_shot(rows, route, category, difficulty, request_index, maximum=5,
         rng.shuffle(other)
         selected.extend(other[:maximum - len(selected)])
     if selected and len(selected) < maximum:
-        label = Counter(row["prompt_harm_label"] for row in selected).most_common(1)[0][0]
+        label = expected_label or Counter(row["prompt_harm_label"] for row in selected).most_common(1)[0][0]
         padding = [row for row in rows if row.get("target") == route and row.get("category") != category
                    and row["prompt_harm_label"] == label]
         rng.shuffle(padding)
@@ -377,11 +381,72 @@ def near_miss_examples(cases, targets, outcomes):
     return selected
 
 
+def discover_label_history(root):
+    history = []
+    for path in sorted(Path(root).glob("round*/generate/requests.json")):
+        checked_path = path.parent.parent / "check/checked.jsonl"
+        if not checked_path.is_file():
+            continue
+        requests = json.loads(path.read_text(encoding="utf-8"))
+        by_id = {row["request_id"]: row for row in requests}
+        if len(by_id) != len(requests):
+            raise ValueError(f"Duplicate request IDs in {path}")
+        for checked in completed_records(checked_path, "request_id").values():
+            request = by_id.get(checked["request_id"])
+            if request is None or any(checked.get(key) != request[key]
+                                      for key in ("route_intended", "expected_label")):
+                raise ValueError(f"Check row differs from its request in {checked_path}")
+            history.append({"route_intended": request["route_intended"],
+                            "expected_label": request["expected_label"],
+                            "judged_harmful": checked["judged_harmful"],
+                            "source": path.parent.parent.name})
+    return history
+
+
+def calibrate_requested_labels(history, target_harmful_share):
+    if (type(target_harmful_share) not in (int, float) or not math.isfinite(target_harmful_share)
+            or not 0 <= target_harmful_share <= 1):
+        raise ValueError("target_harmful_share must be between 0 and 1")
+    counts = {route: Counter() for route in ROUTES}
+    sources = Counter()
+    for row in history:
+        if (row["route_intended"] not in ROUTES or row["expected_label"] not in ("harmful", "unharmful")
+                or type(row["judged_harmful"]) is not bool):
+            raise ValueError("Invalid label calibration observation")
+        counts[row["route_intended"]][row["expected_label"], row["judged_harmful"]] += 1
+        sources[row.get("source", "provided")] += 1
+    pooled = sum(counts.values(), Counter())
+
+    def sizes(counter):
+        return {"requested_harmful": sum(counter["harmful", value] for value in (True, False)),
+                "requested_benign": sum(counter["unharmful", value] for value in (True, False)),
+                "judged_harmful_given_harmful": counter["harmful", True],
+                "judged_harmful_given_benign": counter["unharmful", True]}
+
+    result = {}
+    for route, counter in counts.items():
+        route_sizes = sizes(counter)
+        own_rates = route_sizes["requested_harmful"] > 0 and route_sizes["requested_benign"] > 0
+        sample_sizes = route_sizes if own_rates else sizes(pooled)
+        n_h, n_b = sample_sizes["requested_harmful"], sample_sizes["requested_benign"]
+        a = sample_sizes["judged_harmful_given_harmful"] / n_h if n_h else None
+        b = sample_sizes["judged_harmful_given_benign"] / n_b if n_b else None
+        fallback = a is None or b is None or math.isclose(a, b, rel_tol=0, abs_tol=1e-6)
+        q = target_harmful_share if fallback else max(0, min(1, (target_harmful_share - b) / (a - b)))
+        result[route] = {"t": target_harmful_share, "a": a, "b": b, "q": q,
+                         "rate_source": "route" if own_rates else "pooled",
+                         "fallback_to_target": fallback, "sample_sizes": sample_sizes,
+                         "route_sample_sizes": route_sizes}
+    return {"routes": result, "sources": dict(sources)}
+
+
 def allocate_requests(rows, balance, seed=42, extra_examples=(), near_misses=(), mutation_share=0,
-                      use_difficulty=True):
+                      use_difficulty=True, target_harmful_share=None, label_history=()):
     if not 0 <= mutation_share <= 1:
         raise ValueError("mutation_share must be between 0 and 1")
     example_rows = [*rows, *extra_examples]
+    calibration = (calibrate_requested_labels(label_history, target_harmful_share)
+                   if target_harmful_share is not None else None)
     requests = []
     global_index = 0
     for route in ROUTES:
@@ -415,6 +480,25 @@ def allocate_requests(rows, balance, seed=42, extra_examples=(), near_misses=(),
             for category in categories:
                 if quotas[category] > round_index:
                     category_sequence.append(category)
+        requested_labels = {}
+        if calibration is not None:
+            available_labels = {
+                category: {row["prompt_harm_label"] for row in example_rows
+                           if row.get("target") == route and row.get("category") == category}
+                for category in categories}
+            flexible = []
+            for index, category in enumerate(category_sequence):
+                labels = available_labels[category]
+                if len(labels) == 1:
+                    requested_labels[index] = next(iter(labels))
+                else:
+                    flexible.append(index)
+            random.Random(f"{seed}:{route}:labels").shuffle(flexible)
+            desired = round(calibration["routes"][route]["q"] * len(category_sequence))
+            fixed_harmful = sum(label == "harmful" for label in requested_labels.values())
+            harmful = set(flexible[:max(0, min(len(flexible), desired - fixed_harmful))])
+            requested_labels.update({index: "harmful" if index in harmful else "unharmful"
+                                     for index in flexible})
         for index, category in enumerate(category_sequence):
             difficulty = None
             if use_difficulty:
@@ -425,7 +509,7 @@ def allocate_requests(rows, balance, seed=42, extra_examples=(), near_misses=(),
                 if difficulty is None:
                     continue
             examples = choose_few_shot(example_rows, route, category, difficulty, global_index, seed=seed,
-                                       use_difficulty=use_difficulty)
+                                       use_difficulty=use_difficulty, expected_label=requested_labels.get(index))
             if not examples:
                 continue
             labels = Counter(row["prompt_harm_label"] for row in examples)
@@ -435,7 +519,7 @@ def allocate_requests(rows, balance, seed=42, extra_examples=(), near_misses=(),
                 "route_intended": route,
                 "category": category,
                 "difficulty": difficulty,
-                "expected_label": labels.most_common(1)[0][0],
+                "expected_label": requested_labels[index] if calibration is not None else labels.most_common(1)[0][0],
                 "example_case_ids": [row["case_id"] for row in examples],
             })
             global_index += 1

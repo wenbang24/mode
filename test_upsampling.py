@@ -557,6 +557,118 @@ class G0UnionTest(unittest.TestCase):
                 self.assertEqual(result["file_sha256"][name], laya_router.sha256_file(source / name))
 
 
+class LabelBalancingTest(unittest.TestCase):
+    @staticmethod
+    def history(route="human", n_h=10, h_h=8, n_b=10, b_h=2):
+        return [{"route_intended": route, "expected_label": label, "judged_harmful": index < positive}
+                for label, count, positive in (("harmful", n_h, h_h), ("unharmful", n_b, b_h))
+                for index in range(count)]
+
+    def test_calibration_math_clamping_pooled_and_empty_fallbacks(self):
+        history = self.history()
+        for target, expected in ((0.5, 0.5), (0.1, 0), (0.9, 1)):
+            result = upsampling.calibrate_requested_labels(history, target)
+            human = result["routes"]["human"]
+            self.assertAlmostEqual(human["a"], 0.8)
+            self.assertAlmostEqual(human["b"], 0.2)
+            self.assertAlmostEqual(human["q"], expected)
+            self.assertEqual(human["rate_source"], "route")
+            self.assertEqual(result["routes"]["guardagent"]["rate_source"], "pooled")
+            self.assertEqual(human["sample_sizes"]["requested_harmful"], 10)
+        partial = self.history("guardagent", n_h=2, h_h=0, n_b=0, b_h=0)
+        pooled = upsampling.calibrate_requested_labels(history + partial, 0.5)["routes"]["guardagent"]
+        self.assertEqual(pooled["rate_source"], "pooled")
+        self.assertEqual(pooled["sample_sizes"]["requested_harmful"], 12)
+        self.assertEqual(pooled["route_sample_sizes"]["requested_harmful"], 2)
+        self.assertAlmostEqual(pooled["a"], 8 / 12)
+        for observations in ([], self.history(n_b=0), self.history(h_h=5, b_h=5),
+                             self.history(n_h=2001, h_h=1000, n_b=1999, b_h=999)):
+            result = upsampling.calibrate_requested_labels(observations, 0.4)["routes"]["human"]
+            self.assertEqual(result["q"], 0.4)
+            self.assertTrue(result["fallback_to_target"])
+        reverse = upsampling.calibrate_requested_labels(self.history(h_h=2, b_h=8), 0.3)
+        self.assertAlmostEqual(reverse["routes"]["human"]["q"], 5 / 6)
+        for target in (-0.1, 1.1, math.nan, True, "0.5"):
+            with self.assertRaises(ValueError):
+                upsampling.calibrate_requested_labels(history, target)
+        with self.assertRaisesRegex(ValueError, "observation"):
+            upsampling.calibrate_requested_labels([{**history[0], "judged_harmful": 1}], 0.5)
+
+    def test_label_matching_retains_difficulty_and_category_fallbacks(self):
+        rows = [*make_rows("human", 1), *make_rows("human", 3, difficulty="easy", start=10),
+                *make_rows("human", 4, start=20, label="unharmful"),
+                *make_rows("human", 2, category="other", start=30),
+                *make_rows("piguard", 2, start=40)]
+        for use_difficulty in (True, False):
+            selected = upsampling.choose_few_shot(
+                rows, "human", "cat-a", "hard", 0, expected_label="harmful", use_difficulty=use_difficulty)
+            self.assertEqual(len(selected), 5)
+            self.assertTrue(all(row["prompt_harm_label"] == "harmful" and row["target"] == "human" for row in selected))
+            self.assertEqual(sum(row["category"] == "cat-a" for row in selected), 4)
+        self.assertEqual(upsampling.choose_few_shot(
+            rows, "adasteer", "cat-a", None, 0, expected_label="harmful"), [])
+        with self.assertRaises(ValueError):
+            upsampling.choose_few_shot(rows, "human", "cat-a", None, 0, expected_label="invalid")
+        sparse = [*make_rows("human", 1), *make_rows("human", 4, start=10, label="unharmful", difficulty="easy")]
+        balance = {"routes": {route: {"deficit": 2 if route == "human" else 0} for route in laya_router.ROUTES}}
+        requests = upsampling.allocate_requests(sparse, balance, target_harmful_share=1)
+        self.assertTrue(all(row["expected_label"] == "harmful" for row in requests))
+        self.assertEqual(len(requests[0]["example_case_ids"]), 5)
+
+    def test_quotas_determinism_single_label_categories_and_mutations(self):
+        rows = [*make_rows("human", 1, category="harmful-only"),
+                *make_rows("human", 1, category="benign-only", start=10, label="unharmful"),
+                *make_rows("human", 1, start=20),
+                *make_rows("human", 1, start=30, label="unharmful")]
+        balance = {"routes": {route: {"deficit": 4 if route == "human" else 0} for route in laya_router.ROUTES}}
+        by_id = {row["case_id"]: row for row in rows}
+        baseline = upsampling.allocate_requests(rows, balance)
+        self.assertEqual(baseline, upsampling.allocate_requests(
+            rows, balance, target_harmful_share=None, label_history=self.history()))
+        for target, expected_harmful in ((0, 2), (0.5, 4), (1, 6)):
+            requests = upsampling.allocate_requests(rows, balance, target_harmful_share=target)
+            self.assertEqual(requests, upsampling.allocate_requests(rows, balance, target_harmful_share=target))
+            self.assertEqual(sum(row["expected_label"] == "harmful" for row in requests), expected_harmful)
+            self.assertEqual([row["request_id"] for row in requests], [row["request_id"] for row in baseline])
+            for request in requests:
+                self.assertTrue(all(by_id[i]["prompt_harm_label"] == request["expected_label"]
+                                    for i in request["example_case_ids"]))
+                if request["category"] != "cat-a":
+                    self.assertEqual(request["expected_label"], "harmful" if request["category"] == "harmful-only" else "unharmful")
+        sources = [{**row, "succeeded_expert": "piguard"} for row in make_rows("adasteer", 3)]
+        old = upsampling.allocate_requests(rows, balance, near_misses=sources, mutation_share=0.5)
+        new = upsampling.allocate_requests(rows, balance, near_misses=sources, mutation_share=0.5,
+                                            target_harmful_share=0.5, label_history=self.history())
+        self.assertEqual([row for row in old if row.get("kind") == "mutation"],
+                         [row for row in new if row.get("kind") == "mutation"])
+        mixed = [*make_rows("human", 1), *make_rows("human", 1, start=10, label="unharmful")]
+        allocated = upsampling.allocate_requests(mixed, balance, target_harmful_share=0.25)
+        self.assertEqual(sum(row["expected_label"] == "harmful" for row in allocated), 2)
+        self.assertEqual(upsampling.allocate_requests([], balance, target_harmful_share=0.5), [])
+
+    def test_discovery_joins_archives_excludes_current_and_deduplicates_resume_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            requests = [{"request_id": str(i), "route_intended": "human", "expected_label": label}
+                        for i, label in enumerate(("harmful", "unharmful"))]
+            checked = [{**row, "judged_harmful": True} for row in requests]
+            for name in ("round3", "round4", ""):
+                directory = root / name
+                (directory / "generate").mkdir(parents=True)
+                (directory / "check").mkdir()
+                upsampling.write_json(directory / "generate/requests.json", requests)
+                for row in checked + [{**checked[0], "judged_harmful": False}]:
+                    upsampling.append_jsonl(directory / "check/checked.jsonl", row)
+            history = upsampling.discover_label_history(root)
+            self.assertEqual(len(history), 4)
+            self.assertEqual({row["source"] for row in history}, {"round3", "round4"})
+            self.assertTrue(all(not row["judged_harmful"] for row in history if row["expected_label"] == "harmful"))
+            upsampling.append_jsonl(root / "round3/check/checked.jsonl", {**checked[0], "expected_label": "unharmful"})
+            with self.assertRaisesRegex(ValueError, "differs"):
+                upsampling.discover_label_history(root)
+        self.assertEqual(upsampling.discover_label_history("/nonexistent/label-history"), [])
+
+
 class GenerationTest(unittest.TestCase):
     def test_notebook_records_difficulty_and_rejects_mismatched_resume(self):
         module = ast.parse(Path("upsample_router.py").read_text())
@@ -565,7 +677,7 @@ class GenerationTest(unittest.TestCase):
         action.decorator_list = []
         namespace = {}
         exec(compile(ast.Module(body=[action], type_ignores=[]), "upsample_router.py", "exec"), namespace)
-        for enabled in (True, False):
+        for enabled, target in ((True, None), (False, None), (True, 0.5), (False, 0.5)):
             with self.subTest(use_difficulty=enabled), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 prepared = root / "prepared"
@@ -581,6 +693,8 @@ class GenerationTest(unittest.TestCase):
                 arguments = dict(
                     bootstrap_control=SimpleNamespace(value=False),
                     use_difficulty_control=SimpleNamespace(value=enabled),
+                    label_balance_control=SimpleNamespace(value=target is not None),
+                    target_harmful_share_control=SimpleNamespace(value=0.5),
                     current_prepared={"directory": str(prepared), "manifest": {"targets": {}}},
                     fs=None, generate_button=SimpleNamespace(value=True), judge_config={}, mo=mo,
                     mutation_share_control=SimpleNamespace(value=0), output_control=SimpleNamespace(value=str(root)),
@@ -591,6 +705,16 @@ class GenerationTest(unittest.TestCase):
                     namespace["generate_action"](**arguments)
                 for name in ("bootstrap.json", "done.json"):
                     self.assertIs(json.loads((step_root / "generate" / name).read_text())["use_difficulty"], enabled)
+                    metadata = json.loads((step_root / "generate" / name).read_text())
+                    self.assertEqual(metadata["target_harmful_share"], target)
+                    if target is not None:
+                        self.assertEqual(metadata["label_calibration"]["routes"]["human"]["q"], 0.5)
+                arguments["label_balance_control"].value = target is None
+                with mock.patch.object(upsampling, "run_generation") as generate:
+                    namespace["generate_action"](**arguments)
+                    generate.assert_not_called()
+                self.assertIn("Target harmful share differs", mo.callout.call_args.args[0])
+                arguments["label_balance_control"].value = target is not None
                 arguments["use_difficulty_control"].value = not enabled
                 with mock.patch.object(upsampling, "run_generation") as generate:
                     namespace["generate_action"](**arguments)
