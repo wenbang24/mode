@@ -579,6 +579,8 @@ def generation_controls(mo):
         start=0.5, stop=1.0, step=0.01, value=0.7, label="Maximum harm-label share per route")
     mutation_share_control = mo.ui.number(
         start=0, stop=1, step=0.01, value=0.5, label="Share of requests that mutate near-misses")
+    benign_human_mutations_control = mo.ui.checkbox(label="Use only benign Human mutation sources", value=False)
+    overrefusal_control = mo.ui.checkbox(label="Generate benign Human over-refusal cases", value=False)
     mo.vstack([
         mo.md("## Generate and judge"),
         bootstrap_control,
@@ -587,16 +589,21 @@ def generation_controls(mo):
         target_harmful_share_control,
         max_label_share_control,
         mutation_share_control,
+        benign_human_mutations_control,
+        overrefusal_control,
         generate_button,
         check_button,
     ])
     return (bootstrap_control, check_button, generate_button, max_label_share_control, mutation_share_control,
-            use_difficulty_control, label_balance_control, target_harmful_share_control)
+            use_difficulty_control, label_balance_control, target_harmful_share_control,
+            benign_human_mutations_control, overrefusal_control)
 
 
 @app.cell
 def generate_action(
     bootstrap_control,
+    benign_human_mutations_control,
+    overrefusal_control,
     use_difficulty_control,
     label_balance_control,
     target_harmful_share_control,
@@ -626,7 +633,9 @@ def generate_action(
             _drive_dir = f"MoDE/upsampling/{_prep_name}/generate"
             _target_harmful_share = target_harmful_share_control.value if label_balance_control.value else None
             _bootstrap_metadata = {"use_difficulty": use_difficulty_control.value,
-                                   "target_harmful_share": _target_harmful_share}
+                                   "target_harmful_share": _target_harmful_share,
+                                   "benign_human_mutations": benign_human_mutations_control.value,
+                                   "overrefusal": overrefusal_control.value}
             _metadata_path = _step_dir / "done.json"
             if not _metadata_path.is_file():
                 _metadata_path = _step_dir / "bootstrap.json"
@@ -636,6 +645,9 @@ def generate_action(
                     raise ValueError("Use difficulty differs from saved generation; archive it before generating again")
                 if _saved_metadata.get("target_harmful_share") != _target_harmful_share:
                     raise ValueError("Target harmful share differs from saved generation; archive it before generating again")
+                for _mode in ("benign_human_mutations", "overrefusal"):
+                    if _saved_metadata.get(_mode, False) != _bootstrap_metadata[_mode]:
+                        raise ValueError(f"{_mode} differs from saved generation; archive it before generating again")
             if (_step_dir / "done.json").is_file():
                 upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
                 generated_rows = upsampling.read_jsonl(_step_dir / "deduped.jsonl")
@@ -695,7 +707,9 @@ def generate_action(
                     _rows, _balance, extra_examples=_extra_examples,
                     near_misses=_near_misses, mutation_share=mutation_share_control.value,
                     use_difficulty=use_difficulty_control.value,
-                    target_harmful_share=_target_harmful_share, label_history=_label_history)
+                    target_harmful_share=_target_harmful_share, label_history=_label_history,
+                    benign_human_mutations=benign_human_mutations_control.value,
+                    overrefusal=overrefusal_control.value)
                 if _bootstrap_metadata:
                     _bootstrap_metadata["mutation_requests"] = sum(
                         request.get("kind") == "mutation" for request in _requests)

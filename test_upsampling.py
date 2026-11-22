@@ -1,5 +1,6 @@
 """Offline contract tests for router up-sampling helpers."""
 import ast
+from collections import Counter
 import io
 import json
 import math
@@ -677,7 +678,9 @@ class GenerationTest(unittest.TestCase):
         action.decorator_list = []
         namespace = {}
         exec(compile(ast.Module(body=[action], type_ignores=[]), "upsample_router.py", "exec"), namespace)
-        for enabled, target in ((True, None), (False, None), (True, 0.5), (False, 0.5)):
+        for enabled, target, benign_modes in ((True, None, False), (False, None, False),
+                                              (True, 0.5, False), (False, 0.5, False),
+                                              (False, None, True)):
             with self.subTest(use_difficulty=enabled), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 prepared = root / "prepared"
@@ -692,6 +695,8 @@ class GenerationTest(unittest.TestCase):
                 mo = SimpleNamespace(callout=mock.Mock(), md=mock.Mock())
                 arguments = dict(
                     bootstrap_control=SimpleNamespace(value=False),
+                    benign_human_mutations_control=SimpleNamespace(value=benign_modes),
+                    overrefusal_control=SimpleNamespace(value=benign_modes),
                     use_difficulty_control=SimpleNamespace(value=enabled),
                     label_balance_control=SimpleNamespace(value=target is not None),
                     target_harmful_share_control=SimpleNamespace(value=0.5),
@@ -739,6 +744,17 @@ class GenerationTest(unittest.TestCase):
                     namespace["generate_action"](**arguments)
                     generate.assert_not_called()
                 self.assertIn("Use difficulty differs", mo.callout.call_args.args[0])
+                arguments["use_difficulty_control"].value = enabled
+                for mode in ("benign_human_mutations", "overrefusal"):
+                    for name in ("bootstrap.json", "done.json"):
+                        metadata = json.loads((step_root / "generate" / name).read_text())
+                        self.assertIs(metadata[mode], benign_modes)
+                    arguments[mode + "_control"].value = not benign_modes
+                    with mock.patch.object(upsampling, "run_generation") as generate:
+                        namespace["generate_action"](**arguments)
+                        generate.assert_not_called()
+                    self.assertIn(mode + " differs", mo.callout.call_args.args[0])
+                    arguments[mode + "_control"].value = benign_modes
 
     def test_difficulty_off_pools_examples_and_preserves_request_structure(self):
         rows = [*make_rows("human", 4),
@@ -1425,6 +1441,65 @@ class _FakeMemoryFS:
 
 
 class MutationTest(unittest.TestCase):
+    def test_benign_modes_are_opt_in_and_filter_human_only(self):
+        pool = upsampling.near_miss_examples(*self.pool())
+        pool[0]["prompt_harm_label"] = "unharmful"
+        baseline = self.allocation(near_misses=pool, mutation_share=0.5)
+        self.assertEqual(baseline, self.allocation(
+            near_misses=pool, mutation_share=0.5, benign_human_mutations=False, overrefusal=False))
+        requests = self.allocation(near_misses=pool, mutation_share=0.5, benign_human_mutations=True)
+        mutations = [row for row in requests if row.get("kind") == "mutation"]
+        self.assertEqual(len(mutations), 4)
+        self.assertEqual({row["source_case_id"] for row in mutations}, {pool[0]["case_id"]})
+        self.assertTrue(all(row["expected_label"] == "unharmful" for row in mutations))
+        with self.assertRaisesRegex(ValueError, "benign near-miss"):
+            self.allocation(benign_human_mutations=True, mutation_share=0.5)
+        with self.assertRaisesRegex(ValueError, "benign Human examples"):
+            self.allocation(overrefusal=True)
+
+    def test_overrefusal_examples_counts_determinism_and_prompt_dispatch(self):
+        originals = make_rows("human", 2) + make_rows("piguard", 2, start=10)
+        benign = make_rows("human", 2, start=20, label="unharmful", difficulty="easy")
+        benign += make_rows("human", 1, start=30, label="unharmful", category="extra")
+        pool = upsampling.near_miss_examples(*self.pool())
+        pool[0]["prompt_harm_label"] = "unharmful"
+        balance = {"routes": {route: {"deficit": 2 if route == "human" else 0}
+                              for route in laya_router.ROUTES}}
+        options = dict(extra_examples=benign, near_misses=pool, mutation_share=0.5,
+                       benign_human_mutations=True, overrefusal=True, use_difficulty=False,
+                       target_harmful_share=1)
+        requests = upsampling.allocate_requests(originals, balance, **options)
+        self.assertEqual(requests, upsampling.allocate_requests(originals, balance, **options))
+        self.assertEqual(Counter(row["kind"] for row in requests), {"mutation": 2, "overrefusal": 2})
+        self.assertEqual(len({row["request_id"] for row in requests}), 4)
+        self.assertTrue(all(row["expected_label"] == "unharmful" for row in requests))
+        for row in requests[:2]:
+            self.assertTrue(set(row["example_case_ids"]) <= {example["case_id"] for example in benign})
+            self.assertTrue(row["example_case_ids"])
+        difficult = upsampling.allocate_requests(originals, balance, **{**options, "use_difficulty": True})
+        self.assertEqual(len(difficult), 4)
+        calls = []
+        def llm(prompt, system):
+            calls.append((json.loads(prompt), system))
+            return {"prompt": f"New harmless prompt {len(calls)}"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = upsampling.run_generation(requests, originals + benign + pool,
+                root / "raw.jsonl", root / "deduped.jsonl", [], llm, workers=1)
+        self.assertEqual(Counter(row["kind"] for row in result), {"mutation": 2, "overrefusal": 2})
+        self.assertEqual([system for _, system in calls],
+                         [upsampling.OVERREFUSAL_SYSTEM_PROMPT] * 2 + [upsampling.MUTATION_SYSTEM_PROMPT] * 2)
+        self.assertTrue(all(example["harm_label"] == "unharmful"
+                            for payload, _ in calls[:2] for example in payload["examples"]))
+        self.assertNotIn("harmful ones", calls[0][0]["goal"])
+        balance["routes"]["human"]["deficit"] = 0
+        balance["routes"]["piguard"]["deficit"] = 2
+        self.assertEqual(upsampling.allocate_requests(originals, balance, mutation_share=0),
+                         upsampling.allocate_requests(originals, balance, mutation_share=0,
+                                                      benign_human_mutations=True, overrefusal=True))
+        self.assertEqual(upsampling.allocate_requests([], {"routes": {
+            route: {"deficit": 0} for route in laya_router.ROUTES}}, overrefusal=True), [])
+
     def test_screened_cases_are_not_few_shots_near_misses_or_g1_additions(self):
         cases, targets, outcomes = self.pool()
         cases[1]["screened"] = True
