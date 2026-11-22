@@ -942,7 +942,16 @@ def policy_engine():
         drive_fs.makedirs(remote_dir, exist_ok=True)
         for path in paths:
             if path.exists():
-                drive_fs.put_file(str(path), f"{remote_dir}/{path.name}")
+                try:
+                    # gdrive_fsspec 0.4.1: send one final chunk; it raises KeyError
+                    # after the upload lands when the listings cache is off.
+                    drive_fs.put_file(
+                        str(path),
+                        f"{remote_dir}/{path.name}",
+                        block_size=path.stat().st_size + 1,
+                    )
+                except KeyError:
+                    pass
         return remote_dir
 
     def write_json(path, value):
