@@ -571,6 +571,10 @@ def generation_controls(mo):
     check_button = mo.ui.run_button(label="7 · Judge harm labels and export generated.parquet")
     bootstrap_control = mo.ui.checkbox(
         label="Bootstrap few-shot examples from earlier rounds' measured cases", value=True)
+    use_difficulty_control = mo.ui.checkbox(label="Use difficulty", value=True)
+    label_balance_control = mo.ui.checkbox(label="Use target harmful share", value=False)
+    target_harmful_share_control = mo.ui.number(
+        start=0, stop=1, step=0.01, value=0.5, label="Target harmful share (when enabled)")
     max_label_share_control = mo.ui.number(
         start=0.5, stop=1.0, step=0.01, value=0.7, label="Maximum harm-label share per route")
     mutation_share_control = mo.ui.number(
@@ -578,17 +582,24 @@ def generation_controls(mo):
     mo.vstack([
         mo.md("## Generate and judge"),
         bootstrap_control,
+        use_difficulty_control,
+        label_balance_control,
+        target_harmful_share_control,
         max_label_share_control,
         mutation_share_control,
         generate_button,
         check_button,
     ])
-    return bootstrap_control, check_button, generate_button, max_label_share_control, mutation_share_control
+    return (bootstrap_control, check_button, generate_button, max_label_share_control, mutation_share_control,
+            use_difficulty_control, label_balance_control, target_harmful_share_control)
 
 
 @app.cell
 def generate_action(
     bootstrap_control,
+    use_difficulty_control,
+    label_balance_control,
+    target_harmful_share_control,
     current_prepared,
     fs,
     generate_button,
@@ -613,14 +624,25 @@ def generate_action(
             _root = Path(output_control.value) / "upsampling" / _prep_name
             _step_dir = _root / "generate"
             _drive_dir = f"MoDE/upsampling/{_prep_name}/generate"
-            _bootstrap_metadata = {}
+            _target_harmful_share = target_harmful_share_control.value if label_balance_control.value else None
+            _bootstrap_metadata = {"use_difficulty": use_difficulty_control.value,
+                                   "target_harmful_share": _target_harmful_share}
+            _metadata_path = _step_dir / "done.json"
+            if not _metadata_path.is_file():
+                _metadata_path = _step_dir / "bootstrap.json"
+            _saved_metadata = json.loads(_metadata_path.read_text()) if _metadata_path.is_file() else {}
+            if ((_step_dir / "done.json").is_file() or (_step_dir / "generated_raw.jsonl").is_file()):
+                if _saved_metadata.get("use_difficulty", True) != use_difficulty_control.value:
+                    raise ValueError("Use difficulty differs from saved generation; archive it before generating again")
+                if _saved_metadata.get("target_harmful_share") != _target_harmful_share:
+                    raise ValueError("Target harmful share differs from saved generation; archive it before generating again")
             if (_step_dir / "done.json").is_file():
                 upsampling.ensure_uploaded(fs, _step_dir, _drive_dir)
                 generated_rows = upsampling.read_jsonl(_step_dir / "deduped.jsonl")
                 _done = json.loads((_step_dir / "done.json").read_text())
                 if "bootstrap_counts" in _done:
-                    _bootstrap_metadata = {key: _done[key] for key in (
-                        "bootstrap_counts", "near_miss_counts", "mutation_requests") if key in _done}
+                    _bootstrap_metadata.update({key: _done[key] for key in (
+                        "bootstrap_counts", "near_miss_counts", "mutation_requests", "label_calibration") if key in _done})
             else:
                 _category_rows = upsampling.read_jsonl(_root / "categories/train_categories.jsonl")
                 _difficulty_rows = upsampling.read_jsonl(_root / "folds/difficulty.jsonl")
@@ -630,7 +652,7 @@ def generate_action(
                 _rows = [{
                     **case,
                     "target": current_prepared["manifest"]["targets"][case["case_id"]],
-                    "difficulty": _difficulty[case["case_id"]],
+                    "difficulty": _difficulty[case["case_id"]] if use_difficulty_control.value else None,
                     "category": _category[case["case_id"]],
                 } for case in _train_cases]
                 _balance_data = json.loads((_root / "balance/balance.json").read_text())
@@ -654,16 +676,26 @@ def generate_action(
                         _bootstrap_cases, _bootstrap_targets, _bootstrap_outcomes)
                     _bootstrap_counts = {route: sum(row["target"] == route for row in _extra_examples)
                                          for route in _balance["routes"]}
-                    _bootstrap_metadata = {
+                    _bootstrap_metadata.update({
                         "bootstrap_counts": _bootstrap_counts, "bootstrap_runs": _bootstrap_report,
                         "near_miss_counts": {
                             route: sum(row["target"] != route for row in _near_misses)
                             for route in _balance["routes"]},
                         "mutation_share": mutation_share_control.value,
-                    }
+                    })
+                _label_history = []
+                if _target_harmful_share is not None:
+                    _label_history = upsampling.discover_label_history(_root)
+                    _calibration = upsampling.calibrate_requested_labels(_label_history, _target_harmful_share)
+                    if ((_step_dir / "generated_raw.jsonl").is_file()
+                            and _saved_metadata.get("label_calibration") != _calibration):
+                        raise ValueError("Label calibration differs from saved generation; archive it before generating again")
+                    _bootstrap_metadata["label_calibration"] = _calibration
                 _requests = upsampling.allocate_requests(
                     _rows, _balance, extra_examples=_extra_examples,
-                    near_misses=_near_misses, mutation_share=mutation_share_control.value)
+                    near_misses=_near_misses, mutation_share=mutation_share_control.value,
+                    use_difficulty=use_difficulty_control.value,
+                    target_harmful_share=_target_harmful_share, label_history=_label_history)
                 if _bootstrap_metadata:
                     _bootstrap_metadata["mutation_requests"] = sum(
                         request.get("kind") == "mutation" for request in _requests)
@@ -694,17 +726,18 @@ def generate_action(
                 def _upload_generation_log(path):
                     upsampling.upload_progress_file(fs, path, _step_dir, _drive_dir)
 
+                upsampling.write_json(_step_dir / "bootstrap.json", _bootstrap_metadata)
+                upsampling.upload_progress_file(
+                    fs, _step_dir / "bootstrap.json", _step_dir, _drive_dir, min_interval=0)
                 generated_rows = upsampling.run_generation(
                     _requests, _rows + _source_rows, _step_dir / "generated_raw.jsonl", _step_dir / "deduped.jsonl",
                     _frozen_rows, call_generation, workers=4, on_progress=_upload_generation_log)
                 upsampling.write_json(_step_dir / "requests.json", _requests)
-                if _bootstrap_metadata:
-                    upsampling.write_json(_step_dir / "bootstrap.json", _bootstrap_metadata)
                 upsampling.finish_step(
                     _step_dir, {"requested": len(_requests), "deduped": len(generated_rows),
                                 **_bootstrap_metadata}, fs, _drive_dir)
             _bootstrap_summary = ""
-            if _bootstrap_metadata:
+            if "bootstrap_counts" in _bootstrap_metadata:
                 _bootstrap_summary = "\n\nBootstrap examples available: " + ", ".join(
                     f"{route}: {count}" for route, count in _bootstrap_metadata["bootstrap_counts"].items())
                 _bootstrap_summary += f"\n\nMutation requests: {_bootstrap_metadata.get('mutation_requests', 0)}"
