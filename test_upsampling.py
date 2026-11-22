@@ -352,6 +352,85 @@ class BootstrapDiscoveryTest(unittest.TestCase):
 
 
 class G0UnionTest(unittest.TestCase):
+    def policy_rows(self, prefix, route, label, count):
+        return [{"case_id": f"{prefix}-{i}", "prompt": f"{prefix} prompt {i}",
+                 "prompt_harm_label": label, "target": route} for i in range(count)]
+
+    def test_generated_policies_preserve_originals_and_balance_total(self):
+        original = (self.policy_rows("ob", "human", "unharmful", 81)
+                    + self.policy_rows("oh", "human", "harmful", 25)
+                    + self.policy_rows("og", "guardagent", "unharmful", 3))
+        benign = self.policy_rows("gb", "human", "unharmful", 442)
+        harmful = self.policy_rows("gh", "human", "harmful", 2087)
+        other = self.policy_rows("pg", "piguard", "harmful", 4) + self.policy_rows("ad", "adasteer", "unharmful", 2)
+        generated = benign + harmful + other + self.policy_rows("gg", "guardagent", "harmful", 7)
+        run = self.run_data("all", generated, {case["case_id"]: case["target"] for case in generated})
+        policies = {"guardagent": "drop_generated", "human": "balance_total"}
+        def build(seed=42):
+            outcomes = {case["case_id"]: {} for case in original}
+            result = upsampling.build_g0_cases(
+                original, [run], {case["case_id"]: case["target"] for case in original},
+                reserved_cases=[], outcomes=outcomes, generated_route_policies=policies, seed=seed)
+            self.assertEqual(set(outcomes), set(result[1]))
+            return result
+        cases, targets, report = build()
+        self.assertEqual(cases[:len(original)], original)
+        self.assertTrue(all(case in cases for case in benign + other))
+        self.assertEqual(sum(case["case_id"].startswith("gh-") for case in cases), 498)
+        self.assertEqual(sum(target == "guardagent" for target in targets.values()), 3)
+        human = report["generated_route_policies"]["routes"]["human"]
+        self.assertEqual(human["generated_before"], {"unharmful": 442, "harmful": 2087})
+        self.assertEqual(human["generated_after"], {"unharmful": 442, "harmful": 498})
+        self.assertEqual(human["total_after"], {"unharmful": 523, "harmful": 523})
+        self.assertEqual(report["generated_cases"], 946)
+        self.assertEqual(build(), (cases, targets, report))
+        self.assertNotEqual(build(43)[1], targets)
+        self.assertEqual(report["generated_route_policies"]["seed"], 42)
+        self.assertNotEqual(upsampling.variant_run_name("G0", {"generated_union": report}, 42),
+                            upsampling.variant_run_name("G0", {"generated_union": build(43)[2]}, 42))
+
+    def test_generated_policy_empty_single_label_and_original_only(self):
+        for policy in ("drop_generated", "balance_total"):
+            cases, targets, report = upsampling.build_g0_cases(
+                [], [], {}, reserved_cases=[], generated_route_policies={"human": policy})
+            self.assertEqual((cases, targets), ([], {}))
+            self.assertEqual(report["generated_route_policies"]["routes"]["human"]["total_after"],
+                             {"harmful": 0, "unharmful": 0})
+        generated = self.policy_rows("only", "human", "harmful", 3)
+        cases, _, _ = upsampling.build_g0_cases([], [self.run_data("only", generated)], {},
+            reserved_cases=[], generated_route_policies={"human": "balance_total"})
+        self.assertEqual(cases, [])
+        original = self.policy_rows("original", "human", "unharmful", 2)
+        with self.assertRaisesRegex(ValueError, "without dropping originals"):
+            upsampling.build_g0_cases(original, [], {case["case_id"]: "human" for case in original},
+                                     reserved_cases=[], generated_route_policies={"human": "balance_total"})
+
+    def test_generated_policy_validation_and_disabled_compatibility(self):
+        case = {"case_id": "missing-label", "prompt": "Missing label"}
+        run = self.run_data("one", [case])
+        for policies in ({"unknown": "drop_generated"}, {"human": "unknown"}):
+            with self.assertRaisesRegex(ValueError, "route policy"):
+                upsampling.build_g0_cases([], [run], {}, reserved_cases=[], generated_route_policies=policies)
+        with self.assertRaisesRegex(ValueError, "labels"):
+            upsampling.build_g0_cases([], [run], {}, reserved_cases=[],
+                                     generated_route_policies={"human": "balance_total"})
+        default = upsampling.build_g0_cases([], [run], {}, reserved_cases=[])
+        self.assertEqual(default, upsampling.build_g0_cases([], [run], {}, reserved_cases=[],
+                                                          generated_route_policies={}))
+        self.assertNotIn("generated_route_policies", default[2])
+
+    def test_g0bal_variant_discovery_and_naming(self):
+        manifest = {"generated_union": {"generated_route_policies": {"seed": 42}}}
+        name = upsampling.variant_run_name("G0bal", manifest, 42)
+        self.assertTrue(name.startswith("G0bal-"))
+        self.assertNotEqual(name, upsampling.variant_run_name("G0", manifest, 42))
+        self.assertNotEqual(name, upsampling.variant_run_name("G0bal", {}, 42))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "variants/G0bal").mkdir(parents=True)
+            (root / "variants/G0bal/manifest.json").write_text("{}")
+            self.assertEqual(upsampling.available_variants(root), ["G0bal"])
+
     def test_union_successes_include_original_and_generated(self):
         original = {"case_id": "original", "prompt": "original prompt"}
         generated = {"case_id": "generated", "prompt": "generated prompt"}

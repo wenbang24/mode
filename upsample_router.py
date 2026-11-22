@@ -891,13 +891,15 @@ def confidence_action(
 def import_controls(mo):
     import_button = mo.ui.run_button(label="8 · Import benchmark and build G1")
     g0_import_button = mo.ui.run_button(label="8 · Build G0 from all discovered benchmark rounds")
+    g0_balance_control = mo.ui.checkbox(value=False, label="G0bal: GuardAgent originals only; Human total 50/50 (sampling seed 42)")
     mo.vstack([
         mo.md("## Import measured routes"),
         import_button,
         mo.md("G0 keeps every original training case plus all fully measured generated cases from compatible cached benchmarks, including archived rounds. No quotas. Rebuild after restoring new reports/parquets; selection, calibration and reserved test stay unchanged."),
+        g0_balance_control,
         g0_import_button,
     ])
-    return g0_import_button, import_button
+    return g0_balance_control, g0_import_button, import_button
 
 
 @app.cell
@@ -1025,7 +1027,7 @@ def import_action(
 
 @app.cell
 def g0_import_action(
-    current_prepared, fs, g0_import_button, json, laya_router, mo,
+    current_prepared, fs, g0_balance_control, g0_import_button, json, laya_router, mo,
     output_control, Path, test_parquet_control, training_cases, upsampling,
 ):
     if g0_import_button.value:
@@ -1047,15 +1049,18 @@ def g0_import_action(
                 _entries = json.loads((_prepared_dir / f"{_split}_cases.json").read_text())
                 _reserved.extend(_entry["case"] for _entry in _entries)
             _cases, _targets, _report = upsampling.build_g0_cases(
-                _originals, _runs, current_prepared["manifest"]["targets"], reserved_cases=_reserved, outcomes=_outcomes)
+                _originals, _runs, current_prepared["manifest"]["targets"], reserved_cases=_reserved, outcomes=_outcomes,
+                generated_route_policies={"guardagent": "drop_generated", "human": "balance_total"}
+                if g0_balance_control.value else None, seed=42)
             _report["discovery"] = _discovery
-            _destination = _root / "import/variants/G0"
+            _variant = "G0bal" if g0_balance_control.value else "G0"
+            _destination = _root / "import/variants" / _variant
             upsampling.prepare_variant(
                 current_prepared, _destination, laya_router.labeled_rows(_cases, _targets, _outcomes),
-                _cases, _targets, "G0", source_report=_report, train_outcomes=_outcomes)
+                _cases, _targets, _variant, source_report=_report, train_outcomes=_outcomes)
             upsampling.finish_step(
                 _destination, _report, fs,
-                f"MoDE/upsampling/{_prepared_dir.name}/import/variants/G0")
+                f"MoDE/upsampling/{_prepared_dir.name}/import/variants/{_variant}")
             _view = mo.callout(json.dumps(_report, indent=2), kind="success")
         except Exception as exc:
             _view = mo.callout(f"G0 union import failed: {exc}", kind="danger")
@@ -1068,7 +1073,7 @@ def g0_import_action(
 @app.cell
 def experiment_controls(mo):
     test_benchmark_control = mo.ui.text(value="", label="Aegis test benchmark run directory (optional)", full_width=True)
-    train_button = mo.ui.run_button(label="9 · Train remaining imported B0/B1/G0/G1 seed runs")
+    train_button = mo.ui.run_button(label="9 · Train remaining imported B0/B1/G0/G0bal/G1 seed runs")
     mo.vstack([
         mo.md("## Experiments"),
         test_benchmark_control,
@@ -1177,7 +1182,7 @@ def summary_action(
             if not _variants:
                 raise ValueError("Import at least one training variant first")
             _cached = json.loads(_summary_path.read_text()) if _summary_path.is_file() else {}
-            if (_summary_dir / "done.json").is_file() and set(_cached) == set(_variants) and "G0" not in _variants:
+            if (_summary_dir / "done.json").is_file() and set(_cached) == set(_variants) and not {"G0", "G0bal"}.intersection(_variants):
                 upsampling.ensure_uploaded(
                     fs, _summary_dir, f"MoDE/upsampling/{_prep_name}/{_summary_name}")
                 summary_report = json.loads(_summary_path.read_text())

@@ -1111,8 +1111,13 @@ def build_g1_cases(balance, generated_cases, generated_targets, seed=42, screene
     return original, selected, target_map, [case["case_id"] for case in leftovers]
 
 
-def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, reserved_cases, outcomes=None):
+def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, reserved_cases, outcomes=None,
+                   generated_route_policies=None, seed=42):
     """Union validated runs; extend supplied original outcomes with accepted generated outcomes."""
+    policies = dict(generated_route_policies or {})
+    if any(route not in ROUTES or mode not in {"drop_generated", "balance_total"}
+           for route, mode in policies.items()):
+        raise ValueError("Invalid generated G0 route policy")
     original = list(original_train_cases)
     reserved = list(reserved_cases)
     laya_router.assert_disjoint(original, reserved)
@@ -1174,6 +1179,48 @@ def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, re
             "screened_skipped": len(benchmark.cases) - len(eligible), "duplicates_skipped": duplicates,
         })
     generated = cases[len(original):]
+    policy_report = None
+    if policies:
+        labels = ("unharmful", "harmful")
+        if any(case.get("prompt_harm_label") not in labels for case in cases):
+            raise ValueError("G0 route policies require harmful/unharmful labels")
+
+        def label_counts(selected):
+            return {route: {label: sum(targets[case["case_id"]] == route
+                                      and case["prompt_harm_label"] == label for case in selected)
+                            for label in labels} for route in ROUTES}
+
+        original_counts = label_counts(original)
+        before = label_counts(generated)
+        keep = {case["case_id"] for case in generated}
+        for route, mode in sorted(policies.items()):
+            candidates = [case for case in generated if targets[case["case_id"]] == route]
+            keep.difference_update(case["case_id"] for case in candidates)
+            if mode == "drop_generated":
+                continue
+            total = {label: original_counts[route][label] + before[route][label] for label in labels}
+            balanced_count = min(total.values())
+            if balanced_count < max(original_counts[route].values()):
+                raise ValueError(f"Cannot balance {route} totals without dropping originals")
+            rng = random.Random(f"{seed}:{route}")
+            for label in labels:
+                pool = sorted((case["case_id"] for case in candidates if case["prompt_harm_label"] == label))
+                keep.update(rng.sample(pool, balanced_count - original_counts[route][label]))
+        removed = {case["case_id"] for case in generated} - keep
+        generated = [case for case in generated if case["case_id"] in keep]
+        after = label_counts(generated)
+        policy_report = {"policies": policies, "seed": seed, "source_counts_stage": "before_route_policies",
+                         "routes": {route: {"original": original_counts[route],
+                                             "generated_before": before[route], "generated_after": after[route],
+                                             "total_before": {label: original_counts[route][label] + before[route][label]
+                                                              for label in labels},
+                                             "total_after": {label: original_counts[route][label] + after[route][label]
+                                                             for label in labels}} for route in ROUTES}}
+        cases = original + generated
+        targets = {case["case_id"]: targets[case["case_id"]] for case in cases}
+        if outcomes is not None:
+            for case_id in removed:
+                outcomes.pop(case_id, None)
     report = {
         "source_run_ids": [source["run_id"] for source in sources if source["cases_added"]],
         "sources": sources,
@@ -1182,14 +1229,16 @@ def build_g0_cases(original_train_cases, benchmark_runs, original_targets, *, re
         "generated_target_counts": dict(Counter(targets[case["case_id"]] for case in generated)),
         "train_target_counts": dict(Counter(targets.values())),
     }
+    if policy_report is not None:
+        report["generated_route_policies"] = policy_report
     return cases, targets, report
 
 
 def variant_run_name(variant, manifest, seed, settings=None):
     settings = settings or {}
-    if variant == "G0":
+    if variant in ("G0", "G0bal"):
         union = {key: value for key, value in manifest.get("generated_union", {}).items() if key != "discovery"}
-        name = f"G0-{laya_router.fingerprint({**manifest, 'generated_union': union})[:16]}-seed{seed}"
+        name = f"{variant}-{laya_router.fingerprint({**manifest, 'generated_union': union})[:16]}-seed{seed}"
     else:
         name = f"{variant}-seed{seed}"
     if settings.get("objective", "slcd") != "slcd":
@@ -1198,7 +1247,7 @@ def variant_run_name(variant, manifest, seed, settings=None):
 
 
 def available_variants(import_dir):
-    return [name for name in ("B0", "B1", "G0", "G1")
+    return [name for name in ("B0", "B1", "G0", "G0bal", "G1")
             if (Path(import_dir) / "variants" / name / "manifest.json").is_file()]
 
 
