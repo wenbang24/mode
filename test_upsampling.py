@@ -670,7 +670,7 @@ class LabelBalancingTest(unittest.TestCase):
 
 
 class GenerationTest(unittest.TestCase):
-    def test_notebook_records_difficulty_and_rejects_mismatched_resume(self):
+    def test_notebook_restores_interrupted_generation_settings_and_rejects_mismatched_resume(self):
         module = ast.parse(Path("upsample_router.py").read_text())
         action = next(node for node in module.body if isinstance(node, ast.FunctionDef)
                       and node.name == "generate_action")
@@ -696,11 +696,30 @@ class GenerationTest(unittest.TestCase):
                     label_balance_control=SimpleNamespace(value=target is not None),
                     target_harmful_share_control=SimpleNamespace(value=0.5),
                     current_prepared={"directory": str(prepared), "manifest": {"targets": {}}},
-                    fs=None, generate_button=SimpleNamespace(value=True), judge_config={}, mo=mo,
+                    fs=_FakeMemoryFS(), generate_button=SimpleNamespace(value=True), judge_config={}, mo=mo,
                     mutation_share_control=SimpleNamespace(value=0), output_control=SimpleNamespace(value=str(root)),
                     test_parquet_control=SimpleNamespace(value="test.parquet"),
                     upsampling=upsampling, training_cases=SimpleNamespace(read_cases=lambda *a, **k: []),
                     json=json, Path=Path)
+                remote = "MoDE/upsampling/prepared"
+
+                def interrupt_generation(requests, rows, output_path, *args, **kwargs):
+                    self.assertTrue(arguments["fs"].exists(remote + "/generate/bootstrap.json"))
+                    upsampling.append_jsonl(output_path, {"request_id": "saved-request", "prompt": "saved"})
+                    upsampling.upload_progress_file(
+                        arguments["fs"], output_path, output_path.parent, remote + "/generate", min_interval=0)
+                    raise RuntimeError("generation interrupted")
+
+                with mock.patch.object(upsampling, "run_generation", side_effect=interrupt_generation) as generate:
+                    namespace["generate_action"](**arguments)
+                    generate.assert_called_once()
+                self.assertIn("generation interrupted", mo.callout.call_args.args[0])
+                for path in (step_root / "generate").iterdir():
+                    path.unlink()
+                upsampling.restore_from_drive(arguments["fs"], remote, step_root)
+                self.assertTrue((step_root / "generate/bootstrap.json").is_file())
+                self.assertTrue((step_root / "generate/generated_raw.jsonl").is_file())
+                self.assertFalse((step_root / "generate/done.json").exists())
                 with mock.patch.object(upsampling, "run_generation", return_value=[]):
                     namespace["generate_action"](**arguments)
                 for name in ("bootstrap.json", "done.json"):

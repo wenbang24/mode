@@ -727,6 +727,8 @@ def generate_action(
                     upsampling.upload_progress_file(fs, path, _step_dir, _drive_dir)
 
                 upsampling.write_json(_step_dir / "bootstrap.json", _bootstrap_metadata)
+                upsampling.upload_progress_file(
+                    fs, _step_dir / "bootstrap.json", _step_dir, _drive_dir, min_interval=0)
                 generated_rows = upsampling.run_generation(
                     _requests, _rows + _source_rows, _step_dir / "generated_raw.jsonl", _step_dir / "deduped.jsonl",
                     _frozen_rows, call_generation, workers=4, on_progress=_upload_generation_log)

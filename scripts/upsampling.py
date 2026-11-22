@@ -814,7 +814,8 @@ def restore_from_drive(fs, remote_root, local_root):
         direct_children = _remote_children(fs, directory)
         done = any(child.rstrip("/").endswith("/done.json") for child in direct_children)
         files = _remote_files(fs, directory) if done else [
-            child for child in direct_children if child.endswith(".jsonl")
+            child for child in direct_children
+            if child.endswith(".jsonl") or child.rsplit("/", 1)[-1] == "bootstrap.json"
         ]
         for remote in files:
             relative_remote = remote.strip("/")
