@@ -299,6 +299,7 @@ def policy_engine():
         allow_truncated=False,
         context_length=None,
         api_key="",
+        reasoning_tokens=8192,
     ):
         from scripts.local_judge import request_headers
 
@@ -319,7 +320,11 @@ def policy_engine():
             "temperature": 0,
             "max_tokens": max_tokens,
         }
-        if not api_key:
+        if api_key:
+            # thinking budget on top of the answer cap so reasoning cannot crowd out the answer
+            payload["reasoning"] = {"max_tokens": reasoning_tokens}
+            payload["max_tokens"] = max_tokens + reasoning_tokens
+        else:
             # local vLLM judge only; hosted APIs may reject chat_template_kwargs
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         request = Request(
@@ -457,6 +462,7 @@ def policy_engine():
         retries=2,
         context_length=None,
         synthesis=None,
+        checkpoint=None,
     ):
         """Build a policy; ``synthesis`` optionally routes combining and synthesis.
 
@@ -525,19 +531,37 @@ def policy_engine():
                     progress(f"Retrying model call after {type(exc).__name__}: {exc}")
                     time.sleep(5 * (attempt + 1))
 
-        def run_parallel(fn, items, label):
+        def run_parallel(fn, items, label, key=None):
             results = [None] * len(items)
+            saved = checkpoint["notes"] if checkpoint and key else {}
+            todo = []
+            for index in range(len(items)):
+                if f"{key}:{index}" in saved:
+                    results[index] = saved[f"{key}:{index}"]
+                else:
+                    todo.append(index)
+            if len(todo) < len(items):
+                progress(f"{label}: {len(items) - len(todo):,} resumed from checkpoint")
             pool = ThreadPoolExecutor(max_workers=max(1, max_workers))
             try:
                 futures = {
-                    pool.submit(with_retries, fn, item): index
-                    for index, item in enumerate(items)
+                    pool.submit(with_retries, fn, items[index]): index
+                    for index in todo
                 }
-                for done, future in enumerate(as_completed(futures), 1):
-                    results[futures[future]] = future.result()
+                for done, future in enumerate(
+                    as_completed(futures), len(items) - len(todo) + 1
+                ):
+                    index = futures[future]
+                    results[index] = future.result()
+                    if checkpoint and key:
+                        saved[f"{key}:{index}"] = results[index]
+                        if done % 25 == 0:
+                            checkpoint["save"]()
                     progress(f"{label}: {done:,}/{len(items):,} done")
             finally:
                 pool.shutdown(wait=True, cancel_futures=True)
+                if checkpoint and key and todo:
+                    checkpoint["save"]()
             return results
 
         def clip(prompt):
@@ -606,7 +630,9 @@ def policy_engine():
                     allow_truncated=True,
                 )
 
-            summaries = run_parallel(summarize, batches, "Summarizing training batches")
+            summaries = run_parallel(
+                summarize, batches, "Summarizing training batches", key="summary"
+            )
             tally(local_target, len(batches))
 
             fan_in = max(2, min(batch_size, note_fan_in or batch_size))
@@ -667,6 +693,7 @@ def policy_engine():
                     groups,
                     f"Combining policy notes, round {reduction_round}/"
                     f"{total_rounds} with {round_target['model']}",
+                    key=f"combine{reduction_round}",
                 )
                 tally(round_target, sum(len(group) > 1 for group in groups))
                 if len(reduced) >= len(summaries):
@@ -934,6 +961,33 @@ def policy_engine():
             results,
         )
 
+    def drive_checkpoint(drive_fs, local_path, remote_path, progress):
+        """Policy notes mirrored to one Drive file so a crashed run can resume."""
+        parent = remote_path.rsplit("/", 1)[0]
+        notes = {}
+        if drive_fs.exists(remote_path):
+            drive_fs.get_file(remote_path, str(local_path))
+            notes = json.loads(local_path.read_text(encoding="utf-8"))
+            progress(f"Loaded {len(notes):,} saved policy notes from {remote_path}")
+
+        def save():
+            try:
+                write_json(local_path, notes)
+                drive_fs.makedirs(parent, exist_ok=True)
+                try:
+                    # gdrive_fsspec 0.4.1 overwrites the existing file in place.
+                    drive_fs.put_file(
+                        str(local_path),
+                        remote_path,
+                        block_size=local_path.stat().st_size + 1,
+                    )
+                except KeyError:
+                    pass
+            except Exception as exc:
+                progress(f"Checkpoint upload failed: {type(exc).__name__}: {exc}")
+
+        return {"notes": notes, "save": save}
+
     def drive_run_dir(slug):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         return f"MoDE/unified_policy/{slug}/{stamp}"
@@ -968,8 +1022,10 @@ def policy_engine():
 
     return (
         build_policy,
+        drive_checkpoint,
         drive_run_dir,
         evaluate_classifier,
+        json,
         save_run_to_drive,
         write_json,
         write_jsonl,
@@ -992,8 +1048,10 @@ def generate_policy_action(
     cloud_model_control,
     dataset_config,
     dataset_name,
+    drive_checkpoint,
     drive_run_dir,
     fs,
+    json,
     judge_key,
     local_server,
     normalize_endpoint,
@@ -1010,6 +1068,8 @@ def generate_policy_action(
     synthesis_model_control,
     write_json,
 ):
+    import hashlib as _hashlib
+
     _request_number = build_request_get()
     if _request_number > build_processed_get():
         build_processed_set(_request_number)
@@ -1067,6 +1127,32 @@ def generate_policy_action(
                     "cloud_combine_levels": _synthesis["combine_levels"],
                 }
             _output_dir.mkdir(parents=True, exist_ok=True)
+            _checkpoint_name = (
+                "checkpoint_"
+                + _hashlib.sha256(
+                    json.dumps(
+                        [
+                            dataset_name,
+                            sample_count,
+                            sample_seed,
+                            _batch_size,
+                            _strategy,
+                            _model,
+                            int(_settings["context_length"]),
+                            _synthesis_record,
+                        ],
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest()[:16]
+                + ".json"
+            )
+            _checkpoint = drive_checkpoint(
+                fs,
+                _output_dir / _checkpoint_name,
+                f"MoDE/unified_policy/{dataset_config['slug']}/checkpoints/"
+                f"{_checkpoint_name}",
+                lambda message: print(message, flush=True),
+            )
 
             def _record_generation(validated, error=None, stats=None):
                 _record = {
@@ -1121,6 +1207,7 @@ def generate_policy_action(
                 note_fan_in=(int(_settings["context_length"]) - 3072) // 768,
                 context_length=int(_settings["context_length"]),
                 synthesis=_synthesis,
+                checkpoint=_checkpoint,
             )
             _policy_path.write_text(_source.rstrip() + "\n", encoding="utf-8")
             _record_generation(
