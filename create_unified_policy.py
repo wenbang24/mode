@@ -562,7 +562,7 @@ def policy_engine():
                 pool.shutdown(wait=True, cancel_futures=True)
                 if checkpoint and key and todo:
                     checkpoint["save"]()
-            return results
+            return results, todo
 
         def clip(prompt):
             if len(prompt) <= max_example_chars:
@@ -630,10 +630,10 @@ def policy_engine():
                     allow_truncated=True,
                 )
 
-            summaries = run_parallel(
+            summaries, made = run_parallel(
                 summarize, batches, "Summarizing training batches", key="summary"
             )
-            tally(local_target, len(batches))
+            tally(local_target, len(made))
 
             fan_in = max(2, min(batch_size, note_fan_in or batch_size))
             total_rounds = 0
@@ -688,14 +688,14 @@ def policy_engine():
                         api_key=round_target["api_key"],
                     )
 
-                reduced = run_parallel(
+                reduced, made = run_parallel(
                     combine,
                     groups,
                     f"Combining policy notes, round {reduction_round}/"
                     f"{total_rounds} with {round_target['model']}",
                     key=f"combine{reduction_round}",
                 )
-                tally(round_target, sum(len(group) > 1 for group in groups))
+                tally(round_target, sum(len(groups[index]) > 1 for index in made))
                 if len(reduced) >= len(summaries):
                     raise RuntimeError(
                         "Policy-note reduction did not shrink the input"
