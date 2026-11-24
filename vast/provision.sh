@@ -20,6 +20,10 @@ utils=/opt/supervisor-scripts/utils
 . "${utils}/exit_portal.sh" "marimo"
 
 export PATH="$HOME/.local/bin:$PATH"
+# Directory-mode sandboxes ignore requires-python; most notebooks pin 3.12.
+# The >=3.14 ones (evaluate_piguard.py, select_*.py) need single-file mode:
+#   uvx marimo@0.24.0 edit --sandbox evaluate_piguard.py
+export UV_PYTHON=3.12
 cd /workspace/mode
 pty uvx marimo@0.24.0 edit --sandbox --headless --no-token --host 127.0.0.1 --port 12718 2>&1
 SH
